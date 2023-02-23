@@ -11,7 +11,7 @@ This repository accompanies the paper "*A Gold Standard Dataset for the Reviewer
 
 We now provide more details on each of the released folders.
 
-## Data
+## data
 
 The dataset folder contains six items:
 
@@ -23,26 +23,44 @@ Evaluations reported by the participants are represented in 20 columns. The firs
 
 The second 10 columns (`ExpertiseX` where X ranges from 1 to 10) represent expertise in reviewing the corresponding papers (e.g., `Expertise1` is expertise in reviewing `Paper1`). The values of expertise are from 1 to 5 with larger values representing higher expertise. Again, if a participant reported expertise in less than 10 papers, the values of expertise corresponding to missing papers will be missing.
 
-**2. research_areas.json**
+*2. research_areas.json*
 
 This json file contains research areas of papers reported by participants as classified by the Semantic Scholar tool.
 
-**3. participants folder (profiles of participants)**
+*3. participants folder (profiles of participants)*
 
 For each participant, this folder contains a json file, representing the Semantic Scholar profile of the participant crawled on May 1, 2022.
 
-**4. papers (profiles of all papers)**
+*4. papers (profiles of all papers)*
 
 For each paper (reported by participants or from reviewers' profiles), this folder contains a json file, representing the Semantic Scholar profile of the paper crawled on May 1, 2022.
 
 Note: For papers reported by participants, we edit semantic scholar profiles by adding links to publicly available PDFs whenever they were missing in the SS profile.
 
-**5. pdfs**
+*5. pdfs*
 
 PDF files for each paper (reported by participants or from reviewers' profiles) that has PDF publicly available.
 
-**6. txts**
+*6. txts*
 
 Parsed PDF file. For each file, there is:
 - .txt file that is obtained by parsing the pdf with the `xpdf` tool
 - .json file that contains counts of workds in the txt file with some sanitization applied (txt -> json conversion is done using the approach of Laurent Charlin https://bitbucket.org/lcharlin/tpms/src/master/)
+
+## notebooks
+
+A good entry point to this project is the `DataExploration.ipynb` notebook. It provides some basic overview of the data.
+
+Once you understand the data, you can explore the `Experiments.ipynb` notebook that replicates the results of the paper.
+
+## evaluation_datasets
+
+Open Rewiew algorithms work with data in a specific format (https://github.com/openreview/openreview-expertise#affinity-scores). For consistency, all experiments in this project are conducted with data in the OpenReview format. The `evaluation_datasets` folder contains all the datasets used in the experiments. Specifically, there are two types of datasets we use in the experiments:
+
+- *d_20_{x}, x \in {1, 2, ..., 10}*
+
+For evaluations in Section 6.1 and 7 we use reviewer profiles of length 20 and rerun all evaluations 10 times to average out the noise in the reviewer profiles (the noise arises due to the randomness in the procedure of profile creation).
+
+- *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 10}*
+
+To evaluate TPMS in the full text regime (Section 6.2, Section 7) we need to focus on papers (reported by participants or from reviewers' profiles) that have PDFs publicly available. For this, we need to remove some papers from the dataset and from the reviewers' profiles. Additionally, in Section 6.2 we experiment with the length of the reviewers' profiles so we create a dataset for each length of the profile from 1 to 20.

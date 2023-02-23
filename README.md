@@ -35,7 +35,7 @@ For each participant, this folder contains a json file, representing the Semanti
 
 For each paper (reported by participants or from reviewers' profiles), this folder contains a json file, representing the Semantic Scholar profile of the paper crawled on May 1, 2022.
 
-Note: For papers reported by participants, we edit semantic scholar profiles by adding links to publicly available PDFs whenever they were missing in the SS profile.
+Note: For papers reported by participants, we edit semantic scholar profiles by adding links to publicly available PDFs whenever they were missing in the semantic scholar profile.
 
 **5. pdfs**
 

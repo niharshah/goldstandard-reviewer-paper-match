@@ -55,7 +55,7 @@ Once you understand the data, you can proceed to the `Experiments.ipynb` noteboo
 
 ## evaluation_datasets
 
-Many existing similarity-computation algorithms work with data in a specific format (https://github.com/openreview/openreview-expertise#affinity-scores). For consistency, all experiments in this project are conducted with data in the OpenReview format. The `evaluation_datasets` folder contains all the datasets used in the experiments. Specifically, there are two types of datasets we use:
+Many existing similarity-computation algorithms work with data in the OpenReview format (https://github.com/openreview/openreview-expertise#affinity-scores). For consistency, all experiments in this project are conducted with data in the OpenReview format. The `evaluation_datasets` folder contains all the datasets used in the experiments. Specifically, there are two types of datasets we use:
 
 - *d_20_{x}, x \in {1, 2, ..., 10}*
 

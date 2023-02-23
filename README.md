@@ -15,7 +15,7 @@ We now provide more details on each of the released folders.
 
 The dataset folder contains the data we collect in this work and comprises six items:
 
-*1. evaluations.csv*
+**1. evaluations.csv**
 
 This tab-separated file contains evaluations reported by participants. Each row in the data frame corresponds to a participant who is represented by their Semantic Scholar ID (`ParticipantID`).
 
@@ -23,25 +23,25 @@ Evaluations reported by the participants are represented in 20 columns. The firs
 
 The second 10 columns (`ExpertiseX` where X ranges from 1 to 10) represent expertise in reviewing the corresponding papers (e.g., `Expertise1` is expertise in reviewing `Paper1`). The values of expertise are from 1 to 5 with larger values representing higher expertise. Again, if a participant reported expertise in less than 10 papers, the values of expertise corresponding to missing papers will be missing.
 
-*2. research_areas.json*
+**2. research_areas.json**
 
 This json file contains research areas of papers reported by participants as classified by the Semantic Scholar tool.
 
-*3. participants folder (profiles of participants)*
+**3. participants folder (profiles of participants)**
 
 For each participant, this folder contains a json file, representing the Semantic Scholar profile of the participant crawled on May 1, 2022.
 
-*4. papers (profiles of all papers)*
+**4. papers (profiles of all papers)**
 
 For each paper (reported by participants or from reviewers' profiles), this folder contains a json file, representing the Semantic Scholar profile of the paper crawled on May 1, 2022.
 
 Note: For papers reported by participants, we edit semantic scholar profiles by adding links to publicly available PDFs whenever they were missing in the SS profile.
 
-*5. pdfs*
+**5. pdfs**
 
 PDF files for each paper (reported by participants or from reviewers' profiles) that has PDF publicly available.
 
-*6. txts*
+**6. txts**
 
 Parsed PDF file. For each file, there is:
 - .txt file that is obtained by parsing the pdf with the `xpdf` tool

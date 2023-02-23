@@ -39,19 +39,19 @@ Note: For papers reported by participants, we edit semantic scholar profiles by 
 
 **5. pdfs**
 
-PDF files for each paper (reported by participants or from reviewers' profiles) that has PDF publicly available.
+PDF files for each paper (reported by participants or from reviewers' profiles) that has a link to PDF in its profile.
 
 **6. txts**
 
-Parsed PDF file. For each file, there is:
+Parsed PDF files. For each pdf file in the `pdfs` folder, there is:
 - .txt file that is obtained by parsing the pdf with the `xpdf` tool
-- .json file that contains counts of workds in the txt file with some sanitization applied (txt -> json conversion is done using the approach of Laurent Charlin https://bitbucket.org/lcharlin/tpms/src/master/)
+- .json file that contains counts of words in the txt file with some sanitization applied (txt -> json conversion is done using the approach by Laurent Charlin https://bitbucket.org/lcharlin/tpms/src/master/)
 
 ## notebooks
 
 A good entry point to this project is the `DataExploration.ipynb` notebook. It provides some basic overview of the data.
 
-Once you understand the data, you can explore the `Experiments.ipynb` notebook that replicates the results of the paper.
+Once you understand the data, you can proceed to the `Experiments.ipynb` notebook that replicates the results of the paper.
 
 ## evaluation_datasets
 

@@ -1,0 +1,1628 @@
+arXiv:1209.2137v7 [cs.IR] 30 Jan 2021
+
+Decoding billions of integers per second through vectorization
+D. Lemire1*, L. Boytsov2
+1LICEF Research Center, TELUQ, Montreal, QC, Canada 2Carnegie Mellon University, Pittsburgh, Pennsylvania, USA
+SUMMARY
+In many important applications—such as search engines and relational database systems—data is stored in the form of arrays of integers. Encoding and, most importantly, decoding of these arrays consumes considerable CPU time. Therefore, substantial effort has been made to reduce costs associated with compression and decompression. In particular, researchers have exploited the superscalar nature of modern processors and SIMD instructions. Nevertheless, we introduce a novel vectorized scheme called SIMD-BP128 that improves over previously proposed vectorized approaches. It is nearly twice as fast as the previously fastest schemes on desktop processors (varint-G8IU and PFOR). At the same time, SIMD-BP128 saves up to 2 bits per integer. For even better compression, we propose another new vectorized scheme (SIMD-FastPFOR) that has a compression ratio within 10% of a state-of-the-art scheme (Simple-8b) while being two times faster during decoding.
+KEY WORDS: performance; measurement; index compression; vector processing
+1. INTRODUCTION
+Computer memory is a hierarchy of storage devices that range from slow and inexpensive (disk or tape) to fast but expensive (registers or CPU cache). In many situations, application performance is inhibited by access to slower storage devices, at lower levels of the hierarchy. Previously, only disks and tapes were considered to be slow devices. Consequently, application developers tended to optimize only disk and/or tape I/O. Nowadays, CPUs have become so fast that access to main memory is a limiting factor for many workloads [1, 2, 3, 4, 5]: data compression can signiﬁcantly improve query performance by reducing the main-memory bandwidth requirements.
+Data compression helps to load and keep more of the data into a faster storage. Hence, high speed compression schemes can improve the performances of database systems [6, 7, 8] and text retrieval engines [9, 10, 11, 12, 13].
+We focus on compression techniques for 32-bit integer sequences. It is best if most of the integers are small, because we can save space by representing small integers more compactly, i.e., using short codes. Assume, for example, that none of the values is larger than 255. Then we can encode each integer using one byte, thus, achieving a compression ratio of 4: an integer uses 4 bytes in the uncompressed format.
+In relational database systems, column values are transformed into integer values by dictionary coding [14, 15, 16, 17, 18]. To improve compressibility, we may map the most frequent values to the smallest integers [19]. In text retrieval systems, word occurrences are commonly represented
+∗Correspondence to: LICEF Research Center, TELUQ, Universite´ du Que´bec, 5800 Saint-Denis, Montreal (Quebec) H2S 3L5 Canada.
+Contract/grant sponsor: Natural Sciences and Engineering Research Council of Canada; contract/grant number: 261437
+
+2
+
+D. LEMIRE AND L. BOYTSOV
+
+array→
+
+differential coding (e.g., δi = xi − xi−1)
+
+→ compression (e.g., SIMD-BP128)
+(a) encoding
+
+→ compressed
+
+compressed →
+
+decompression → differential decoding
+
+(e.g., SIMD-BP128)
+
+(e.g., xi = δi + xi−1)
+
+(b) decoding
+
+→ array
+
+Figure 1. Encoding and decoding of integer arrays using differential coding and an integer compression algorithm
+
+by sorted lists of integer document identiﬁers, also known as posting lists. These identiﬁers are
+
+converted to small integer numbers through data differencing. Other database indexes can also be
+
+stored similarly [20].
+
+A mainstream approach to data differencing is differential coding (see Fig. 1). Instead of storing
+
+the original array of sorted integers (x1, x2, . . . with xi ≤ xi+1 for all i), we keep only the difference
+
+between successive elements together with the initial value: (x1, δ2 = x2 − x1, δ3 = x3 − x2, . . .).
+
+The differences (or deltas) are non-negative integers that are typically much smaller than the original
+
+integers. Therefore, they can be compressed more efﬁciently. We can then reconstruct the original
+
+arrays by computing preﬁx sums (xj = x1 +
+
+j i=2
+
+δj ).
+
+Differential
+
+coding
+
+is
+
+also
+
+known
+
+as
+
+delta
+
+coding [18, 21, 22], not to be confused with Elias delta coding (§ 2.3). A possible downside of
+
+differential coding is that random access to an integer located at a given index may require summing
+
+up several deltas: if needed, we can alleviate this problem by partitioning large arrays into smaller
+
+ones.
+
+An engineer might be tempted to compress the result using generic compression tools such as
+
+LZO, Google Snappy, FastLZ, LZ4 or gzip. Yet this might be ill-advised. Our fastest schemes
+
+are an order of magnitude faster than a fast generic library like Snappy, while compressing better
+
+(see § 6.5).
+
+Instead, it might be preferable to compress these arrays of integers using specialized schemes
+
+based on Single-Instruction, Multiple-Data (SIMD) operations. Stepanov et al. [12] reported that
+
+their SIMD-based varint-G8IU algorithm outperformed the classic variable byte coding method (see
+
+§ 2.4) by 300%. They also showed that use of SIMD instructions allows one to improve performance
+
+of decoding algorithms by more than 50%.
+
+In Table I, we report the speeds of the fastest decoding algorithms reported in the literature
+
+on desktop processors. These numbers cannot be directly compared since hardware, compilers,
+
+benchmarking methodology, and data sets differ. However, one can gather that varint-G8IU—which
+
+can be viewed as an improvement on the Group Varint Encoding [13] (varint-GB) used by Google—
+
+is, probably, the fastest method (except for our new schemes) in the literature. According to our
+
+own experimental evaluation (see Tables IV, V and Fig. 12), varint-G8IU is indeed one of the most
+
+efﬁcient methods, but there are previously published schemes that offer similar or even slightly
+
+better performance such as PFOR [23]. We, in turn, were able to further surpass the decoding speed
+
+of varint-G8IU by a factor of two while improving the compression ratio.
+
+We report our own speed in a conservative manner: (1) our timings are based on the wall-
+
+clock time and not the commonly used CPU time, (2) our timings incorporate all of the decoding
+
+operations including the computation of the preﬁx sum whereas this is sometimes omitted by other
+
+authors [24], (3) we report a speed of 2300 million integers per second (mis) achievable for realistic
+
+data sets, while higher speed is possible (e.g., we report a speed of 2500 mis on some realistic data
+
+and 2800 mis on some synthetic data).
+
+Another observation we can make from Table I is that not all authors have chosen to make
+
+explicit use of SIMD instructions. While there are has been several variations on PFOR [23] such
+
+as NewPFD and OptPFD [10], we introduce for the ﬁrst time a variation designed to exploit the
+
+vectorization instructions available since the introduction of the Pentium 4 and the Streaming
+
+SIMD Extensions 2 (henceforth SSE2). Our experimental results indicate that such vectorization
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+3
+
+Table I. Recent best decoding speeds in millions of 32-bit integers per second (mis) reported by authors for integer compression on realistic data. We indicate whether the authors made explicit use of SIMD
+instructions. Results are not directly comparable but they illustrate the evolution of performance.
+
+this paper Stepanov et al. (2011) [12] Anh and Moffat (2010) [25] Silvestri and Venturini (2010) [24] Yan et al. (2009) [10] Zhang et al. (2008) [26] Zukowski et al. (2006) [23, § 5]
+
+Speed
+2300 1512 1030 835 1120 890 1024
+
+Cycles/int
+1.5 2.2 2.3 — 2.4 3.6 2.9
+
+Fastest scheme
+SIMD-BP128 varint-G8IU binary packing VSEncoding NewPFD PFOR2008 PFOR
+
+Processor
+Core i7 (3.4 GHz) Xeon (3.3 GHz) Xeon (2.33 GHz) Xeon Core 2 (2.66 GHz) Pentium 4 (3.2 GHz) Pentium 4 (3 GHz)
+
+SIMD
+SSE2 SSSE3 no no no no no
+
+is desirable: our SIMD-FastPFOR scheme surpasses the decoding speed of PFOR by at least 30% while offering a superior compression ratio (10%). In some instances, SIMD-FastPFOR is twice as fast as the original PFOR.
+For most schemes, the preﬁx sum computation is so fast as to represent 20% or less of the running time. However, because our novel schemes are much faster, the preﬁx sum can account for the majority of the running time.
+Hence, we had to experiment with faster alternatives. We ﬁnd that a vectorized preﬁx sum using SIMD instructions can be twice as fast. Without vectorized differential coding, we were unable to reach a speed of two billion integers per second.
+In a sense, the speed gains we have achieved are a direct application of advanced hardware instructions to the problem of integer coding (speciﬁcally SSE2 introduced in 2001). Nevertheless, it is instructive to show how this is done, and to quantify the beneﬁts that accrue.
+
+2. RELATED WORK
+Some of the earliest integer compression techniques are Golomb coding [27], Rice coding [28], as well as Elias gamma and delta coding [29]. In recent years, several faster techniques have been added such as the Simple family, binary packing, and patched coding. We brieﬂy review them.
+Because we work with unsigned integers, we make use of two representations: binary and unary. In both systems numbers are represented using only two digits: 0 and 1. The binary notation is a standard positional base-2 system (e.g., 1 → 1, 2 → 10, 3 → 11). Given a positive integer x, the binary notation requires log2(x + 1) bits. Computers commonly store unsigned integers in the binary notation using a ﬁxed number of bits by adding leading zeros: e.g., 3 is written as 00000011 using 8 bits. In unary notation, we represent a number x as a sequence of x − 1 digits 0 followed by the digit 1 (e.g., 1 → 1, 2 → 01, 3 → 001) [30]. If the number x can be zero, we can store x + 1 instead.
+2.1. Golomb and Rice coding
+In Golomb coding [27], given a ﬁxed parameter b and a positive integer v to be compressed, the quotient v/b is coded in unary. The remainder r = v mod b is stored using the usual binary notation with no more than log2 b bits. If v can be zero, we can code v + 1 instead. When b is chosen to be a power of two, the resulting algorithm is called Rice coding [28]. The parameter b can be chosen optimally by assuming some that the integers follow a known distribution [27].
+Unfortunately, Golomb and Rice coding are much slower than a simple scheme such as Variable Byte [9, 10, 31] (see § 2.4) which, itself, falls short of our goal of decoding billions of integers per second (see § 6.4–6.5).
+2.2. Interpolative coding
+If speed is not an issue but high compression over sorted arrays is desired, interpolative coding [32] might be appealing. In this scheme, we ﬁrst store the lowest and the highest value, x1 and xn, e.g.,
+
+4
+
+D. LEMIRE AND L. BOYTSOV
+
+in a uncompressed form. Then a value in-between is stored in a binary form, using the fact this value must be in the range (x1, xn). For example, if x1 = 16 and xn = 31, we know that for any value x in between, the difference x − x1 is from 0 to 15. Hence, we can encode this difference using only 4 bits. The technique is then repeated recursively. Unfortunately, it is slower than Golomb coding [9, 10].
+
+2.3. Elias gamma and delta coding
+An Elias gamma code [29, 30, 33] consists of two parts. The ﬁrst part encodes in unary notation the minimum number of bits necessary to store the positive integer in the binary notation ( log2(x + 1) ). The second part represents the integer in binary notation less the most signiﬁcant digit. If the integer is equal to one, the second part is empty (e.g., 1 → 1, 2 → 01 0, 3 → 01 1, 4 → 001 00, 5 → 001 01). If integers can be zero, we can code their values incremented by one.
+As numbers become large, gamma codes become inefﬁcient. For better compression, Elias delta codes encode the ﬁrst part (the number log2(x + 1) ) using the Elias gamma code, while the second part is coded in the binary notation. For example, to code the number 8 using the Elias delta code, we must ﬁrst store 4 = log2(8 + 1) as a gamma code (001 00) and then we can store all but the most signiﬁcant bit of the number 8 in the binary notation (000). The net result is 001 00 000.
+However, Variable Byte is twice as fast as Elias gamma and delta coding [24]. Hence, like Golomb coding, gamma coding falls short of our objective of compressing billions of integers per second.
+2.3.1. k-gamma Schlegel et al. [34] proposed a version of Elias gamma coding better suited to current processors. To ease vectorization, the data is stored in blocks of k integers using the same number of bits where k ∈ {2, 4}. (This approach is similar to binary packing described in § 2.6.) As with regular gamma coding, we use unary codes to store this number of bits though we only have one such number for k integers.
+The binary part of the gamma codes are stored using the same vectorized layout as in § 4 (known as vertical or interleaved). During decompression, we decode integer in groups of k integers. For each group we ﬁrst retrieve the binary length from a gamma code. Then, we decode group elements using a sequence of mask-and-shift operations similar to the fast bit unpacking technique described in § 4. This step does not require branching.
+Schlegel et al. report best decoding speeds of ≈550 mis (≈2100 MB/s) on synthetic data using an Intel Core i7-920 processor (2.67 GHz). These results fall short of our objective to compress billions of integers per second.
+
+2.4. Variable Byte and byte-oriented encodings
+Variable Byte is a popular technique [35] that is known under many names (v-byte, variablebyte [36], var-byte, vbyte [30], varint, VInt, VB [12] or Escaping [31]). To our knowledge, it was ﬁrst described by Thiel and Heaps in 1972 [37]. Variable Byte codes the data in units of bytes: it uses the lower-order seven bits to store the data, while the eighth bit is used as an implicit indicator of a code length. Namely, the eighth bit is equal to 1 only for the last byte of a sequence that encodes an integer. For example:
+• Integers in [0, 27) are written using one byte: The ﬁrst 7 bits are used to store the binary representation of the integer and the eighth bit is set to 1.
+• Integers in [27, 214) are written using two bytes, the eighth bit of the ﬁrst byte is set to 0 whereas the eighth bit of the second byte is set to 1. The remaining 14 bits are used to store the binary representation of the integer.
+For a concrete example, consider the number 200. It is written as 11001000 in the binary notation. Variable Byte would code it using 16 bits as 10000001 01001000.
+When decoding, bytes are read one after the other: we discard the eighth bit if it is zero, and we output a new integer whenever the eighth bit is one.
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+5
+
+Subsequent code words
+
+Unused Int 3
+
+Int 2
+
+Int 1
+
+... ... ... ... ... ... ... ... 00 00 80 80 00 00 80 00
+
+00 00 00 00 00 00 00 80 00 80 00 00 00 00 80 00
+
+Unused
+
+Int 3
+
+Int 2
+
+Int 1
+
+Figure 2. Example of simultaneous decoding of 3 integers in the scheme varint-G8IU using the shufﬂe instruction. The integers 215, 223, 27 are packed into the 8-byte block with 2 bytes being unused. Byte values are given by hexadecimal numbers. The target 16-byte buffer bytes are either copied from the source 16-byte buffer or are ﬁlled with zeros. Arrows indicate which bytes of the source buffer are copied to the
+target buffer as well as their location in the source and target buffers.
+
+Though Variable Byte rarely compresses data optimally, it is reasonably efﬁcient. In our tests, Variable Byte encodes data three times faster than most alternatives. Moreover, when the data is not highly compressible, it can match the compression ratios of more parsimonious schemes.
+Stepanov et al. [12] generalize Variable Byte into a family of byte-oriented encodings. Their main characteristic is that each encoded byte contains bits from only one integer. However, whereas Variable Byte uses one bit per byte as descriptor, alternative schemes can use other arrangements. For example, varint-G8IU [12] and Group Varint [13] (henceforth varint-GB) regroup all descriptors in a single byte. Such alternative layouts make easier the simultaneous decoding of several integers. A similar approach to placing descriptors in a single control word was used to accelerate a variant of the Lempel-Ziv algorithm [38].
+For example, varint-GB uses a single byte to describe 4 integers, dedicating 2 bits per integer. The scheme is better explained by an example. Suppose that we want to store the integers 215, 223, 27, and 231. In the usual binary notation, we would use 2, 3, 1 and 4 bytes, respectively. We can store the sequence as 2, 3, 1, 4 as 1, 2, 0, 3 if we assume that each number is encoded using a non-zero number of bytes. Each one of these 4 integers can be written using 2 bits (as they are in {0,1,2,3}). We can pack them into a single byte containing the bits 01,10,00, and 11. Following this byte, we write the integer values using 2 + 3 + 1 + 4 = 10 bytes.
+Whereas varint-GB codes a ﬁxed number of integers (4) using a single descriptor, varint-G8IU uses a single descriptor for a group of 8 bytes, which represent compressed integers. Each 8-byte group may store from 2 to 8 integers. A single-byte descriptor is placed immediately before this 8-byte group. Each bit in the descriptor represents a single data byte. Whenever a descriptor bit is set to 0, then the corresponding byte is the end of an integer. This is symmetrical to the Variable Byte scheme described above, where the descriptor bit value 1 denotes the last byte of an integer code.
+In the example we used for varint-GB, we could only store the ﬁrst 3 integers (215, 223, 27) into a single 8-byte group, because storing all 4 integers would require 10 bytes. These integers use 2, 3, and 1 bytes, respectively, whereas the descriptor byte is equal to 11001101 (in the binary notation). The ﬁrst two bits (01) of the descriptor tell us that the ﬁrst integer uses 2 bytes. The next three bits (011) indicate that the second integer requires 3 bytes. Because the third integer uses a single byte, the next (sixth) bit of the descriptor would be 0. In this model, the last two bytes cannot be used and, thus, we would set the last two bits to 1.
+On most recent x86 processors, integers packed with varint-G8IU can be efﬁciently decoded using the SSSE3 (Supplemental Streaming SIMD Extensions 3) shufﬂe instruction: pshufb. This assembly operation selectively copies byte elements of a 16-element vector to speciﬁed locations of the target 16-element buffer and replaces selected elements with zeros.
+The name “shufﬂe” is a misnomer, because certain source bytes can be omitted, while others may be copied multiple times to a number of different locations. The operation takes two 16 element vectors (of 16 × 8 = 128 bits each): the ﬁrst vector contains the bytes to be shufﬂed into an output vector whereas the second vector serves as a shufﬂe mask. Each byte in the shufﬂe mask determines
+
+6
+
+D. LEMIRE AND L. BOYTSOV
+
+which value will go in the corresponding location in the output vector. If the last bit is set (that is, if the value of the byte is larger than 127), the target byte is zeroed. For example, if the shufﬂe mask contains the byte values 127, 127, . . . , 127, then the output vector will contain only zeros. Otherwise, the ﬁrst 4 bits of the ith mask element determine the index of the byte that should be copied to the target byte i. For example, if the shufﬂe mask contains the byte values 0, 1, 2, . . . , 15, then the bytes are simply copied in their original locations.
+In Fig. 2, we illustrate one step of the decoding algorithm for varint-G8IU. We assume that the descriptor byte, which encodes the 3 numbers of bytes (2, 3, 1) required to store the 3 integers (215, 223, 27), is already retrieved. The value of the descriptor byte was used to obtain a proper shufﬂe mask for pshufb. This mask deﬁnes a hardcoded sequence of operations that copy bytes from the source to the target buffer or ﬁll selected bytes of the target buffer with zeros. All these byte operations are carried out in parallel in the following manner (byte numeration starts from zero):
+• The ﬁrst integer uses 2 bytes, which are both copied to bytes 0–1 of the target buffer Bytes 2–3 of the target buffer are zeroed.
+• Likewise, we copy bytes 2–4 of the source buffer to bytes 4–6 of the target buffer. Byte 7 of the target buffer is zeroed.
+• The last integer uses only one byte 5: we copy the value of this byte to byte 8 and zero bytes 9–11.
+• The bytes 12–15 of the target buffer are currently unused and will be ﬁlled out by subsequent decoding steps. In the current step, we may ﬁll them with arbitrary values, e.g., zeros.
+We do not know whether Google implemented varint-GB using SIMD instructions [13]. However, Schlegel et al. [34] and Popov [11] described the application of the pshufb instruction to accelerate decoding of a varint-GB scheme (which Schlegel et al. called 4-wise null suppression).
+Stepanov et al. [12] found varint-G8IU to compress slightly better than a SIMD-based varint-GB while being up to 20% faster. Compared to the common Variable Byte, varint-G8IU had a slightly worse compression ratio (up to 10%), but it is 2–3 times faster.
+2.5. The Simple family
+Whereas Variable Byte takes a ﬁxed input length (a single integer) and produces a variable-length output (1, 2, 3 or more bytes), at each step the Simple family outputs a ﬁxed number of bits, but processes a variable number of integers, similar to varint-G8IU. However, unlike varint-G8IU, schemes from the Simple family are not byte-oriented. Therefore, they may fare better on highly compressible arrays (e.g., they could compress a sequence of numbers in {0, 1} to ≈1 bit/int).
+The most competitive Simple scheme on 64-bit processors is Simple-8b [25]. It outputs 64-bit words. The ﬁrst 4 bits of every 64-bit word is a selector that indicates an encoding mode. The remaining 60 bits are employed to keep data. Each integer is stored using the same number of bits b. Simple-8b has 2 schemes to encode long sequences of zeros and 14 schemes to encode positive integers. For example:
+• Selector values 0 or 1 represent sequences containing 240 and 120 zeros, respectively. In this instance the 60 data bits are ignored.
+• The selector value 2 corresponds to b = 1. This allows us to store 60 integers having values in {0,1}, which are packed in the data bits.
+• The selector value 3 corresponds to b = 2 and allows one to pack 30 integers having values in [0, 3] in the data bits.
+And so on (see Table II): the larger is the value of the selector, the larger is b, and the fewer integers one can ﬁt in 60 data bits. During coding, we try successively the selectors starting with value 0. That is, we greedily try to ﬁt as many integers as possible in the next 64-bit word.
+Other schemes such as Simple-9 [9] and Simple-16 [10] use words of 32 bits. (Simple-9 and Simple-16 can also be written as S9 and S16 [10].) While these schemes may sometimes compress slightly better, they are generally slower. Hence, we omitted them in our experiments. Unlike
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+7
+
+Table II. Encoding mode for Simple-8b scheme. Between 1 and 240 integers are coded with one 64-bit word.
+
+selector value
+
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+
+integers coded 240 120 60 30 20 15 12 10 8 7 6 5 4 3 2 1
+
+bits per integer 0 0 1 2 3 4 5 6 7 8 10 12 15 20 30 60
+
+Simple-8b that can encode integers in [0, 260), Simple-9 and Simple-16 are restricted to integers in [0, 228).
+While Simple-8b is not as fast as Variable Byte during encoding, it is still faster than many alternatives. Because the decoding step can be implemented efﬁciently (with little branching), we also get a good decoding speed while achieving a better compression ratio than Variable Byte.
+2.6. Binary Packing
+Binary packing is closely related to Frame-Of-Reference (FOR) from Goldstein et al. [39] and tuple differential coding from Ng and Ravishankar [40]. In such techniques, arrays of values are partitioned into blocks (e.g., of 128 integers). The range of values in the blocks is ﬁrst coded and then all values in the block are written in reference to the range of values: for example, if the values in a block are integers in the range [1000, 1127], then they can be stored using 7 bits per integer ( log2(1127 + 1 − 1000) = 7) as offsets from the number 1000 stored in the binary notation. In our approach to binary packing, we assume that integers are small, so we only need to code a bit width b per block (to represent the range). Then, successive values are stored using b bits per integer using fast bit packing functions. Anh and Moffat called binary packing PackedBinary [25] whereas Delbru et al. [41] called their 128-integer binary packing FOR and their 32-integer binary packing AFOR-1.
+Binary packing can have a competitive compression ratio. In Appendix A, we derive a general information-theoretic lower bound on the compression ratio of binary packing.
+2.7. Binary Packing with variable-length blocks
+Three factors determine to the storage cost of a given block in binary packing:
+• the number of bits (b) required to store the largest integer value in the binary notation, • the block length (B), • and a ﬁxed per-block overhead (κ).
+The total storage cost for one block is bB + κ. Binary packing uses ﬁxed-length blocks (e.g., B = 32 or B = 128).
+We can vary dynamically the length of the blocks to improve the compression ratio. This adds a small overhead to each block because we need to store not only the corresponding bit width (b) but also the block length (B). We then have a conventional optimization problem: we must partition the array into blocks so that the total storage cost is minimized. The cost of each block is still given by bB + κ, but the block length B may vary from one block to another.
+The dynamic selection of block length was ﬁrst proposed by Deveaux et al. [42] who reported compression gains (15–30%). They used both a top-down and a bottom-up heuristic.
+Delbru et al. [41] also implemented two such adaptive solutions, AFOR-2 and AFOR-3. AFOR-2 picks blocks of length 8, 16, 32 whereas AFOR-3 adds a special processing for the case where we have successive integers. To determine the best conﬁguration of blocks, they pick 32 integers and try various conﬁgurations (1 block of 32 integers, 2 blocks of 16 integers and so on). They keep the conﬁguration minimizing the storage cost. In effect, they apply a greedy approach to the storage minimization problem.
+Silvestri and Venturini [24] proposed two variable-length schemes, and we selected their fastest version (henceforth VSEncoding). VSEncoding optimizes the block length using dynamic programming over blocks of lengths 1–14, 16, 32. That is, given the integer logarithm of every integer in the array, VSEncoding ﬁnds a partition truly minimizing the total storage cost. We expect VSEncoding to provide a superior compression ratio compared to AFOR-2 and AFOR-3.
+
+8
+
+D. LEMIRE AND L. BOYTSOV
+
+2.8. Patched coding
+Binary packing might sometimes compress poorly. For example, the integers 1, 4, 255, 4, 3, 12, 101 can be stored using slightly more than 8 bits per integer with binary packing. However, the same sequence with one large value, e.g., 1, 4, 255, 4, 3, 12, 4294967295, is no longer so compressible: at least 32 bits per integer are required. Indeed, 32 bits are required for storing 4294967295 in the binary notation and all integers use the same bit width under binary packing.
+To alleviate this problem, Zukowski et al. [23] proposed patching: we use a small bit width b, but store exceptions (values greater than or equal to 2b) in a separate location. They called this approach PFOR. (It is sometimes written PFD [43], PFor or PForDelta when used in conjunction with differential coding.) We begin with a partition of the input array into subarrays that have a ﬁxed maximal size (e.g., 32 MB). We call each such subarray a page.
+A single bit width is used for an entire page in PFOR. To determine the best bit width b during encoding, a sample of at most 216 integers is created out of the page. Then, various bit widths are tested until the best compression ratio is achieved. In practice, to accelerate the computation, we can construct a histogram, recording how many integers have a given integer logarithm ( log2(x + 1) ).
+A page is coded in blocks of 128 integers, with a separate storage array for the exceptions. The blocks are coded using bit packing. We either pack the integer value itself when the value is regular (< 2b), or an integer offset pointing to the next exception in the block of 128 integers when there is one. The offset is the difference between the index of the next exception and the index of the current exception, minus one. For the purpose of bit packing, we store integer values and offsets in the same array without differentiating them. For example, consider the following array of integers in the binary notation:
+10, 10, 1, 10, 100110, 10, 1, 11, 10, 100000, 10, 110100, . . .
+Assume that the bit width is set to three (b = 3), then we have exceptions at positions 4, 9, 11, . . ., the offsets are 9 − 4 − 1 = 4, 11 − 9 − 1 = 1, . . . In the binary notation we have 4 → 100 and 1 → 1, so we would store
+10, 10, 1, 10, 100, 10, 1, 11, 10, 1, 10, . . .
+The bit-packed blocks are preceded by a 32-bit word containing two markers. The ﬁrst marker indicates the location of the ﬁrst exception in the block of 128 integers (4 in our example), and the second marker indicates the location of this ﬁrst exception value in the array of exceptions (exception table).
+Effectively, exception locations are stored using a linked list: we ﬁrst read the location of the ﬁrst exception, then going to this location we ﬁnd an offset from which we retrieve the location of the next exception, and so on. If the bit width b is too small to store an offset value, that is, if the offset is greater or equal than 2b, we have to create a compulsory exception in-between. The location of the exception values themselves are found by incrementing the location of the ﬁrst exception value in the exception table.
+When there are too many exceptions, these exception tables may overﬂow and it is necessary to start a new page: Zukowski et al. [23] used pages of 32 MB. In our own experiments, we partition large arrays into arrays of at most 216 integers (see § 6.2) so a single page is used in practice.
+PFOR [23] does not compress the exception values. In an attempt to improve the compression, Zhang et al. [26] proposed to store the exception values using either 8, 16, or 32 bits. We implemented this approach (henceforth PFOR2008). (See Table III.)
+2.8.1. NewPFD and OptPFD The compression ratios of PFOR and PFOR2008 are relatively modest (see § 6). For example, we found that they fare worse than binary packing over blocks of 32 integers (BP32). To get better compression, Yang et al. [10] proposed two new schemes called NewPFD and OptPFD. (NewPFD is sometimes called NewPFOR [44, 45] whereas OptPFD is also known as OPT-P4D [24].) Instead of using a single bit width b per page, they use a bit width per block of 128 integers. They avoid wasteful compulsory exceptions: instead of storing exception
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+9
+
+Table III. Overview of the patched coding schemes: Only PFOR and PFOR2008 generate compulsory
+exceptions and use a single bit width b per page. Only NewPFD and OptPFD store exceptions on a per block basis. We implemented all schemes with 128 integers per block and a page size of at least 216 integers.
+
+PFOR [23] PFOR2008 [26] NewPFD/OptPFD [10] FastPFOR (§ 5) SIMD-FastPFOR (§ 5) SimplePFOR (§ 5)
+
+compulsory yes yes no no no no
+
+bit width per page per page per block per block per block per block
+
+exceptions per page per page per block per page per page per page
+
+compressed exceptions no
+8, 16, 32 bits Simple-16
+binary packing vectorized bin. pack.
+Simple-8b
+
+offsets in the bit packed blocks, they store the ﬁrst b bits of the exceptional integer value. For example, given the following array
+10, 10, 1, 10, 100110, 10, 1, 11, 10, 100000, 10, 110100, . . .
+and a bit width of 3 (b = 3), we would pack
+10, 10, 1, 10, 110, 10, 1, 11, 10, 0, 10, 100, . . .
+For each block of 128 integers, the 32 − b higher bits of the exception values (100, 100, 110, . . . in our example) as well as their locations (e.g., 4, 9, 11, . . . ) are compressed using Simple-16. (We tried replacing Simple-16 with Simple-8b but we found no beneﬁt.)
+Each block of 128 coded integers is preceded by a 32-bit word used to store the bit width, the number of exceptions, and the storage requirement of the compressed exception values in 32-bit words. NewPFD determines the bit width b by picking the smallest value of b such that not more than 10% of the integers are exceptions. OptPFD picks the value of b maximizing the compression. To accelerate the processing, the bit width is chosen among the integer values 0–16, 20 and 32.
+Ao et al. [43] also proposed a version of PFOR called ParaPFD. Though it has a worse compression efﬁciency than NewPFD or PFOR, it is designed for fast execution on graphical processing units (GPUs).
+
+3. FAST DIFFERENTIAL CODING AND DECODING
+All of the schemes we consider experimentally rely on differential coding over 32-bit unsigned integers. The computation of the differences (or deltas) is typically considered a trivial operation which accounts for only a negligible fraction of the total decoding time. Consequently, authors do not discuss it. But in our experience, a straightforward implementation of differential decoding can be four times slower than the decompression of small integers.
+We have implemented and evaluated two approaches to data differencing:
+1. The standard form of differential coding is simple and requires merely one subtraction per value during encoding (δi = xi − xi−1) and one addition per value during decoding to effectively compute the preﬁx sum (xi = δi + xi−1).
+2. A vectorized differential coding leaves the ﬁrst four elements unmodiﬁed. From each of the remaining elements with index i, we subtract the element with the index i − 4: δi = xi − xi−4. In other words, the original array (x1, x2, . . .) is converted into (x1, x2, x3, x4, δ5 = x5 − x1, δ6 = x6 − x2, δ7 = x7 − x3, δ8 = x8 − x4, . . .). An advantage of this approach is that we can compute four differences using a single SIMD operation. This operation carries out an element-wise subtraction for two four-element vectors. The decoding part is symmetric and involves the addition of the element xi−4: xi = δi + xi−4. Again, we can use a single SIMD instruction to carry out four additions simultaneously.
+
+10
+
+D. LEMIRE AND L. BOYTSOV
+
+struct Fields4 8 { unsigned Int1: 4; unsigned Int2: 4; unsigned Int3: 4; unsigned Int4: 4; unsigned Int5: 4; unsigned Int6: 4; unsigned Int7: 4; unsigned Int8: 4;
+};
+
+struct Fields5 8 { unsigned Int1: 5; unsigned Int2: 5; unsigned Int3: 5; unsigned Int4: 5; unsigned Int5: 5; unsigned Int6: 5; unsigned Int7: 5; unsigned Int8: 5;
+};
+
+Figure 3. Eight bit-packed integers represented as two structures in C/C++. Integers in the left panel use 4-bit ﬁelds, while integers in the right panel use 5-bit ﬁelds.
+
+We can get a speed of ≈2000 mis or 1.7 cycles/int with the standard differential decoding (the ﬁrst approach) by manually unrolling the loops. Clearly, it is impossible to decode compressed integers at more than 2 billion integers per second if the computation of the preﬁx sum itself runs at 2 billion integers per second. Hence, we implemented a vectorized version of differential coding. Vectorized differential decoding is much faster (≈5000 mis vs. ≈2000 mis). However, it comes at a price: vectorized deltas are, on average, four times larger which increases the storage cost by up to 2 bits (e.g., see Table V).
+To prevent memory bandwidth from becoming a bottleneck [1, 2, 3, 4, 5], we prefer to compute differential coding and decoding in place. To this end, we compute deltas in decreasing index order, starting from the largest index. For example, given the integers 1, 4, 13, we ﬁrst compute the difference between 13 and 4 which we store in last position (1, 4, 9), then we compute the difference between 4 and 1 which we store in second position (1, 3, 9). In contrast, the differential decoding proceeds in the increasing index order, starting from the beginning of the array. Starting from 1, 3, 9, we ﬁrst add 3 and 4 which we store in the second position (1, 4, 9), then we add 4 and 9 which we store in the last position (1, 4, 9). Further, our implementation requires two passes: one pass to reconstruct the deltas from their compressed format and another pass to compute the preﬁx sum (§ 6.2). To improve data locality and reduce cache misses, arrays containing more than 216 integers (216 × 4 B = 256 KB) are broken down into smaller arrays and each array is decompressed independently. Experiments with synthetic data have shown that reducing cache misses by breaking down arrays can lead to nearly a signiﬁcant improvement in decoding speed for some schemes without degrading the compression efﬁciency.
+
+4. FAST BIT UNPACKING
+Bit packing is a process of encoding small integers in [0, 2b) using b bits each: b can be arbitrary and not just 8, 16, 32 or 64. Each number is written using a string of exactly b bits. Bit strings of ﬁxed size b are concatenated together into a single bit string, which can span several 32-bit words. If some integer is too small to use all b bits, it is padded with zeros.
+Languages like C and C++ support the concept of bit packing through bit ﬁelds. An example of two C/C++ structures with bit ﬁelds is given in Fig. 3. Each structure in this example stores 8 small integers. The structure Fields4 8 uses 4 bits per integer (b = 4), while the structure Fields5 8 uses 5 bits per integer (b = 5).
+Assuming that bit ﬁelds in these structures are stored compactly, i.e., without gaps, and the order of the bit ﬁelds is preserved, the 8 integers are stored in the memory as shown in Fig. 4. If any bits remain unused, their values can be arbitrary. All small integers on the left panel in Fig. 4 ﬁt into a single 32-bit word. However, the integers on the right panel require two 32-bit words with 24 bits remaining unused (these bits can be arbitrary). The ﬁeld of the 7th integer crosses the 32-bit word boundary: the ﬁrst 2 bits use bits 30–31 of the ﬁrst words, while the remaining 3 bits occupy bits 0–2 of the second word (bits are enumerated starting from zero).
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+11
+
+Int 8 Int 7 Int 6 Int 5 Int 4 Int 3 Int 2 Int 1
+31 28 24 20 16 12 8 4 0
+(a) 4-bit integers
+
+unused
+31
+
+Int 8
+
+8
+
+3
+
+Int 7 Int 6 Int 5 Int 4 Int 3 Int 2 Int 1
+
+0
+
+30
+
+25
+
+20
+
+15
+
+10
+
+5
+
+0
+
+(b) 5-bit integers
+
+Figure 4. Example of two bit-packed representations of 8 small integers. For convenience, we indicate a starting bit number for each ﬁeld (numeration begins from zero). Integers in the left panel use 4-bit each and, consequently, they ﬁt into a single 32-bit word. Integers in the right panel use 5-bit each. The complete
+representation uses two 32-bit words: 24-bits are unoccupied.
+
+void unpack4_8(const uint32 t* in,
+
+uint32_t* out) {
+
+*out++ = ((*in))
+
+& 15;
+
+*out++ = ((*in) >> 4) & 15;
+
+*out++ = ((*in) >> 8) & 15;
+
+*out++ = ((*in) >> 12) & 15;
+
+*out++ = ((*in) >> 16) & 15;
+
+*out++ = ((*in) >> 20) & 15;
+
+*out++ = ((*in) >> 24) & 15;
+
+*out = ((*in) >> 28);
+
+}
+
+void unpack5_8(const uint32_t* in, uint32_t* out) {
+
+*out++ = ((*in))
+
+& 31;
+
+*out++ = ((*in) >> 5 ) & 31;
+
+*out++ = ((*in) >> 10) & 31;
+
+*out++ = ((*in) >> 15) & 31;
+
+*out++ = ((*in) >> 20) & 31;
+
+*out++ = ((*in) >> 25) & 31;
+
+*out = ((*in) >> 30);
+
+++in;
+
+*out++ |= ((*in) & 7) << 2;
+
+*out = }
+
+((*in) >> 3) & 31;
+
+Figure 5. Two procedures to unpack eight bit-packed integers. The procedure unpack4 8 works for b = 4 while procedure unpack5 8 works for b = 5. In both cases we assume that (1) integers are packed tightly, i.e., without gaps, (2) packed representations use whole 32-bit words: values of unused bits are undeﬁned.
+
+Unfortunately, language implementers are not required to ensure that the data is fully packed. For example, the C language speciﬁcation states that whether a bit-ﬁeld that does not ﬁt is put into the next unit or overlaps adjacent units is implementation-deﬁned [46]. Most importantly, they do not have to provide packing and unpacking routines that are optimally fast. Hence, we implemented bit packing and unpacking using our own procedures as proposed by Zukowski et al. [23]. In Fig. 5, we give C/C++ implementations of such procedures assuming that ﬁelds are laid out as depicted in Fig. 4. The packing procedures can be implemented similarly and we omit them for simplicity of exposition.
+In some cases, we use bit packing even though some integers are larger than 2b − 1 (see § 2.8). In effect, we want to pack only the ﬁrst b bits of each integer, which can be implemented by applying a bit-wise logical and operation with the mask 2b − 1 on each integer. These extra steps slow down the bit packing (see § 6.3).
+The procedure unpack4 8 decodes eight 4-bit integers. Because these integers are tightly packed, they occupy exactly one 32-bit word. Given that this word is already loaded in a register, each integer can be extracted using at most four simple operations (shift, mask, store, and pointer increment). Unpacking is efﬁcient because it does not involve any branching.
+The procedure unpack5 8 decodes eight 5-bit integers. This case is more complicated, because the packed representation uses two words: the ﬁeld for the 7th integer crosses word boundaries. The ﬁrst two (lower order) bits of this integer are stored in the ﬁrst word, while the remaining three (higher order) bits are stored in the second word. Decoding does not involve any branches and most integers are extracted using four simple operations.
+The procedures unpack4 8 and unpack5 8 are merely examples. Separate procedures are required for each bit width (not just 4 and 5).
+Decoding routines unpack4 8 and unpack5 8 operate on scalar 32-bit values. An effective way to improve performance of these routines involves vectorization [14, 47]. Consider listings in Fig. 5 and assume that in and out are pointers to m-element vectors instead of scalars. Further, assume that scalar operators (shifts, assignments, and bit-wise logical operations) are vectorized.
+
+12
+
+D. LEMIRE AND L. BOYTSOV
+
+Int 24 Int 20 Int 16 Int 12 Int 8 Int 4
+
+Int 23 Int 19 Int 15 Int 11 Int 7 Int 3
+
+30 25 20 15 10
+
+5
+
+0 30 25 20 15 10
+
+5
+
+0
+
+Int 28
+
+Int 27
+
+unused
+
+Int 32
+
+unused
+
+Int 31
+
+31
+
+8
+
+3 0 31
+
+8
+
+30
+
+Int 22 Int 18 Int 14 Int 10 Int 6 Int 2
+
+30 25 20 15 10
+
+5
+
+0
+
+Int 26
+
+unused
+
+Int 30
+
+31
+
+8
+
+30
+
+Int 21 Int 17 Int 13 Int 9 Int 5 Int 1
+
+30 25 20 15 10
+
+5
+
+0
+
+Int 25
+
+unused
+
+Int 29
+
+31
+
+8
+
+30
+
+Figure 6. Example of a vectorized bit-packed representations of 32 small integers. For convenience, we show a starting bit number for each ﬁeld (numeration begins from zero). Integers use 5-bit each. Words in the second row follow (i.e., have larger addresses) words of the ﬁrst row. Curved lines with arrows indicate
+that integers 25–28 are each split between two words.
+
+For example, a bit-wise shift is applied to all m vector elements at the same time. Then, a single call to unpack5 8 or unpack4 8 decodes m × 8 rather than just eight integers.
+Recent x86 processors have SIMD instructions that operate on vectors of four 32-bit integers (m = 4) [48, 49, 50]. We can use these instructions to achieve a better decoding speed. A sample vectorized data layout for b = 5 is given in Fig. 6. Integers are divided among series of four 32-bit words in a round-robin fashion. When a series of four words overﬂows, the data spills over to the next series of 32-bit integers. In this example, the ﬁrst 24 integers are stored in the ﬁrst four words (the ﬁrst row in Fig. 6), integers 25–28 are each split between different words, and the remaining integers 29–32 are stored in the second series of words (the second row of the Fig. 6).
+These data can be processed using a vectorized version of the procedure unpack5 8, which is obtained from unpack5 8 by replacing scalar operations with respective SIMD instructions. With Microsoft, Intel or GNU GCC compilers, we can almost mechanically go from the scalar procedure to the vectorized one by replacing each C operator with the equivalent SSE2 intrinsic function:
+• the bitwise logical and (&) becomes mm and si128, • the right shift (>>) becomes mm srli epi32, • and the left shift (<<) becomes mm slli epi32.
+Indeed, compare procedure unpack5 8 from Fig. 5 with procedure SIMDunpack5 8 from Fig. 7. The intrinsic functions serve the same purpose as the C operators except that they work on vectors of 4 integers instead of single integers: e.g., the function mm srli epi32 shifts 4 integers at once. The functions mm load si128 and mm store si128 load a register from memory and write the content of a register to memory respectively; the function mm set1 epi32 creates a vector of 4 integers initialized with a single integer (e.g., 31 becomes 31,31,31,31).
+In the beginning of the vectorized procedure the pointer in points to the ﬁrst 128-bit chunk of data displayed in row one of the Fig. 6. The ﬁrst shift-and-mask operation extracts 4 small integers at once. Then, these integers are written to the target buffer using a single 128-bit SIMD store operation. The shift-and-mask is repeated until we extract the ﬁrst 24 numbers and the ﬁrst two bits of the integers 25–28. At this point the unpack procedure increases the pointer in and loads the next 128-bit chunk into a register. Using an additional mask operation, it extracts the remaining 3 bits of integers 25–28. These bits are combined with already obtained ﬁrst 2 bits (for each of the integers 25–28). Finally, we store integers 25–28 and ﬁnish processing the second 128-bit chunk by extracting numbers 29–32.
+Our vectorized data layout is interleaved. That is, the ﬁrst four integers (Int 1, Int 2, Int 3, and Int 4 in Fig. 6) are packed into 4 different 32-bit words. The ﬁrst integer is immediately adjacent to the ﬁfth integer (Int 5). Schlegel et al. [34] called this model vertical. Instead we could ensure that the integers are packed sequentially (e.g. Int 1, Int 2, and Int 3 could be stored in the same 32-bit word). Schlegel et al. called this alternative model horizontal and it is used by Willhalm et al. [47]. In their scheme, decoding relies on the SSSE3 shufﬂe operation pshufb (like varint-G8IU). After we determine the bit width b of integers in the block, one decoding step typically includes the following operations:
+1. Loading data into the source 16-byte buffer (this step may require a 16-byte alignment). 2. Distributing 3–4 integers stored in the source buffer among four 32-bit words of the target
+buffer. This step, which requires loading a shufﬂe mask, is illustrated by Fig. 8 (for 5-bit
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+13
+
+const static __m128i m7 = _mm_set1_epi32(7U); const static __m128i m31 = _mm_set1_epi32(31U);
+
+void SIMDunpack5_8(const __m128i* in, __m128i* out) { __m128i i = _mm_load_si128(in); _mm_store_si128(out++, _mm_and_si128( i , m31)); _mm_store_si128(out++, _mm_and_si128( _mm_srli_epi32(i,5) , _mm_store_si128(out++, _mm_and_si128( _mm_srli_epi32(i,10) , _mm_store_si128(out++, _mm_and_si128( _mm_srli_epi32(i,15) , _mm_store_si128(out++, _mm_and_si128( _mm_srli_epi32(i,20) , _mm_store_si128(out++, _mm_and_si128( _mm_srli_epi32(i,25) , __m128i o = _mm_srli_epi32(i,30); i = _mm_load_si128(++in); o = _mm_or_si128(o, _mm_slli_epi32(_mm_and_si128(i, m7), 2)); _mm_store_si128(out++, o); _mm_store_si128(out++, _mm_and_si128( _mm_srli_epi32(i,3) ,
+}
+
+m31)); m31)); m31)); m31)); m31));
+m31));
+
+Figure 7. Equivalent to the unpack5 8 procedure from Fig. 7 using SSE intrinsic functions as illustrated by Fig. 6.
+
+Int 8
+
+Int 7
+
+Int 6 Int 5 Int 4 Int 3 Int 2 Int 1
+
+Byte 0
+
+Byte 3
+
+Byte 2
+
+Byte 1
+
+Byte 0
+
+Byte 3 0
+
+Byte 2 Int 5 Int 4
+
+Byte 1 Int 3
+Int 2
+
+Byte 0 0
+
+Byte 3 0
+
+Byte 2 0
+
+Byte 1 Int 3
+
+Int 4 Int 2
+
+Byte 0 0
+
+Byte 3 0
+
+Byte 2 0
+
+Byte 1
+
+Byte 0
+
+Int 3 Int 2 Int 1
+
+Int 4
+
+Byte 3 0
+
+Byte 2 0
+
+Byte 1 0
+
+Byte 0 Int 1
+Int 2
+
+Figure 8. One step of simultaneous decoding of four 5-bit integers that are stored in a horizontal layout (as opposed to the vertical data layout of Fig. 6). These integers are copied to four 32-bit words using the shufﬂe operation pshufb. The locations in source and target buffers are indicated by arrows. Curvy lines are used to denote integers that cross byte boundaries in the source buffer. Hence, they are copied only partially. The boldface zero values represent the bytes zeroed by the shufﬂe instruction. Note that some source bytes are
+copied to multiple locations.
+
+integers). Note that unlike varint-G8IU, the integers in the source buffer are not necessarily aligned by byte boundaries (unless b is 8, 16, or 32). Hence, after the shufﬂe operation, (1) the integers copied the target buffer may not be aligned on boundaries of 32-bit words, and (2) 32-bit words may contain some extra bits that do not belong to the integers of interest. 3. Aligning integers on bit boundaries, which may require shifting several integers to the right. Because the x86 platform currently lacks a SIMD shift that has four different shift amounts, this step is simulated via two operations: a SIMD multiplication by four different integers using the SSE4.1 instruction pmulld and a subsequent vectorized right shift. 4. Zeroing bits that do not belong to the integers of interest. This requires a mask operation. 5. Storing the target buffer.
+Overall, Willhalm et al. [47] require SSE4.1 for their horizontal bit packing whereas efﬁcient bit packing using a vertical layout only requires SSE2.
+We compare experimentally vertical and horizontal bit packing in § 6.3.
+
+5. NOVEL SCHEMES: SIMD-FASTPFOR, FASTPFOR AND SIMPLEPFOR
+Patched schemes compress arrays broken down into pages (e.g., thousands or millions of integers). Pages themselves may be broken down into small blocks (e.g., 128 integers). While the original patched coding scheme (PFOR) stores exceptions on a per page basis, newer alternatives such as NewPFD and OptPFD store exceptions on a per block basis (see Table III). Also, PFOR picks a
+
+14
+
+D. LEMIRE AND L. BOYTSOV
+
+single bit width for an entire page, whereas NewPFD and OptPFD may choose a separate bit width for each block.
+The net result is that NewPFD compresses better than PFOR, but PFOR is faster than NewPFD. We would prefer a scheme that compresses as well as NewPFD but with the speed of PFOR. For this purpose, we propose two new schemes: FastPFOR and SimplePFOR. Instead of compressing the exceptions on a per block basis like NewPFD and OptPFD, FastPFOR and SimplePFOR store the exceptions on a per page basis, which is similar to PFOR. However, like NewPFD and OptPFD, they pick a new bit width for each block.
+To explain FastPFOR and SimplePFOR, we consider an example. For simplicity, we only use 16 integers (to be encoded). In the binary notation these numbers are:
+10, 10, 1, 10, 100110, 10, 1, 11, 10, 100000, 10, 110100, 10, 11, 11, 1
+The maximal number of bits used by an integer is 6 (e.g., because of 100000). So we can store the data using 6 bits per value plus some overhead. However, we might be able to do better by allowing exceptions in the spirit of patched coding. Assume that we store the location of any exception using a byte (8 bits): in our implementation, we use blocks of 128 integers so that this is not a wasteful choice.
+We want to pick b ≤ 6, the actual number of bits we use. That is, we store the lowest b bits of each value. If a value uses 6 bits, then we somehow need to store the extra 6 − b bits as an exception. We propose to use the difference (i.e., 6 − b) between the maximal bit width and the number of bits allocated per truncated integer to estimate the cost of storing an exception. This is a heuristic since we use slightly more in practice (to compress the 6 − b highest bits of exception values). Because we store exception locations using 8 bits, we estimate the cost of storing each exception as 8 + (6 − b) = 14 − b bits. We want to choose b so that b × 16 + (14 − b) × c is minimized where c is the number of exceptions corresponding to the value b. (In our software, we store blocks of 128 integers so that the formula would be b × 128 + (14 − b) × c.)
+We still need to compute the number of exceptions c as a function of the bit width b in a given block of integers. For this purpose, we build a histogram that tells us how many integers have a given bit width. In software, this can be implemented as an array of 33 integers: one integer for each possible bit width from 0 to 32. Creating the histogram requires the computation of the integer logarithm ( log2(x + 1) ) of every single integer to be coded. From this histogram, we can quickly determine the value b that minimizes the expected storage simply by trying every possible value of b. Looking at our data, we have 3 integers using 1 bit, 10 integers using 2 bits, and 3 integers using 6 bits. So, if we set b = 1, we get c = 13 exceptions; for b = 2, we get c = 3; and for b = 6, c = 0. The corresponding costs (b × 16 + (14 − b) × c) are 185, 68, and 96. So, in this case, we choose b = 2. We therefore have 3 exceptions (100110, 100000, 110100).
+A compressed page begins with a 32-bit integer. Initially, this 32-bit integer is left uninitialized: we come back to it later. Next, we ﬁrst store the values themselves, with the restriction that we use only b lowest bits of each value. In our example, the data corresponding to the block is
+10, 10, 1, 10, 10, 10, 1, 11, 10, 00, 10, 00, 10, 11, 11, 1.
+These truncated values are stored continuously, one block after the other (see Fig. 9). Different blocks may use different values of b, but because 128 × b is always divisible by 32, the truncated values for a given block can be stored at a memory address that is 32-bit aligned.
+During the encoding of a compressed page, we write to a temporary byte array. The byte array contains different types of information. For each block, we store the number of bits allocated for each truncated integer (i.e., b) and the maximum number of bits any actual, i.e., non-truncated, value may use. If the maximal bit width is greater than the number of allocated bits b, we store a counter c indicating the number of exceptions. We also store the c exception locations within the block as integers in [0, 127]. In contrast with schemes such as NewPFD or OptPFD, we do not attempt to compress these numbers and simply store them using one byte each. Each value is already represented concisely using only one byte as opposed to using a 32-bit integer or worse.
+When all integers of a page have been processed and bit-packed, the temporary byte array is stored right after the truncated integers, preceded with a 32-bit counter indicating its size. We pad the byte
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+15
+
+array with zeros so that the number of bytes is divisible by 4 (allowing a 32-bit memory alignment). Then, we go back to the beginning of the compressed page, where we had left an uninitialized 32-bit integer, and we write there the offset of the byte array within the compressed page. This ensures that during decoding we can locate the byte array immediately. The initial 32-bit integer and the 32-bit counter preceding the byte array add a ﬁxed overhead of 8 bytes per page: it is typically negligible because it is shared by many blocks, often spanning thousands of integers.
+In our example, we write 16 truncated integers using b = 2 bits each, for the total of 4 bytes (32 bits). In the byte array, we store:
+• the number of bits (b = 2) allocated per truncated integer using one byte; • the maximal bit width (6) using a byte; • the number of exceptions c = 3 (again using one byte); • locations of the exceptions (4,9,11) using one byte each.
+Thus, for this block alone, we use 3+4+3=10 bytes (80 bits). Finally, we must store the highest (6 − b) = 4 bits of each exception: 1001, 1000, 1101. They are
+stored right after the byte array. Because the offset of the byte array within the page is stored at the beginning of the page, and because the byte array is stored with a header indicating its length, we can locate the exceptions quickly during decoding. The exceptions are stored on a per page basis in compressed form. This is in contrast to schemes such as OptPFD and NewPFD where exceptions are stored on a per-block basis, interleaved with the truncated values.
+SimplePFOR and FastPFOR differ in how they compress high bits of the exception values:
+• In the SimplePFOR scheme, we collect all these values (e.g., such as 1001, 1000, 1101) in one 32-bit array and we compress them using Simple-8b. We apply Simple-8b only once per compressed page.
+• In the FastPFOR scheme, we store exceptions in one of 32 arrays, one for each possible bit width (from 1 to 32). When encoding a block, the difference between the maximal bit width and b determines in which array the exceptions are stored. Each of the 32 arrays is then bit packed using the corresponding bit width. Arrays are padded so that their length is a multiple of 32 integers. In our example, the 3 values corresponding to the high bits of exceptions (1001, 1000, 1101) would be stored in the fourth array and bit-packed using 4 bits per value. In practice, we store the 32 arrays as follows. We start with a 32-bit bitset: each bit of the bitset corresponds to one array. The bit is set to true if the array is not empty and to false otherwise. Then all non-empty bit-packed arrays are stored in sequence. Each bit-packed array is preceded by a 32-bit counter indicating its length.
+In all other aspects, SimplePFOR and FastPFOR are identical. These schemes provide effective compression even though they were designed for speed. Indeed,
+suppose we could compress the highest bits of 3 exceptions of our example (1001, 1000, 1101) using only 4 bits each. For this block alone, we use 32 bits for the truncated data, 48 bits in the byte array plus 12 bits for the values of the exceptions. The total would be 92 bits to store the 16 original integers, or 5.75 bits/int. This compares favorably to maximal bit width of these integers (6). In our implementation, we use blocks of 128 integers instead of only 16 integers so that good compression is more likely.
+During decoding, the exceptions are ﬁrst decoded in bulk. To ensure that we do not overwhelm the CPU cache, we process the data in pages of 216 integers. We then unpack the integers and apply patching on a per block basis. The exceptions locations do not need any particular decoding: they are read byte by byte.
+Though SimplePFOR and FastPFOR are similar in design to NewPFD and OptPFD, we ﬁnd that they offer better coding and decoding speed. In our tests (see § 6), FastPFOR and SimplePFOR encode integers about twice as fast as NewPFD. It is an indication that compressing exceptions in bulk is faster.
+
+16
+
+D. LEMIRE AND L. BOYTSOV
+
+Data to be compressed: . . . 10, 10, 1, 10, 100110, 10, 1, 11, 10, 100000, 10, 110100, 10, 11, 11, 1. . .
+
+Truncated data: (16 × 2 = 32 bits)
+Byte array: (6 × 8 = 48 bits)
+Exception data: (to be compressed)
+
+. . . 10, 10, 01, 10, 10, 10, 01, 11, 10, 00, 10, 00, 10, 11, 11, 01 . . . . . . 2, 6, 3, 4, 9, 11 . . . . . . 1001, 1000, 1101 . . .
+
+Figure 9. Layout of a compressed page for SimplePFOR and FastPFOR schemes with our running example. We only give numbers for a block of 16 integers: a page contains hundreds of blocks. The beginning of each page contains the truncated data of each block. The truncated data is then followed by a byte array containing
+metadata (e.g., exception locations). At the end of the page, we store the exceptions in compressed form.
+
+We also designed a new scheme, SIMD-FastPFOR: it is identical to FastPFOR except that it packs relies on vectorized bit packing for the truncated integers and the high bits of the exception values. The compression ratio is slightly diminished for two reasons:
+• The 32 exception arrays are padded so that their length is a multiple of 128 integers, instead of 32 integers.
+• We insert some padding prior to storing bit packing data so that alignment on 128-bit boundaries is preserved.
+This padding adds an overhead of about 0.3–0.4 bits per integer (see Table V).
+
+6. EXPERIMENTS
+The goal of our experiments is to evaluate the best known integer encoding methods. The ﬁrst series of our test in § 6.4 is based on synthetic data sets ﬁrst presented by Anh and Moffat [25]: ClusterData and Uniform. They have the beneﬁt that they can be quickly implemented, thus helping reproducibility. We then conﬁrm our results in § 6.5 using large realistic data sets based on TREC collections ClueWeb09 and GOV2.
+6.1. Hardware
+We carried out our experiments on a Linux server equipped with Intel Core i7 2600 (3.40 GHz, 8192 KB of L3 CPU cache) and 16 GB of RAM. The DDR3-1333 RAM with dual channel has a transfer rate of ≈20,000 MB/s or ≈5300 mis. According to our tests, it can copy arrays at a rate of 2270 mis with the C function memcpy.
+6.2. Software
+We implemented our algorithms in C++ using GNU GCC 4.7. We use the optimization ﬂag -O3. Because the varint-G8IU scheme requires SSSE3 instructions, we had to add the ﬂag -mssse3. When compiling our implementation of Willhalm et al. [47] bit unpacking, we had to use the ﬂag -msse4.1 since it requires SSE4 instructions. Our complete source code is available online.†
+Following Stepanov et al. [12], we compute speed based on the wall-clock in-memory processing. Wall-clock times include the time necessary for differential coding and decoding. During our tests, we do not retrieve or store data on disk: it is impossible to decode billions of integers per second when they are kept on disk.
+†https://github.com/lemire/FastPFOR
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+17
+
+Arrays containing more than 216 integers (256 KB) are broken down into smaller chunks. Each chunk is decoded into two passes. In the ﬁrst pass, we decompress deltas and store each delta value using a 32-bit word. In the second pass, we carry out an in-place computation of preﬁx sums. As noted in § 3, this approach greatly improves data locality and leads to a signiﬁcant improvement in decoding speed for the fastest schemes.
+Our implementation of VSEncoding, NewPFD, and OptPFD is based on software published by Silvestri and Venturini [24]. They report that their implementation of OptPFD was validated against an implementation provided by the original authors [10]. We implemented varint-G8IU from Stepanov et al. [12] as well as Simple-8b from Anh and Moffat [25]. To minimize branching, we implemented Simple-8b using a C++ switch case that selects one of 16 functions, that is, one for each selector value. Using a function for each selector value instead of a single function is faster because loop unrolling eliminates branching. (Anh and Moffat [25] referred to this optimization as bulk unpacking.) We also implemented the original PFOR scheme from Zukowski et al. [23] as well as its successor PFOR2008 from Zhang et al. [26]. Zukowski et al. made a distinction between PFOR and PFOR-Delta: we effectively use FOR-Delta since we apply PFOR to deltas.
+Reading and writing unaligned data can be as fast as reading and writing aligned data on recent Intel processors—as long as we do not cross a 64-byte cache line. Nevertheless, we still wish to align data on 32-bit boundaries when using regular binary packing. Each block of 32 bit-packed integers should be preceded by a descriptor that stores the bit width (b) of integers in the block. The number of bits used by the block is always divisible by 32. Hence, to keep blocks aligned on 32-bit boundaries, we group the blocks and respective descriptors into meta-blocks each of which contains 4 successive blocks. A meta-block is preceded by a 32-bit descriptor that combines 4 bit widths b (8 bits per width). We call this scheme BP32. We also experimented with versions of binary packing on fewer integers (8 integers and 16 integers). Because these versions are slower, we omit them from our experiments.
+We also implemented a vectorized binary packing over blocks of 128 integers (henceforth SIMD-BP128). Similar to regular binary packing, we want to keep the blocks aligned on 128-bit boundaries when using vectorized binary packing. To this end, we regroup 16 blocks into a metablock of 2048 integers. As in BP32, the encoded representation of a meta-block is preceded by a 128-bit descriptor word keeping bit widths (8 bits per width).
+In summary, the format of our binary packing schemes is as follows:
+• SIMD-BP128 combines 16 blocks of 128 integers whereas BP32 combines 4 blocks of 32 integers.
+• SIMD-BP128 employs (vertical) vectorized bit packing whereas BP32 relies on the regular bit packing as described in §4.
+Many schemes such as BP32 and SIMD-BP128 require the computation of the integer logarithm during encoding. If done naively, this step can take up most of the running time: the computation of the integer logarithm is slower than a fast operation such as a shift or an addition. We found it best to use the bit scan reverse (bsr) assembly instruction on x86 platforms (as it provides log2(x + 1) − 1 whenever x > 0).
+For the binary packing schemes, we must determine the maximum of the integer logarithm of the integers (maxi log2(xi + 1) ) during encoding. Instead on computing one integer logarithm per integer, we carry out a bit-wise logical or on all the integers and compute the integer logarithm of the result. This shortcut is possible due to the equation: maxi log2(xi + 1) = log2 ∨i(xi + 1) where ∨ refers to the bit-wise logical or.
+Some schemes compress data in blocks of ﬁxed length (e.g., 128 integers). We compress the remainder using Variable Byte as in Zhang et al. [26]. In our tests, most arrays are large compared to the block size. Thus, replacing Variable Byte by another scheme would make no or little difference.
+Speeds are reported in millions of 32-bit integers per second (mis). Stepanov et al. report a speed of 1059 mis over the TREC GOV2 data set for their best scheme varint-G8IU. We got a similar speed (1300 mis).
+VSEncoding, FastPFOR, and SimplePFOR use buffers during compression and decompression proportional to the size of the array. VSEncoding uses a persistent buffer of over 256 KB. We
+
+18
+
+D. LEMIRE AND L. BOYTSOV
+
+implemented SIMD-FastPFOR, FastPFOR, and SimplePFOR with a persistent buffer of slightly more than 64 KB. PFOR, PFOR2008, NewPFD, and OptPFD are implemented using persistent buffers proportional to the block size (128 integers in our tests): less than 512 KB in persistent buffer memory are used for each scheme. Both PFOR and PFOR2008 use pages of 216 integers or 256 KB. During compression, PFOR, PFOR2008, SIMD-FastPFOR, FastPFOR, and SimplePFOR use a buffer to store exceptions. These buffers are limited by the size of the pages and they are released immediately after decoding or encoding an array.
+The implementation of VSEncoding [24] uses some SSE2 instructions through assembly during bit unpacking. Varint-G8IU makes explicit use of SSSE3 instructions through SIMD intrinsic functions whereas SIMD-FastPFOR and SIMD-BP128 similarly use SSE2 intrinsic functions.
+Though we tested vectorized differential coding with all schemes, we only report results for schemes that make explicit use of SIMD instructions (SIMD-FastPFOR, SIMD-BP128, and varintG8IU). To ensure fast vector processing, we align all initial pointers on 16-byte boundaries.
+
+6.3. Computing bit packing
+We implemented bit packing using hand-tuned functions as originally proposed by Zukowski et al. [23]. Given a bit width b, a sequence of K unsigned 32-bit integers are coded to Kb/32 integers. In our tests, we used K = 32 for the regular version, and K = 128 for the vectorized version.
+Fig. 10 illustrates the speed at which we can pack and unpack integers using blocks of 32 integers. In some schemes, it is known that all integers are no larger than 2b − 1, while in patching schemes there are exceptions, i.e., integers larger than or equal to 2b. In the latter case, we enforce that integers are smaller than 2b through the application of a mask. This operation slows down compression.
+We can pack and unpack much faster when the number of bits is small because less data needs to be retrieved from RAM. Also, we can pack and unpack faster when the bit width is 4, 8, 16, 24 or 32. Packing and unpacking with bit widths of 8 and 16 is especially fast.
+The vectorized version (Fig. 10b) is roughly twice as fast as the scalar version. We can unpack integers having a bit width of 8 or less at a rate of ≈6000 mis. However, it carries the implicit constraint that integers must be packed and unpacked in blocks of at least 128 integers. Packing is slightly faster when the bit width is 8 or 16.
+In Fig. 10b only, we report the unpacking speed when using the horizontal data layout as described by Willhalm et al. [47] (see § 4). When the bit widths range from 16 to 26, the vertical and horizontal techniques have the same speed. For small (< 8) or large (> 27) bit widths, our approach based on a vertical layout is preferable as it is up to 70% faster. Accordingly, all integer coding schemes are implemented using the vertical layout.
+We also experimented with the cases where we pack fewer integers (K = 8 or K = 16). However, it is slower and a few bits remain unused ( Kb/32 32 − Kb).
+
+6.4. Synthetic data sets
+We used the ClusterData and the Uniform model from Anh and Moffat [25]. These models generate sets of distinct integers that we keep in sorted order. In the Uniform model, integers follow a uniform distribution whereas in the ClusterData model, integer values tend to cluster. That is, we are more likely to get long sequences of similar values. The goal of the ClusterData model is to simulate more realistically data encountered in practice. We expect data obtained from the ClusterData model to be more compressible.
+We generated data sets of random integers in the range [0, 229) with both the ClusterData and the Uniform model. In the ﬁrst pass, we generated 210 short arrays containing 215 integers each. The average difference between successive integers within an array is thus 229−15 = 214. We expect the compressed data to use at least 14 bits/int. In the second pass, we generated a single long array of 225 integers. In this case, the average distance between successive integers is 24: we expect the compressed data to use at least 4 bits/int.
+The results are given in Table IV (schemes with a by their name, e.g., SIMD-FastPFOR , use vectorized differential coding). Over short arrays, we see little compression as expected. There is
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+19
+
+speed (mis) speed (mis)
+
+9000 8000 7000 6000 5000 4000 3000 2000 1000
+0
+
+packing packing without mask
+unpacking
+2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 bit width
+(a) Optimized but portable C++
+
+9000 8000 7000 6000
+
+packing packing without mask
+unpacking unpacking (hori.)
+
+5000
+
+4000
+
+3000
+
+2000
+
+1000
+
+0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 bit width
+
+(b) Vectorized with SSE2 instructions
+
+speed ratio (SIMD/C++)
+
+3.2
+
+3
+
+2.8
+
+2.6
+
+2.4
+
+2.2
+
+2
+
+1.8
+
+1.6
+
+packing
+
+1.4
+
+packing without mask
+
+unpacking
+
+1.2
+
+0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32
+
+bit width
+
+(c) Ratio vectorized/non-vectorized
+
+Figure 10. Wall-clock speed in millions of integers per second for bit packing and unpacking. We use small arrays (256 KB) to minimize cache misses. When packing integers that do not necessarily ﬁt in b bits, (as
+required in patching schemes), we must apply a mask which slows down packing by as much as 30%.
+
+also a relatively little difference in compression efﬁciency between Variable Byte and a more spaceefﬁcient alternative such as FastPFOR. However, speed differences are large: the decoding speed ranges from 220 mis for Variable Byte to 2500 mis for SIMD-BP128 .
+For long arrays, there is a greater difference between the compression efﬁciencies. The schemes with the best compression ratios are SIMD-FastPFOR, FastPFOR, SimplePFOR, Simple-8b, OptPFD. Among those, SIMD-FastPFOR is the clear winner in terms of decoding speed. The good compression ratio of OptPFD comes at a price: it has one of the worst encoding speeds. In fact, it is 20–50 times slower than SIMD-FastPFOR during encoding.
+Though they differ signiﬁcantly in implementation, FastPFOR, SimplePFOR, and SIMD-FastPFOR have equally good compression ratios. All three schemes have similar decoding speeds, but SIMD-FastPFOR decodes integers much faster than FastPFOR and SimplePFOR.
+In general, encoding speeds vary signiﬁcantly, but binary packing schemes are the fastest, especially when they are vectorized. Better implementations could possibly help reduce this gap.
+The version of SIMD-BP128 using vectorized differential coding (written SIMD-BP128 ) is always 400 mis faster during decoding than any other alternative. Though it does not always offer the best compression ratio, it always matches the compression ratio of Variable Byte.
+The difference between using vectorized differential coding and regular differential coding could amount to up to 2 bits per integer. Yet, typically, the difference is less than 2 bits. For example, SIMD-BP128 only uses about one extra bit per integer when compared with SIMD-BP128. The cost of binary packing is determined by the largest delta in a block: increasing the average size of the deltas by a factor of 4 does not necessarily lead to a fourfold increase in the expected largest integer (in a block of 128 deltas).
+Compared to our novel schemes, performance of varint-G8IU is unimpressive. However, variant-G8IU is about 60% faster than Variable Byte while providing a similar compression efﬁciency. It is also faster than Simple-8b, though Simple-8b has a better compression efﬁciency. The version with vectorized differential coding (written varint-G8IU ) has poor compression over
+
+20
+
+D. LEMIRE AND L. BOYTSOV
+
+the short arrays compared with the regular version (varint-G8IU). Otherwise, on long arrays, varintG8IU is signiﬁcantly faster (from 1300 mis to 1600 mis) than varint-G8IU while compressing just as well.
+There is little difference between PFOR and PFOR2008 except that PFOR offers a signiﬁcantly faster encoding speed. Among all the schemes taken from the literature, PFOR and PFOR2008 have the best decoding speed in these tests: they use a single bit width for all blocks, determined once at the beginning of the compression. However, they are dominated in all metrics (coding speed, decoding speed and compression ratio) by SIMD-BP128 and SIMD-FastPFOR.
+For comparison, we tested Google Snappy (version 1.0.5) as a delta compression technique. Google Snappy is a freely available library used internally by Google in its database engines [17]. We believe that it is competitive with other fast generic compression libraries such as zlib or LZO. For short ClusterData arrays, we got a decoding speed of 340 mis and almost no compression (29 bits/int.). For long ClusterData arrays, we got a decoding speed of 200 mis and 14 bits/int. Overall, Google Snappy has about half the compression efﬁciency of SIMD-BP128 while being an order of magnitude slower.
+
+6.5. Realistic data sets
+The posting list of a word is an array of document identiﬁers where the word occurs. For more realistic data sets, we used posting lists obtained from two TREC Web collections. Our data sets include only document identiﬁers, but not positions of words in documents. For our purposes, we do not store the words or the documents themselves, just the posting lists.
+The ﬁrst data set is a posting list collection extracted from the ClueWeb09 (Category B) data set [51]. The second data set is a posting list collection built from the GOV2 data set by Silvestri and Venturini [24]. The GOV2 is a crawl of the .gov sites, which contains 25 million HTML, text, and PDF documents (the latter are converted to text).
+This ClueWeb09 collection is a more realistic HTML collection of about 50 million crawled HTML documents, mostly in English. It represents postings for one million most frequent words. Common stop words were excluded and different grammar forms of words were conﬂated. Documents were enumerated in the order they appear in source ﬁles, i.e., they were not reordered. Unlike GOV2, the ClueWeb09 crawl is not limited to any speciﬁc domain. Uncompressed, the posting lists from GOV2 and ClueWeb09 use 20 GB and 50 GB respectively.
+We decomposed these data sets according to the array length, storing all arrays of lengths 2K to 2K+1 − 1 consecutively. We applied differential coding on the arrays (integers x1, x2, x3, . . . are transformed to y1 = x1, y2 = x2 − x1, y3 = x3 − x2, . . .) and computed the Shannon entropy (− i p(yi) log2 p(yi)) of the result. We estimate the probability p(yi) of the integer value yi as the number of occurrences of yi divided by the number of integers. As Fig. 11 shows, longer arrays are more compressible. There are differences in entropy values between two collections (ClueWeb09 has about two extra bits, see Fig. 11a), but these differences are much smaller than those among different array sizes. Fig. 11b shows the distribution of array lengths and entropy values.
+6.5.1. Results over different array lengths We present results per array length for selected schemes in Fig. 12. Longer arrays are more compressible since the deltas, i.e., differences between adjacent elements, are smaller.
+We see in Figs. 12b and 12f that all schemes compress the deltas within a factor of two of the Shannon entropy for short arrays. For long arrays however, the compression (compared to the Shannon entropy) becomes worse for all schemes. Yet many of them manage to remain within a factor of three of the Shannon entropy.
+Integer compression schemes are better able to compress close to the Shannon entropy over ClueWeb09 (see Fig. 12b) than over GOV2 (see Fig. 12f). For example, SIMD-FastPFOR, Simple8b, and OptPFD are within a factor of two of Shannon entropy over ClueWeb09 for all array lengths, whereas they all exceed three times the Shannon entropy over GOV2 for the longest arrays. Similarly, varint-G8IU, SIMD-BP128 , and SIMD-FastPFOR remain within a factor of six of the
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+21
+
+Table IV. Coding and decoding speed in millions of integers per second over synthetic data sets, together with number of bits per 32-bit integer. Results are given using two signiﬁcant digits. Schemes with a by
+their name use vectorized differential coding.
+
+(a) ClusterData: Short arrays
+
+SIMD-BP128 SIMD-FastPFOR SIMD-BP128 SIMD-FastPFOR PFOR PFOR2008 SimplePFOR FastPFOR BP32 NewPFD varint-G8IU varint-G8IU VSEncoding Simple-8b OptPFD Variable Byte
+
+coding 1700 380 1000 300 350 280 300 300 790 66 160 150 10 260 5.1 300
+
+decoding 2500 2000 1800 1400 1200 1200 1100 1100 1100 1100 910 860 720 690 660 270
+
+bits/int 17 16 16 15 18 18 15 15 15 16 23 18 16 16 15 17
+
+(b) Uniform: Short arrays
+
+coding 1600 360 1100 330 370 280 330 330 840 64 140 170 10 260 4.6 240
+
+decoding 2000 1800 1600 1400 1400 1400 1200 1200 1200 1300 650 870 690 540 1100 220
+
+bits/int 18 18 17 16 17 17 16 16 17 17 25 18 18 18 17 19
+
+(c) ClusterData: Long arrays
+
+SIMD-BP128 SIMD-FastPFOR SIMD-BP128 SIMD-FastPFOR varint-G8IU PFOR PFOR2008 BP32 FastPFOR SimplePFOR varint-G8IU NewPFD Simple-8b VSEncoding OptPFD Variable Byte
+
+coding 1800 440 1100 320 270 360 280 840 320 320 230 120 360 9.8 17 880
+
+decoding 2800 2400 1900 1600 1600 1300 1300 1300 1200 1200 1300 970 890 790 750 830
+
+bits/int 7.0 6.8 6.0 5.4 9.1 6.1 6.1 5.8 5.4 5.3 9.0 5.5 5.6 6.4 5.4 8.1
+
+(d) Uniform: Long arrays
+
+coding 1900 380 1100 340 270 360 280 810 330 330 230 110 370 9.9 15 930
+
+decoding 2600 2200 1800 1600 1600 1300 1300 1200 1200 1200 1300 1000 940 790 740 860
+
+bits/int 8.0 7.6 7.0 6.4 9.0 7.3 7.3 6.7 6.3 6.3 9.0 6.5 6.4 7.2 6.2 8.0
+
+Shannon entropy over ClueWeb09 but they all exceed this factor over GOV2 for long arrays. In general, it might be easier to compress data close to the entropy when the entropy is larger.
+We get poor results with varint-G8IU over the longer (and more compressible) arrays (see Figs. 12a and 12e). We do not ﬁnd this surprising because variant-G8IU requires at least 9 bits/int. In effect, when other schemes such as SIMD-FastPFOR and SIMD-BP128 use less than ≈ 8 bits/int, they surpass varint-G8IU in both compression efﬁciency and decoding speed. However, when the storage exceeds 9 bits/int, Varint-G8IU is one of the fastest methods available for these data sets. However, we also got poor results with variant-G8IU on the ClusterData and Uniform data sets for short (and poorly compressible) arrays in § 6.4.
+
+22
+
+D. LEMIRE AND L. BOYTSOV
+
+Entropy Relative data volume
+
+14
+
+ClueWeb09
+
+12
+
+TREC GOV2
+
+10
+
+8
+
+6
+
+4
+
+2
+
+0
+
+10
+
+12
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(a) Shannon entropy of the differences (deltas)
+
+0.18 0.16 0.14
+
+ClueWeb09 TREC GOV2 AOL query log
+
+0.12
+
+0.1
+
+0.08
+
+0.06
+
+0.04
+
+0.02
+
+0
+
+10
+
+12
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(b) Data distribution
+
+Figure 11. Description of the posting-list data sets
+
+We see in Figs. 12c and 12g that both SIMD-BP128 and SIMD-BP128 have a signiﬁcantly better encoding speed, irrespective of the array length. The opposite is true for OptPFD: it is much slower than the alternatives.
+Examining the decoding speed as a function of array length (see Figs. 12c and 12g), we see that several schemes have a signiﬁcantly worse decoding speed over short (and poorly compressible) arrays, but the effect is most pronounced for the new schemes we introduced (SIMD-FastPFOR, SIMD-FastPFOR , SIMD-BP128, and SIMD-BP128 ). Meanwhile, varint-G8IU and Simple-8b have a decoding speed that is less sensitive to the array length.
+6.5.2. Aggregated results Not all posting lists are equally likely to be retrieved by the search engine. As observed by Stepanov et al. [12], it is desirable to account for different term distributions in queries. Unfortunately, we do not know of an ideal approach to this problem. Nevertheless, to model more closely the performance of a major search engine, we used the AOL query log data set as a collection of query statistics [52, 53]. It consists of about 20 million web queries collected from 650 thousand users over three months: queries repeating within a single user session were ignored. When possible (in about 90% of all cases), we matched the query terms with posting lists in the ClueWeb09 data set and obtained term frequencies (see Fig. 11b). This allowed us to estimate how often a posting list of length between 2K to 2K+1 − 1 is likely to be retrieved for various values of K. This gave us a weight vector that we use to aggregate our results.
+We present aggregated results in Table V. The results are generally similar to what we obtained with synthetic data. The newly introduced schemes (SIMD-BP128 , SIMD-FastPFOR , SIMD-BP128, SIMD-FastPFOR) still offer the best decoding speed. We ﬁnd that varint-G8IU is much faster than varint-G8IU (1500 mis vs. 1300 mis over GOV2) even though the compression ratio is the same with a margin of 10%. PFOR and PFOR2008 offer a better compression than varint-G8IU but at a reduced speed. However, we ﬁnd that SIMD-BP128 is preferable in every way to varint-G8IU , varint-G8IU, PFOR, and PFOR2008.
+For some applications, decoding speed and compression ratios are the most important metrics. Whereas elsewhere we report the number of bits per integer b, we can easily compute the compression ratio as 32/b. We plot both metrics for some competitive schemes (see Fig. 13). These plots suggest that the most competitive schemes are SIMD-BP128 , SIMD-FastPFOR , SIMD-BP128, SIMD-FastPFOR, SimplePFOR, FastPFOR, Simple-8b, and OptPFD depending on how much compression is desired. Fig. 13 also shows that to achieve decoding speeds higher than 1300 mis, we must choose between SIMD-BP128, SIMD-FastPFOR , and SIMD-BP128 .
+Few research papers report encoding speed. Yet we ﬁnd large differences: for example, VSEncoding and OptPFD are two orders of magnitude slower during encoding than our fastest schemes. If the compressed arrays are written to slow disks in a batch mode, such differences might be of little practical signiﬁcance. However, for memory-based databases and network applications, slow encoding speeds could be a concern. For example, the output of a query might need to be
+
+bits/int
+
+encoding speed (mis)
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+23
+
+18 16 14 12 10
+8 6 4 2 0
+12
+
+varint-G8IU SIMD-FastPFOR SIMD-FastPFOR*
+SIMD-BP128 SIMD-BP128*
+Simple-8b OptPFD
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(a) Size: ClueWeb09 (bits/int)
+
+size (Shannon = 1)
+
+6
+
+5.5
+
+varint-G8IU SIMD-FastPFOR
+
+5 SIMD-FastPFOR*
+
+SIMD-BP128
+
+4.5
+
+SIMD-BP128*
+
+4
+
+Simple-8b
+
+OptPFD
+
+3.5
+
+3
+
+2.5
+
+2
+
+1.5
+
+1
+
+12
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(b) Size: ClueWeb09 (relative to entropy)
+
+2000 1500
+
+varint-G8IU SIMD-FastPFOR SIMD-FastPFOR*
+SIMD-BP128
+
+SIMD-BP128* Simple-8b OptPFD
+
+1000
+
+500
+
+0
+
+12
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(c) Encoding: ClueWeb09
+
+decoding speed (mis)
+
+3000 2500 2000
+
+varint-G8IU SIMD-FastPFOR SIMD-FastPFOR*
+SIMD-BP128
+
+SIMD-BP128* Simple-8b OptPFD
+
+1500
+
+1000
+
+500
+
+0
+
+12
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(d) Decoding: ClueWeb09
+
+18 16 14 12 10
+8 6 4 2 0
+12
+
+varint-G8IU SIMD-FastPFOR SIMD-FastPFOR*
+SIMD-BP128 SIMD-BP128*
+Simple-8b OptPFD
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(e) Size: GOV2 (bits/int)
+
+size (Shannon = 1)
+
+6
+
+5.5
+
+varint-G8IU SIMD-FastPFOR
+
+5 SIMD-FastPFOR*
+
+SIMD-BP128
+
+4.5
+
+SIMD-BP128*
+
+4
+
+Simple-8b
+
+OptPFD
+
+3.5
+
+3
+
+2.5
+
+2
+
+1.5
+
+1
+
+12
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(f) Size: GOV2 (relative to entropy)
+
+2000 1800 1600 1400
+
+varint-G8IU SIMD-FastPFOR SIMD-FastPFOR*
+SIMD-BP128
+
+SIMD-BP128* Simple-8b OptPFD
+
+1200
+
+1000
+
+800
+
+600
+
+400
+
+200
+
+0
+
+12
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(g) Encoding: GOV2
+
+decoding speed (mis)
+
+3500 3000 2500
+
+varint-G8IU SIMD-FastPFOR SIMD-FastPFOR*
+SIMD-BP128
+
+SIMD-BP128* Simple-8b OptPFD
+
+2000
+
+1500
+
+1000
+
+500
+
+0
+
+12
+
+14
+
+16
+
+18
+
+20
+
+22
+
+24
+
+array length (log)
+
+(h) Decoding: GOV2
+
+Figure 12. Experimental comparison of competitive schemes on ClueWeb09 and GOV2.
+
+bits/int
+
+encoding speed (mis)
+
+compressed or we might need to index the data in real time [54]. Our SIMD-BP128 and SIMDBP128 schemes have especially fast encoding.
+Similarly to previous work [12, 24], in Table VI we report unweighted averages. The unweighted speed aggregates are equivalent to computing the average speed over all arrays—irrespective of their lengths. From the distribution of posting size logarithms in Fig. 11b, one may conclude that
+
+24
+
+D. LEMIRE AND L. BOYTSOV
+
+Table V. Experimental results. Coding and decoding speeds are given in millions of 32-bit integers per second. Averages are weighted based on AOL query logs.
+
+SIMD-BP128 SIMD-FastPFOR SIMD-BP128 varint-G8IU SIMD-FastPFOR PFOR2008 PFOR varint-G8IU BP32 SimplePFOR FastPFOR NewPFD VSEncoding Simple-8b OptPFD Variable Byte
+
+(a) ClueWeb09
+
+coding 1600 330 1000 220 250 260 330 210 760 240 240 100 11 280 14 570
+
+decoding 2300 1700 1600 1400 1200 1200 1200 1200 1100 980 980 890 740 730 500 540
+
+bits/int 11 9.9 9.5 12 8.1 10 11 11 8.3 7.7 7.8 8.3 7.6 7.5 7.1 9.6
+
+coding 1600 350 1000 240 290 250 310 230 790 270 270 150 11 340 23 730
+
+(b) GOV2
+decoding 2500 1900 1700 1500 1400 1300 1300 1300 1200 1100 1100 1000 810 780 710 680
+
+bits/int 7.6 7.2 6.3 10 5.3 7.9 7.9 9.6 5.5 4.8 4.9 5.2 5.4 4.8 4.5 8.7
+
+bits/int bits/int
+
+12
+
+11
+
+10
+
+9
+
+8
+
+7
+
+6
+
+5
+
+4
+
+0
+
+500
+
+SIMD-FastPFOR SIMD-FastPFOR*
+SIMD-BP128 varint-G8IU
+
+1000
+
+1500
+
+decoding speed (mis)
+
+2000
+
+SIMD-BP128* PFOR BP32
+FastPFOR
+
+NewPFD VSE
+Simple-8b OptPFD
+
+(a) ClueWeb09
+
+2500
+
+12
+
+11
+
+10
+
+9
+
+8
+
+7
+
+6
+
+5
+
+4
+
+0
+
+500
+
+SIMD-FastPFOR SIMD-FastPFOR*
+SIMD-BP128 varint-G8IU
+
+1000
+
+1500
+
+decoding speed (mis)
+
+2000
+
+SIMD-BP128* PFOR BP32
+FastPFOR
+
+NewPFD VSE
+Simple-8b OptPFD
+
+(b) GOV2
+
+2500
+
+Figure 13. Scatter plots comparing competitive schemes on decoding speed and bits per integer weighted based on AOL query logs. We use VSE as a shorthand for VSEncoding. For reference, Variable Byte is
+indicated as a red lozenge. The novel schemes (e.g., SIMD-BP128 ) are identiﬁed with blue markers.
+
+weighted results should be similar to unweighted ones. These observations are supported by data in Table VI: the decoding speeds and compression ratios for both aggregation approaches differ by less than 15% with the weighted results presented in Table V.
+We can compare the number of bits per integer in Table VI with an information-theoretic limit. Indeed, the Shannon entropy for the deltas of ClueWeb09 is 5.5 bits/int whereas it is 3.6 for GOV2. Hence, OptPFD is within 16% of the entropy on ClueWeb09 whereas it is within 22% of the entropy on GOV2. Meanwhile, the faster SIMD-FastPFOR is within 30% and 40% of the entropy for ClueWeb09 and GOV2. Our fastest scheme (SIMD-BP128 ) compresses the deltas of GOV2 to twice the entropy. It does slightly better with ClueWeb09 (1.8×).
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+25
+
+Table VI. Average speeds in millions of 32-bit integers per second and bits per integer over all arrays of two data sets. These averages are not weighted according to the AOL query logs.
+
+SIMD-BP128 SIMD-FastPFOR SIMD-BP128 varint-G8IU SIMD-FastPFOR PFOR2008 PFOR varint-G8IU BP32 SimplePFOR FastPFOR NewPFD VSEncoding Simple-8b OptPFD Variable Byte
+
+(a) ClueWeb09
+
+coding 1600 340 1000 230 260 260 330 220 770 250 240 110 11 290 16 630
+
+decoding 2400 1700 1700 1400 1300 1300 1300 1200 1100 1000 1000 900 760 750 530 600
+
+bits/int 9.7 9.0 8.7 12 7.2 9.6 9.6 10 7.5 6.9 6.9 7.4 6.9 6.7 6.4 9.2
+
+coding 1600 350 1000 250 290 250 310 230 790 260 270 150 11 340 25 750
+
+(b) GOV2
+decoding 2500 1900 1800 1500 1400 1300 1300 1200 1200 1100 1100 990 790 780 720 700
+
+bits/int 7.4 6.9 6.1 10 5.1 7.6 7.6 9.6 5.3 4.7 4.8 5.0 5.4 4.6 4.4 8.6
+
+7. DISCUSSION
+We ﬁnd that binary packing is both fast and space efﬁcient. The vectorized binary packing (SIMD-BP128 ) is our fastest scheme. While it has a lesser compression efﬁciency compared to Simple-8b, it is more than 3 times faster during decoding. Moreover, in the worst case, a slower binary packing scheme (BP32) incurred a cost of only about 1.2 bits per integer compared to the patching scheme with the best compression ratio (OptPFD) while decoding nearly as fast (within 10%) as the fastest patching scheme (PFOR).
+Yet only few authors considered binary packing schemes or its vectorized variants in the recent literature:
+• Delbru et al. [41] reported good results with a binary packing scheme similar to our BP32: in their experiments, it surpassed Simple-8b as well as a patched scheme (PFOR2008).
+• Anh and Moffat [9] also reported good results with a binary packing scheme: in their tests, it decoded at least 50% faster than either Simple-8b or PFOR2008. As a counterpart, they reported that their binary packing scheme had a poorer compression.
+• Schlegel et al. [34] proposed a scheme similar to SIMD-BP128. This scheme (called k-gamma) uses a vertical data layout to store integers, like our SIMD-BP128 and SIMDFastPFOR schemes. It essentially applies binary packing to tiny groups of integers (at most 4 elements). From our preliminary experiments, we learned that decoding integers in small groups is not efﬁcient. This is also supported by results of Schlegel et al. [34]. Their fastest decoding speed, which does not include writing back to RAM, is only 1600 mis (Core i7-920, 2.67 Ghz).
+• Willhalm et al. [47] used a vectorized binary packing like our SIMD-BP128, but with a horizontal data layout instead of our vertical layout. The decoding algorithm relies on the shufﬂe instruction pshufb. Our experimental results suggest that our approach based on a vertical layout might be preferable (see Fig. 10a): our implementation of bit unpacking over a vertical layout is sometimes between 50% to 70% faster than our reimplementation over a horizontal layout based on the work of Willhalm et al. [47]. This performance comparison depends on the quality of our software. Yet the speed of our reimplementation is comparable with the speed originally reported by Willhalm et al. [47,
+
+26
+
+D. LEMIRE AND L. BOYTSOV
+
+Fig. 11]: they report a speed of ≈3300 mis with a bit width of 6. In contrast, using our implementation of their algorithms, we got a speed above 4800 mis for the same bit width and a 20% higher clock speed on a more recent CPU architecture. The approach described by Willhalm et al. might be more competitive on platforms with instructions for simultaneously shifting several values by different offsets (e.g., the vpsrld AVX2 instruction). Indeed, this must be otherwise emulated by multiplications by powers of two followed by shifting.
+Vectorized bit-packing schemes are efﬁcient: they encode/decode integers at speeds of 4000– 8500 mis. Hence, the computation of deltas and preﬁx sums may become a major bottleneck. This bottleneck can be removed through vectorization of these operations (though at expense of poorer compression ratios in our case). We have not encountered this approach in the literature: perhaps, because for slower schemes the computation of the preﬁx sum accounts for a small fraction of total running time. In our implementation, to ease comparisons, we have separated differential decoding from data decompression: an integrated approach could be up to twice as fast in some cases. Moreover, we might be able improve the decoding speed and the compression ratios with better vectorized algorithms. There might also be alternatives to data differencing, which also permit vectorization, such as linear regression [43].
+In our results, the original patched coding scheme (PFOR) is bested on all three metrics (compression ratio, coding and decoding speed) by a binary packing scheme (SIMD-BP128). Similarly, a more recent fast patching scheme (NewPFD) is generally bested by another binary packing scheme (BP32). Indeed, though the compression ratio of NewPFD is up to 6% better on realistic data, NewPFD is at least 20% slower than BP32. Had we stopped our investigations there, we might have been tempted to conclude that patched coding is not a viable solution when decoding speed is the most important characteristic on desktop processors. However, we designed a new vectorized patching scheme SIMD-FastPFOR. It shows that patching remains a fruitful strategy even when SIMD instructions are used. Indeed, it is faster than the SIMD-based varint-G8IU while providing a much better compression ratio (by at least 35%). In fact, on realistic data, SIMDFastPFOR is better than BP32 on two key metrics: decoding speed and compression ratio (see Fig. 13).
+In the future, we may expect increases in the arity of SIMD operations supported by commodity CPUs (e.g., with AVX) as well as in memory speeds (e.g., with DDR4 SDRAM). These future improvements could make our vectorized schemes even faster in comparison to their scalar counterparts. However, an increase in arity means an increase in the minimum block size. Yet, when we increase the size of the blocks in binary packing, we also make them less space efﬁcient in the presence of outlier values. Consider that BP32 is signiﬁcantly more space efﬁcient than SIMD-BP128 (e.g., 5.5 bits/int vs. 6.3 bits/int on GOV2).
+Thankfully, the problem of outliers in large blocks can be solved through patching. Indeed, even though OptPFD uses the same block size as SIMD-BP128, it offers signiﬁcantly better compression (4.5 bits/int vs. 6.3 bits/int on GOV2). Thus, patching may be more useful for future computers— capable of processing larger vectors—than for current ones.
+While our work focused on decoding speed, there is promise in directly processing data while still in compressed form, ideally by using vectorization [47]. We expect that conceptually simpler schemes (e.g., SIMD-BP128) might have the advantage over relatively more sophisticated alternatives (e.g., SIMD-FastPFOR) for this purpose.
+Many of the fastest schemes use relatively large blocks (128 integers) that are decoded all at once. Yet not all queries require decoding the entire array. For example, consider the computation of intersections between sorted arrays. It is sometimes more efﬁcient to use random access, especially when processing arrays with vastly different lengths [55, 56, 57]. If the data is stored in relatively large compressed blocks (e.g., 128 integers with SIMD-BP128), the granularity of random access might be reduced (e.g., when implementing a skip list). Hence, we may end up having to scan many more integers than needed. However, blocks of 128 integers might not necessarily be an impediment to good performance. Indeed, Schlegel et al. [58] were able to accelerate the computation of intersections by a factor of 5 with vectorization using blocks of up to 65 536 integers.
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+27
+
+8. CONCLUSION
+We have presented new schemes that are up to twice as fast as the previously best available schemes in the literature while offering competitive compression ratios and encoding speed. This was achieved by vectorization of almost every step including differential decoding. To achieve both high speed and competitive compression ratios, we introduced a new patched scheme that stores exceptions in a way that permits a vectorization (SIMD-FastPFOR).
+In the future, we might seek to generalize our results over more varied architectures as well as to provide a greater range of tradeoffs between speed and compression ratio. Indeed, most commodity processors support vector processing (e.g., Intel, AMD, PowerPC, ARM). We might also want to consider adaptive schemes that compress more aggressively when the data is more compressible and optimize for speed otherwise. For example, one could use a scheme such as varint-G8IU for less compressible arrays and SIMD-BP128 for the more compressible ones. One could also use workload-aware compression: frequently accessed arrays could be optimized for decoding speed whereas least frequently accessed data could be optimized for high compression efﬁciency. Finally, we should consider more than just 32-bit integers. For example, some popular search engines (e.g., Sphinx [59]) support 64-bit document identiﬁers. We might consider an approach similar to Schlegel et al. [58] who decompose arrays of 32-bit integers into blocks of 16-bit integers.
+
+ACKNOWLEDGEMENT
+Our varint-G8IU implementation is based on code by M. Caron. V. Volkov provided better loop unrolling for differential coding. P. Bannister provided a fast algorithm to compute the maximum of the integer logarithm of an array of integers. We are grateful to N. Kurz for his insights and for his review of the manuscript. We wish to thank the anonymous reviewers for their valuable comments.
+
+REFERENCES
+1. Sebot J, Drach-Temam N. Memory bandwidth: The true bottleneck of SIMD multimedia performance on a superscalar processor. Euro-Par 2001 Parallel Processing, Lecture Notes in Computer Science, vol. 2150. Springer Berlin / Heidelberg, 2001; 439–447, doi:10.1007/3-540-44681-8 63.
+2. Drepper U. What every programmer should know about memory. http://www.akkadia.org/drepper/ cpumemory.pdf [Last checked August 2012.] 2007.
+3. Manegold S, Kersten ML, Boncz P. Database architecture evolution: mammals ﬂourished long before dinosaurs became extinct. Proceedings of the VLDB Endowment Aug 2009; 2(2):1648–1653.
+4. Zukowski M. Balancing vectorized query execution with bandwidth-optimized storage. PhD Thesis, Universiteit van Amsterdam 2009.
+5. Harizopoulos S, Liang V, Abadi DJ, Madden S. Performance tradeoffs in read-optimized databases. Proceedings of the 32nd international conference on Very Large Data Bases, VLDB ’06, VLDB Endowment, 2006; 487–498.
+6. Westmann T, Kossmann D, Helmer S, Moerkotte G. The implementation and performance of compressed databases. SIGMOD Record September 2000; 29(3):55–67, doi:10.1145/362084.362137.
+7. Abadi D, Madden S, Ferreira M. Integrating compression and execution in column-oriented database systems. Proceedings of the 2006 ACM SIGMOD International Conference on Management of data, SIGMOD ’06, ACM: New York, NY, USA, 2006; 671–682, doi:10.1145/1142473.1142548.
+8. Bu¨ttcher S, Clarke CLA. Index compression is good, especially for random access. Proceedings of the 16th ACM conference on Information and Knowledge Management, CIKM ’07, ACM: New York, NY, USA, 2007; 761–770, doi:10.1145/1321440.1321546.
+9. Anh VN, Moffat A. Inverted index compression using word-aligned binary codes. Information Retrieval 2005; 8(1):151–166, doi:10.1023/B:INRT.0000048490.99518.5c.
+10. Yan H, Ding S, Suel T. Inverted index compression and query processing with optimized document ordering. Proceedings of the 18th International Conference on World Wide Web, WWW ’09, ACM: New York, NY, USA, 2009; 401–410, doi:10.1145/1526709.1526764.
+11. Popov P. Basic optimizations: Talk at the YaC (Yet Another Conference) held by Yandex (in Russian). http: //yac2011.yandex.com/archive2010/topics/ [Last checked Sept 2012.] 2010.
+12. Stepanov AA, Gangolli AR, Rose DE, Ernst RJ, Oberoi PS. SIMD-based decoding of posting lists. Proceedings of the 20th ACM International Conference on Information and Knowledge Management, CIKM ’11, ACM: New York, NY, USA, 2011; 317–326, doi:10.1145/2063576.2063627.
+13. Dean J. Challenges in building large-scale information retrieval systems: invited talk. Proceedings of the Second ACM International Conference on Web Search and Data Mining, WSDM ’09, ACM: New York, NY, USA, 2009; 1–1, doi:10.1145/1498759.1498761. Author’s slides: http://static.googleusercontent.
+com/external_content/untrusted_dlcp/research.google.com/en/us/people/jeff/ WSDM09-keynote.pdf [Last checked Dec. 2012.].
+
+28
+
+D. LEMIRE AND L. BOYTSOV
+
+14. Lemke C, Sattler KU, Faerber F, Zeier A. Speeding up queries in column stores: a case for compression. Proceedings of the 12th International Conference on Data Warehousing and Knowledge Discovery, DaWaK’10, Springer-Verlag: Berlin, Heidelberg, 2010; 117–129, doi:10.1007/978-3-642-15105-7 10.
+15. Binnig C, Hildenbrand S, Fa¨rber F. Dictionary-based order-preserving string compression for main memory column stores. Proceedings of the 2009 ACM SIGMOD International Conference on Management of Data, ACM: New York, NY, USA, 2009; 283–296, doi:10.1145/1559845.1559877.
+16. Poess M, Potapov D. Data compression in Oracle. VLDB’03, Proceedings of the 29th International Conference on Very Large Data Bases, Morgan Kaufmann: San Francisco, CA, USA, 2003; 937–947.
+17. Hall A, Bachmann O, Bu¨ssow R, Ga¨nceanu S, Nunkesser M. Processing a trillion cells per mouse click. Proceedings of the VLDB Endowment 2012; 5(11):1436–1446.
+18. Raman V, Swart G. How to wring a table dry: entropy compression of relations and querying of compressed relations. Proceedings of the 32nd International Conference on Very Large Data Bases, VLDB ’06, VLDB Endowment, 2006; 858–869.
+19. Lemire D, Kaser O. Reordering columns for smaller indexes. Information Sciences June 2011; 181(12):2550–2570, doi:10.1016/j.ins.2011.02.002.
+20. Bjørklund TA, Grimsmo N, Gehrke J, Torbjørnsen O. Inverted indexes vs. bitmap indexes in decision support systems. Proceedings of the 18th ACM conference on Information and Knowledge Management, CIKM ’09, ACM: New York, NY, USA, 2009; 1509–1512, doi:10.1145/1645953.1646158.
+21. Holloway AL, Raman V, Swart G, DeWitt DJ. How to barter bits for chronons: Compression and bandwidth trade offs for database scans. Proceedings of the 2007 ACM SIGMOD International Conference on Management of Data, ACM: New York, NY, USA, 2007; 389–400.
+22. Holloway AL, DeWitt DJ. Read-optimized databases, in depth. Proceedings of the VLDB Endowment 2008; 1(1):502–513.
+23. Zukowski M, Heman S, Nes N, Boncz P. Super-scalar RAM-CPU cache compression. Proceedings of the 22nd International Conference on Data Engineering, ICDE ’06, IEEE Computer Society: Washington, DC, USA, 2006; 59–71, doi:10.1109/ICDE.2006.150.
+24. Silvestri F, Venturini R. VSEncoding: efﬁcient coding and fast decoding of integer lists via dynamic programming. Proceedings of the 19th ACM International Conference on Information and Knowledge Management, CIKM ’10, ACM: New York, NY, USA, 2010; 1219–1228, doi:10.1145/1871437.1871592.
+25. Anh VN, Moffat A. Index compression using 64-bit words. Software: Practice and Experience 2010; 40(2):131– 147, doi:10.1002/spe.v40:2.
+26. Zhang J, Long X, Suel T. Performance of compressed inverted list caching in search engines. Proceedings of the 17th International Conference on World Wide Web, WWW ’08, ACM: New York, NY, USA, 2008; 387–396, doi: 10.1145/1367497.1367550.
+27. Witten IH, Moffat A, Bell TC. Managing gigabytes (2nd ed.): compressing and indexing documents and images. Morgan Kaufmann Publishers Inc.: San Francisco, CA, USA, 1999.
+28. Rice R, Plaunt J. Adaptive variable-length coding for efﬁcient compression of spacecraft television data. IEEE Transactions on Communication Technology 1971; 19(6):889 –897.
+29. Elias P. Universal codeword sets and representations of the integers. IEEE Transactions on Information Theory 1975; 21(2):194–203.
+30. Bu¨ttcher S, Clarke C, Cormack G. Information retrieval: Implementing and evaluating search engines. The MIT Press, 2010.
+31. Transier F, Sanders P. Engineering basic algorithms of an in-memory text search engine. ACM Transactions on Information Systems Dec 2010; 29(1):2:1–2:37, doi:10.1145/1877766.1877768.
+32. Moffat A, Stuiver L. Binary interpolative coding for effective index compression. Information Retrieval 2000; 3(1):25–47, doi:10.1023/A:1013002601898.
+33. Walder J, Kra´tky´ M, Bacˇa R, Platosˇ J, Sna´sˇel V. Fast decoding algorithms for variable-lengths codes. Information Sciences Jan 2012; 183(1):66–91, doi:10.1016/j.ins.2011.06.019.
+34. Schlegel B, Gemulla R, Lehner W. Fast integer compression using SIMD instructions. Proceedings of the Sixth International Workshop on Data Management on New Hardware, DaMoN ’10, ACM: New York, NY, USA, 2010; 34–40, doi:10.1145/1869389.1869394.
+35. Cutting D, Pedersen J. Optimization for dynamic inverted index maintenance. Proceedings of the 13th annual international ACM SIGIR conference on Research and development in information retrieval, SIGIR ’90, ACM: New York, NY, USA, 1990; 405–411, doi:10.1145/96749.98245.
+36. Williams H, Zobel J. Compressing integers for fast ﬁle access. The Computer Journal 1999; 42(3):193–201, doi: 10.1093/comjnl/42.3.193.
+37. Thiel L, Heaps H. Program design for retrospective searches on large data bases. Information Storage and Retrieval 1972; 8(1):1–20.
+38. Williams R. An extremely fast ziv-lempel data compression algorithm. Proceedings of the 1st Data Compression Conference, DCC ’91, 1991; 362–371.
+39. Goldstein J, Ramakrishnan R, Shaft U. Compressing relations and indexes. Proceedings of the Fourteenth International Conference on Data Engineering, ICDE ’98, IEEE Computer Society: Washington, DC, USA, 1998; 370–379.
+40. Ng WK, Ravishankar CV. Block-oriented compression techniques for large statistical databases. IEEE Transactions on Knowledge and Data Engineering Mar 1997; 9(2):314–328, doi:10.1109/69.591455.
+41. Delbru R, Campinas S, Tummarello G. Searching web data: An entity retrieval and high-performance indexing model. Web Semantics Jan 2012; 10:33–58, doi:10.1016/j.websem.2011.04.004.
+42. Deveaux JP, Rau-Chaplin A, Zeh N. Adaptive Tuple Differential Coding. Database and Expert Systems Applications, Lecture Notes in Computer Science, vol. 4653. Springer Berlin / Heidelberg, 2007; 109–119, doi: 10.1007/978-3-540-74469-6 12.
+
+DECODING BILLIONS OF INTEGERS PER SECOND THROUGH VECTORIZATION
+
+29
+
+43. Ao N, Zhang F, Wu D, Stones DS, Wang G, Liu X, Liu J, Lin S. Efﬁcient parallel lists intersection and index compression algorithms using graphics processing units. Proceedings of the VLDB Endowment May 2011; 4(8):470–481.
+44. Baeza-Yates R, Jonassen S. Modeling static caching in web search engines. Advances in Information Retrieval, Lecture Notes in Computer Science, vol. 7224. Springer Berlin / Heidelberg, 2012; 436–446, doi:10.1007/ 978-3-642-28997-2 37.
+45. Jonassen S, Bratsberg S. Intra-query concurrent pipelined processing for distributed full-text retrieval. Advances in Information Retrieval, Lecture Notes in Computer Science, vol. 7224. Springer Berlin / Heidelberg, 2012; 413–425, doi:10.1007/978-3-642-28997-2 35.
+46. Jones DM. The New C Standard: A Cultural and Economic Commentary. Addison Wesley Longman Publishing Co., Inc.: Redwood City, CA, USA, 2003.
+47. Willhalm T, Popovici N, Boshmaf Y, Plattner H, Zeier A, Schaffner J. SIMD-scan: ultra fast in-memory table scan using on-chip vector processing units. Proceedings of the VLDB Endowment Aug 2009; 2(1):385–394.
+48. Zhou J, Ross KA. Implementing database operations using SIMD instructions. Proceedings of the 2002 ACM SIGMOD International Conference on Management of Data, SIGMOD ’02, ACM: New York, NY, USA, 2002; 145–156, doi:10.1145/564691.564709.
+49. Inoue H, Moriyama T, Komatsu H, Nakatani T. A high-performance sorting algorithm for multicore singleinstruction multiple-data processors. Software: Practice and Experience Jun 2012; 42(6):753–777, doi:10.1002/ spe.1102.
+50. Wassenberg J. Lossless asymmetric single instruction multiple data codec. Software: Practice and Experience 2012; 42(9):1095—-1106, doi:10.1002/spe.1109.
+51. Boystov L. Clueweb09 posting list data set. http://boytsov.info/datasets/clueweb09gap/ [Last checked August 2012.] 2012.
+52. Brenes DJ, Gayo-Avello D. Stratiﬁed analysis of AOL query log. Information Sciences May 2009; 179(12):1844– 1858, doi:10.1016/j.ins.2009.01.027.
+53. Pass G, Chowdhury A, Torgeson C. A picture of search. Proceedings of the 1st International Conference on Scalable Information Systems, InfoScale ’06, ACM: New York, NY, USA, 2006, doi:10.1145/1146847.1146848.
+54. Fusco F, Stoecklin MP, Vlachos M. NET-FLi: On-the-ﬂy compression, archiving and indexing of streaming network trafﬁc. Proceedings of the VLDB Endowment 2010; 3:1382–1393.
+55. Baeza-Yates R, Salinger A. Experimental analysis of a fast intersection algorithm for sorted sequences. Proceedings of the 12th international conference on String Processing and Information Retrieval, SPIRE’05, Springer-Verlag: Berlin, Heidelberg, 2005; 13–24.
+56. Ding B, Ko¨nig AC. Fast set intersection in memory. Proceedings of the VLDB Endowment 2011; 4(4):255–266. 57. Vigna S. Quasi-succinct indices. Proceedings of the Sixth ACM International Conference on Web Search and Data
+Mining, WSDM ’13, ACM: New York, NY, USA, 2013. 58. Schlegel B, Willhalm T, Lehner W. Fast sorted-set intersection using SIMD instructions. ADMS Workshop, 2011. 59. Aksyonoff A. Introduction to Search with Sphinx: From installation to relevance tuning. O’Reilly Media, 2011.
+
+A. INFORMATION-THEORETIC BOUND ON BINARY PACKING
+Consider arrays of n distinct sorted 32-bit integers. We can compress the deltas computed from such arrays using binary packing as described in § 2.6 (see Fig. 1). We want to prove that such an approach is reasonably efﬁcient.
+There are 2n32 such arrays. Thus, by an information-theoretic argument, we need at least log 2n32 bits to represent them. By a well known inequality, we have that log 2n32 ≥ n log 2n32 . In effect, this means that we need at least log 2n32 bits/int.
+Consider binary packing over blocks of B integers: e.g., for BP32 we have B = 32 and for SIMD-BP128 we have B = 128. For simplicity, assume that the array length n is divisible by B and that B is divisible by 32. Though our result also holds for vectorized differential coding (§ 3), assume that we use the common version of differential coding before applying binary packing. That is, if the original array is x1, x2, x3, . . . (xi > xi−1 for all i > 1), we compress the integers x1, x2 − x1, x3 − x2, . . . using binary packing.
+For every block of B integers, we have an overhead of 8 bits to store the bit width b. This contributes 8n/B bits to the total storage cost. The storage of any given block depends also on the bit width for this block. In turn, the bit width is bounded by the logarithm of the difference between the largest and the smallest element in the block. If we write this difference for block i as ∆i, the total storage cost in bits is
+
+n/B
+8n + B log(∆i) B
+i=1
+
+n/B  ≤ 8n + n + B log  ∆i .
+B
+i=1
+
+30
+
+D. LEMIRE AND L. BOYTSOV
+
+Because
+
+n/B i=1
+
+∆i
+
+≤
+
+232,
+
+we
+
+can
+
+show
+
+that
+
+the
+
+cost
+
+is
+
+maximized
+
+when
+
+∆i
+
+=
+
+232B/n.
+
+Thus,
+
+we
+
+have
+
+that
+
+the total cost in bits is smaller than
+
+
+
+
+
+8n
+
+n/B 232B
+
+8n
+
+232B n/B
+
++ n + B log 
+
+=
+
++ n + B log
+
+B
+
+n
+
+B
+
+n
+
+i=1
+
+8n
+
+232B
+
+=
+
++ n + n log
+
+,
+
+B
+
+n
+
+which is equivalent to 8/B + 1 + log B + log 2n32 bits/int. Hence, in the worst case, binary packing is suboptimal by 8/B + 1 + log B bits/int. Therefore, we can show that BP32 is 2-optimal for arrays of length less than 225 integers: its storage cost is no more than twice the information-theoretic limit. We also have that SIMD-BP128 is 2-optimal for arrays of length 223 or less.
+
+

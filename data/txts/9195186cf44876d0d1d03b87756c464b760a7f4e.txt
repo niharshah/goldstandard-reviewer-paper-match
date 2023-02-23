@@ -1,0 +1,730 @@
+ESPnet-ST IWSLT 2021 Ofﬂine Speech Translation System
+Hirofumi Inaguma1∗ Brian Yan2∗ Siddharth Dalmia2 Pengcheng Guo3 Jiatong Shi4 Kevin Duh4 Shinji Watanabe2,4
+1Kyoto University, Japan 2Carnegie Mellon University, USA 3Northwestern Polytechnical University, China 4Johns Hopkins University, USA
+inaguma@sap.ist.i.kyoto-u.ac.jp byan@cs.cmu.edu
+
+arXiv:2107.00636v2 [eess.AS] 6 Jul 2021
+
+Abstract
+This paper describes the ESPnet-ST group’s IWSLT 2021 submission in the ofﬂine speech translation track. This year we made various efforts on training data, architecture, and audio segmentation. On the data side, we investigated sequence-level knowledge distillation (SeqKD) for end-to-end (E2E) speech translation. Speciﬁcally, we used multi-referenced SeqKD from multiple teachers trained on different amounts of bitext. On the architecture side, we adopted the Conformer encoder and the Multi-Decoder architecture, which equips dedicated decoders for speech recognition and translation tasks in a uniﬁed encoder-decoder model and enables search in both source and target language spaces during inference. We also signiﬁcantly improved audio segmentation by using the pyannote.audio toolkit and merging multiple short segments for long context modeling. Experimental evaluations showed that each of them contributed to large improvements in translation performance. Our best E2E system combined all the above techniques with model ensembling and achieved 31.4 BLEU on the 2-ref of tst2021 and 21.2 BLEU and 19.3 BLEU on the two single references of tst2021.
+1 Introduction
+This paper presents the ESPnet-ST group’s English→German speech translation (ST) system submitted to the IWSLT 2021 ofﬂine speech translation track. ESPnet (Watanabe et al., 2018) has been widely used for many speech applications; automatic speech recognition (ASR), textto-speech (Hayashi et al., 2020), speech translation (Inaguma et al., 2020), machine translation (MT), and speech separation/enhancement (Li et al., 2021). The purpose of this submission is not only to show the recent progress on ST researches, but
+∗*Equal contribution
+
+also to encourage future research by building strong systems along with the open-sourced project.
+This year we focused on (1) sequence-level knowledge distillation (SeqKD) (Kim and Rush, 2016), (2) Conformer encoder (Gulati et al., 2020), (3) Multi-Decoder architecture (Dalmia et al., 2021), (4) model ensembling, and (5) better segmentation with a neural network-based voice activity (VAD) system (Bredin et al., 2020) and a novel algorithm to merge multiple short segments for long context modeling. Our primary focus was E2E models, although we also compared them with cascade systems with our best effort. All experiments were conducted with the ESPnet-ST toolkit (Inaguma et al., 2020), and the recipe is publicly available at https://github.com/espnet/ espnet/tree/master/egs/iwslt21.
+2 Data preparation
+In this section, we describe data preparation for each task. The corpus statistics are listed in Table 1. We removed the off-limit talks following previous evaluation campaigns1. To ﬁt the GPU memory, we excluded utterances having more than 3000 speech frames or more than 400 characters. All sentences were tokenized with the tokenizer.perl script in the Moses toolkit (Koehn et al., 2007).
+2.1 ASR
+We used Must-C (Di Gangi et al., 2019), Must-C v22, ST-TED (Jan et al., 2018), Librispeech (Panayotov et al., 2015), and TEDLIUM2 (Rousseau et al., 2012) corpora. We used the cleaned version of STTED following (Inaguma et al., 2019). The speech
+1https://sites.google.com/ view/iwslt-evaluation-2019/ speech-translation/off-limit-ted-talks
+2https://ict.fbk.eu/ must-c-release-v2-0/
+
+ASR Must-C Must-C v2 ST-TED (cleaned) Librispeech TEDLIUM2
+E2E-ST Must-C Must-C v2 ST-TED (cleaned)
+MT Must-C Must-C v2 ST-TED (cleaned) Europarl Commoncrawl Paracrawl NewsCommentary WikiTitles RAPID WikiMatrix
+
+#Hour
+408 × 3 458 × 3 200 × 3
+960 210 × 3
+408 × 3 458 × 3 200 × 3
+-
+
+#Sentence
+0.68M 0.74M 0.40M 0.28M 0.27M
+0.68M 0.74M 0.40M
+0.68M 0.74M 0.40M 1.82M 2.39M 34.37M 0.37M 1.38M 1.63M 1.57M
+
+Table 1: Corpus statistics
+
+Filtering method
+In-domain LM + langid + length/character
+
+WMT5M
+5.00M 3.42M 3.15M
+
+#Sentence
+
+WMT10M WMT20M
+
+10.00M 7.90M 7.77M
+
+20.00M 15.33M 15.01M
+
+Table 2: MT bitext ﬁltering
+
+Conformer Block +
+Positionwise FeedForardward LayerNorm
++ Convolution
+LayerNorm
++ Multihead Self-
+Attention
+LayerNorm +
+Positionwise FeedForardward LayerNorm
+
+data was augmented by three-fold speed perturbation (Ko et al., 2015) with speed ratios of 0.9, 1.0, and 1.1 except for Librispeech. We removed case information and punctuation marks except for apostrophes from the transcripts. The 5k unit vocabulary was constructed based on the byte pair encoding (BPE) algorithm (Sennrich et al., 2016) with the sentencepiece toolkit3 using the English transcripts only.
+2.2 E2E-ST
+We used Must-C, Must-C v2, and ST-TED only. The shared source and target vocabulary of BPE16k units was constructed using cased and punctuated transcripts and translations.
+2.3 MT
+We used available bitext for WMT204 in addition to the in-domain TED data used for E2E-ST systems. We ﬁrst performed perplexity-based ﬁltering with an in-domain n-gram language model (LM) (Moore and Lewis, 2010). We controlled the WMT data size by thresholding and obtained three data pools: 5M, 10M, and 20M sentences. Next, we removed non-printing characters and performed language identiﬁcation with the langid.py toolkit (Lui and Baldwin, 2012)5 and kept sentences whose lan-
+3https://github.com/google/ sentencepiece
+4Europarl, Commoncrawl, Paracrawl, NewsCommentary, WikiTitles, RAPID and WikiMatrix
+5https://github.com/saffsd/langid.py
+
+Figure 1: Block diagram of Conformer architecture
+guage IDs were identiﬁed correctly on both English and German sides. We also removed sentences having more than 250 tokens in either language or a source-target length ratio of more than 1.5 with the clean-corpus-n.perl script in Moses. Finally, we removed sentences having CJK and other unrelated characters in either language with the built-in regex module in Python. The resulting data size is shown in Table 2. We found that our ﬁltering strategy removed 22-37% of data. Note that the above ﬁltering process was performed over the WMT data only. For each data size, the joint source and target vocabulary of BPE32k units was constructed using cased and punctuated sentences after the ﬁltering. We did not use additional monolingual data.
+3 System
+3.1 Conformer encoder
+Conformer encoder (Gulati et al., 2020) is a stacked multi-block architecture and has shown consistent improvement over a wide range of E2E speech processing applications (Guo et al., 2020). The architecture of each block is depicted in Figure 1. It includes a multi-head self-attention module, a convolution module, and a pair of position-wise feed-forward modules in the Macaron-Net style. While the self-attention module learns the long-
+
+Figure 2: The Multi-Decoder (MD) architecture decomposes the overall ST task with ASR and MT subnets while maintaining E2E differentiability.
+range global context, the convolution module aims to model the local feature patterns synchronously. Recent studies have shown improvements by introducing Conformer in the E2E-ST task (Guo et al., 2020; Inaguma et al., 2021b), which motivated us to adopt this architecture as our system.
+3.2 SeqKD
+Sequence-level knowledge distillation (SeqKD) (Kim and Rush, 2016) is an effective method to transfer knowledge in a teacher model to a student model via discrete symbols. Our recent studies (Inaguma et al., 2021a,b) showed a large improvement in ST performance with this technique. Unlike the previous studies, however, we used more training data than bitext in ST training data to train teacher MT models. We translated source transcripts in the ST training data by the teacher MT models with a beam width of 5 and then replaced the original ground-truth translation with the generated translation. We used cased and punctuated transcripts as inputs to the MT teachers. We also combined both the original and pseudo translations as data augmentation (multi-referenced training) (Gordon and Duh, 2019).
+3.3 Multi-Decoder architecture
+The Multi-Decoder is an E2E-ST model using Searchable Hidden Intermediates to decompose the overall ST task into ASR and MT subtasks (Dalmia et al., 2021). As shown in Figure 2, the Multi-Decoder consists of two encoder-decoder models, an ASR sub-net and a subsequent MT subnet, where the hidden representations of the ASR decoder are passed as inputs to the encoder of the MT sub-net. During inference, the best ASR decoder hidden representations are retrieved using beam search decoding at this intermediate stage.
+Since this framework decomposes the overall ST task, it brings several advantages of cascaded
+
+approaches into the E2E setting. For instance, the Multi-Decoder allows for greater search capabilities and separation of speech and text encoding. However, one trade-off is a greater risk of error propagation from the ASR sub-net to the downstream MT sub-net. To alleviate this issue, we condition the decoder of the MT sub-net on the ASR encoder hidden representations in addition to the MT encoder hidden representations using multisource cross-attention. This improved variant of the architecture is called the Multi-Decoder with Speech Attention.
+3.4 Model ensembling
+We use posterior probability combination to ensemble models trained with different data and architectures. During inference, we perform a posterior combination at each step of beam search decoding by ﬁrst computing the softmax normalized posterior probabilities for each model in the ensemble and then taking the mean value. In this ensembling approach, a single uniﬁed beam search operates over the combined posteriors of the models to ﬁnd the most likely decoded sequence.
+3.5 Segmentation
+How to segment audio during inference significantly impacts ST performances (Gaido et al., 2020; Pham et al., 2020; Potapczyk and Przybysz, 2020; Gaido et al., 2021). This is because the ST systems are usually trained with utterances segmented based on punctuation marks (Di Gangi et al., 2019) while the audio segmentation by voice activity detection (VAD) at test time does not access such meta information. Since VAD splits a long speech recording into chunks by silence regions, it would prevent models from extracting semantically coherent contextual information. Therefore, it is very important to seek a better segmentation strategy in order to minimize this gap in training and test conditions and evaluate models correctly. In fact, the last year’s winner obtained huge improvements by using their own segmentation strategy.
+Motivated by this fact, we investigated two VAD systems apart from the provided segmentation. Speciﬁcally, we used WebRTC6 and pyannote.audio (Bredin et al., 2020)7 toolkits. For We-
+6https://github.com/wiseman/ py-webrtcvad
+7https://github.com/pyannote/ pyannote-audio
+
+Algorithm 1 Merge short segments after VAD for long context modeling
+
+1: function MERGESEGMENT(x, Mdur, Mint)
+
+2: Q ← V AD(x)
+
+{(s1, e1), · · · , (sM , eM )}
+
+3: while True do
+
+4:
+
+Nmerge ← 0
+
+5:
+
+Qnext ← {}
+
+Queue
+
+6:
+
+S, T ← s1, e1
+
+Start/End time
+
+7:
+
+for (sm, em) ∈ Q do
+
+8:
+
+if em − S < Mdur and sm − E < Mint then
+
+9:
+
+Nmerge ← Nmerge + 1 Merge segments
+
+10:
+
+else
+
+11:
+
+Qnext.enqueue((S, E))
+
+12:
+
+S ← sm
+
+Reset
+
+13:
+
+end if
+
+14:
+
+E ← em
+
+15:
+
+end for
+
+16:
+
+Q ← Qnext
+
+17:
+
+if Nmerge = 0 then
+
+18:
+
+break
+
+19:
+
+end if
+
+20: end while
+
+21: return Q
+
+22: end function
+
+bRTC, we set the frame duration, padding duration, and aggressive mode to 10ms, 150ms, and 3, respectively. For pyannote.audio, we used a publicly available model pre-trained on the DIHARD corpus (Ryant et al., 2019).
+However, we observed that VAD systems are more likely to generate short segments because they do not take contextual information into account. Therefore, we propose a novel algorithm to merge multiple short segments into a single chunk to enable long context modeling by self-attention in both encoder and decoder modules. The proposed algorithm is shown in Algorithm 1. We ﬁrst perform VAD and obtain multiple segments. Then, we check the segments in a greedy way from left to right and merge adjacent segments if (1) the total utterance duration is below a threshold Mdur [10ms] and (2) the time interval of the two segments is below a threshold Mint [10ms]. This process continues until no segment is merged in an iteration. Although recent studies proposed similar methods (Potapczyk and Przybysz, 2020; Gaido et al., 2021), our algorithm is a bottom-up approach while theirs are top-down.
+4 Experimental setting
+In this section, we describe the experimental setting for each task. The detailed conﬁgurations for each task are summarized in Table 3.
+
+Conﬁguration
+Warmup step Learning rate factor Batch size Epoch Validation metric Model average Beam width
+
+ASR
+25k 10.0 200 utt 30 Accuracy
+5 10
+
+E2E-ST
+
+non-MD MD
+
+25k 2.5 128 utt 30 BLEU 5 4
+
+25k 12.5 120 utt 30 BLEU
+5 16, 10
+
+MT
+8k 1.0 65k tok 40 BLEU 5 4
+
+Table 3: Summary of training conﬁguration
+
+4.1 Feature extraction
+We extracted 80-channel log-mel ﬁlterbank coefﬁcients computed with 25-ms window size and shifted every 10-ms with 3-dimensional pitch features using the Kaldi toolkit (Povey et al., 2011). The features were normalized by the mean and the standard deviation calculated on the entire training set. We applied SpecAugment (Park et al., 2019) with mask parameters (mT , mF , T, F ) = (2, 2, 40, 30) and time-warping for both ASR and E2E-ST tasks.
+4.2 ASR
+We used both Transformer and Conformer architectures. The encoder had two CNN blocks followed by 12 Transformer/Conformer blocks following (Karita et al., 2019; Guo et al., 2020). Each CNN block consisted of a channel size of 256 and a kernel size of 3 with a stride of 2 × 2, which resulted in time reduction by a factor of 4. Both architectures had six Transformer blocks in the decoder. In both encoder and decoder blocks, the dimensions of the self-attention layer dmodel and feed-forward network dﬀ were set to 512 and 2048, respectively. The number of attention heads H was set to 8. The kernel size of depthwise separable convolution in Conformer blocks was set to 31. We optimized the model with the joint CTC/attention objective (Watanabe et al., 2017) with a CTC weight of 0.3. We also used CTC scores during decoding but did not use any external LM for simplicity. We adopted the best model conﬁguration from the Librispeech ASR recipe in ESPnet.
+4.3 MT
+We used the Transformer-Base and -Big conﬁgurations in (Vaswani et al., 2017).
+4.4 E2E-ST
+We used the same Conformer architecture as ASR except for the vocabulary. We initialized the en-
+
+Model
+Transformer Conformer
+
+Librispeech test-other
+9.4 7.1
+
+WER (↓)
+TEDLIUM2 test
+6.4 6.2
+
+Must-C tst-COMMON
+7.0 5.6
+
+Table 4: Word error rate (WER) of ASR systems
+
+VAD
+
+Mdur Mint
+
+WER (↓)
+
+tst2010 tst2015 tst2018 tst2019 Avg.
+
+–
+
+– 18.2 32.1 23.5 20.8 23.65
+
+Provided 1500 200 14.4 29.3 18.4 15.5 19.40 2000 200 12.7 27.7 16.4 11.5 17.08
+
+2500 200 14.5 29.9 15.1 12.2 17.93
+
+–
+
+– 35.3 35.1 44.0 22.7 34.28
+
+WebRTC 1500 200 19.4 26.7 27.7 13.8 21.90 2000 200 19.8 27.7 27.1 11.9 21.63
+
+2500 200 22.9 29.5 27.1 11.6 22.78
+
+–
+
+–
+
+9.5 24.0 15.5
+
+1500 200 8.0 23.0 12.4
+
+1500 100 7.5 22.2 12.4
+
+pyannote 2000 200 10.3 22.5 12.2
+
+2000 150 9.6 21.8 12.3
+
+2000 100 8.1 21.5 12.0
+
+2000 50 7.3 21.9 12.4
+
+7.3 14.08 7.3 12.68 6.5 12.15 6.5 12.88 6.1 12.45 5.8 11.90 5.9 11.88
+
+Table 5: Impact of audio segmentation for ASR
+
+coder parameters with those of the Conformer ASR. On the decoder side, we initialized parameters like BERT (Devlin et al., 2019), where weight parameters were sampled from N (0, 0.02), biases were set to zero, and layer normalization parameters were set to β = 0, γ = 1. This technique led to better translation performance and faster convergence.
+5 Results
+5.1 ASR
+5.1.1 Architecture
+We compared Transformer and Conformer ASR architectures in Table 4. We observed that Conformer signiﬁcantly outperformed Transformer. Therefore, we use the Conformer encoder in the following experiments.
+5.1.2 Segmentation
+Next, we investigated the VAD systems and the proposed segment merging algorithm for long context modeling in Table 5. We used the same decoding hyperparameters tuned on Must-C. We ﬁrstly observed that merging short segments was very effective probably because it alleviated frame classiﬁcation errors in the VAD systems. Among three audio segmentation methods, we conﬁrmed that pyannote.audio signiﬁcantly reduced the WER while WebRTC had negative impacts compared to the provided segmentation. Speciﬁcally, we found that
+
+the dihard option in pyannote.audio worked very well while the rest options did not. The optimal maximum duration Mdur was around 2000 frames (i.e., 20 seconds). In the last experiments, we tuned the maximum interval Mint among {50, 100, 150, 200} and found 50 and 100 (i.e., 0.5 and 1 second) was best on average. Compared to the provided segmentation, we obtained a 49.6% improvement on average.
+5.2 MT
+In this section, we show the results of our MT systems used for cascade systems and pseudo labeling in SeqKD. We report case-sensitive detokenized BLEU scores (Papineni et al., 2002) with the multi-bleu-detok.perl script in Moses. We carefully investigated the effective amount of WMT training data to improve the performance of the TED domain. The results are shown in Table 6. We conﬁrmed that adding the WMT data improved the performance by more than 4 BLEU. Regarding the WMT data size, using up to 10M sentences was helpful, but 20M did not show clear improvements, probably because of the undersampling of the TED data. Oversampling as in multilingual NMT (Arivazhagan et al., 2019) could alleviate this problem, but this is beyond our scope.
+After training with a mix of the WMT and TED data, we also tried to ﬁnetune the model with the TED data only, but this did not lead to clear improvement, especially for the IWSLT test sets. Increasing the model capacity was not helpful, although the conclusion might change by adding more training data and evaluating the model in other domains such as news. Because our primary focus to use MT systems was pseudo labeling for SeqKD, we decided to use the Base conﬁguration to speed up decoding.
+Finally, we checked the BLEU scores on the Must-C training data used for SeqKD. We observed that adding more WMT data decreased the BLEU score, from which we can conclude that using more WMT data gradually changed the MT output from the TED style. Therefore, we decided to use the models trained on WMT5M and WMT10M as teachers for SeqKD.
+5.3 Speech translation
+5.3.1 E2E-ST
+SeqKD The results are shown in Table 7. We ﬁrst observed the baseline Conformer model
+
+Model
+Base (Must-C only) Base (WMT5M) + Big Base (WMT10M) + In-domain ﬁnetune Base (WMT20M)
+
+dev
+–
+31.31 27.32 33.28 30.67 33.15
+
+Must-C tst-COMMON
+30.02
+34.13 29.11 35.09 35.50 35.06
+
+BLEU (↑)
+
+Must-C v2 tst2010 tst-COMMON
+
+29.86
+
+27.28
+
+33.85 28.85 34.80 35.30 34.87
+
+31.61 27.61 33.58 30.79 33.26
+
+tst2015
+24.92
+32.44 28.44 33.26 31.43 33.56
+
+tst2018
+21.13
+28.30 24.42 29.24 25.35 29.94
+
+tst2019
+20.37
+28.28 23.92 28.87 26.10 29.08
+
+Must-C Train
+45.68 –
+38.31 –
+33.60
+
+Table 6: BLEU scores of text-based MT systems
+
+ID Model
+
+BLEU (↑)
+
+Must-C
+
+Must-C v2 tst2010 tst2015 tst2018 tst2019
+
+dev tst-COMMON tst-HE tst-COMMON
+
+Bidir SeqKD (E2E) (Inaguma et al., 2021b)
+
+25.67
+
+Multi-Decoder (E2E) (Dalmia et al., 2021)
+
+–
+
+- RWTH (Cascade) (Bahar et al., 2021) –
+
+KIT (E2E) (Pham et al., 2020)
+
+–
+
+KIT (Cascade) (Pham et al., 2020)
+
+–
+
+SRPOL (E2E) (Potapczyk and Przybysz, 2020) –
+
+27.01 26.4 26.50 30.60
+– –
+
+25.36 –
+26.80 – – –
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+28.4
+
+–
+
+–
+
+–
+
+24.27 21.82
+
+–
+
+–
+
+–
+
+26.68 24.95
+
+–
+
+–
+
+–
+
+29.44 24.6
+
+–
+
+23.96
+
+A1 Baseline (X) A2 + SeqKD (Y) A3 + 2ref SeqKD (X+Y) A4 + 3ref SeqKD (X+Y+Z)
+
+25.14 26.31 26.50 27.66
+
+35.63 29.29 30.59 30.90
+
+22.63 26.33 26.21 27.44
+
+36.07 29.50 30.92 31.07
+
+21.40 23.34 23.00 24.97
+
+18.18 21.24 22.18 22.66
+
+16.69 21.09 20.38 22.20
+
+17.39 22.25 21.59 23.41
+
+B1 MD + 2ref SeqKD
+
+–
+
+30.78
+
+–
+
+–
+
+–
+
+–
+
+–
+
+23.78
+
+C1 Conformer ASR → Base MT (WMT10M)
+
+27.01
+
+29.42
+
+26.13
+
+29.75
+
+25.04 23.17 23.05 23.19
+
+Table 7: BLEU scores of ST systems. X: original, Y: WMT5M, Z: WMT10M. For unsegmented test sets, we used pyannote.audio with Mdur = 2000 and Mint = 100.
+
+(A1) achieved 35.63 BLEU on the Must-C tst-COMMON set, and it is the new state-of-theart record to the best of our knowledge. Surprisingly, it even outperformed text-based MT systems in Table 6. On the other hand, unlike our observations in (Inaguma et al., 2021a,b), SeqKD (A2-4) degraded the performance on the MustC tst-COMMON set. However, the results on the Must-C dev and tst-HE sets showed completely different trends, where we observed better BLEU scores by SeqKD in proportion to the WMT data used for training the teachers. Therefore, after tuning audio segmentation, we also evaluated the models on the unsegmented IWSLT test sets. Here, we used the pyannote.audio based segmentation with (Mdur, Mint) = (2000, 100) as described in §5.1.2. Then, we conﬁrmed large improvements with SeqKD by 2-6 BLEU, and therefore we decided to determine the best model based on the IWSLT test sets. Multi-referenced training consistently improved the BLEU scores on the IWSLT sets. For example, A4 outperformed A1 by 6.02 BLEU on tst2019 although the tst2019 set was well-segmented (WER: 6.0%). Given these observations, we recommend evaluating ST models on
+
+ID Ensembled Models tst2019
+
+- B1 E1 B1, A4 E2 B1, A4, A1 E3 B1, A4, A1, A3 E4 B1, A4, A1, A3, A2
+
+21.06 22.51 22.83 23.36 23.61
+
+Table 8: BLEU (↑) scores of ensembled E2E-ST systems on tst2019, using the provided segmentation with Mdur = 2000 and Mint = 100
+
+multiple test sets for future research.
+Multi-Decoder architecture We combined the SeqKD and Multi-Decoder techniques in our B1 system. B1, which used a conformer ASR encoder and 2ref SeqKD, showed an improvement of 2.19 BLEU on tst2019 over A3, the encoder-decoder which also used 2ref SeqKD. B1 also achieved a slightly higher result on tst2019 compared to A4 which used 3ref SeqKD. These results suggest that the Multi-Decoder architecture is indeed compatible with SeqKD.
+Model ensemble As shown in Table 8, ensembling our various ST systems using the posterior combination method described in §3.4 showed im-
+
+VAD
+
+Mdur Mint
+
+BLEU (↑)
+
+tst2010 tst2015 tst2018 tst2019 Avg.
+
+Provided† –
+
+–
+
+–
+
+–
+
+–
+
+20.1
+
+–
+
+–
+
+–
+
+Provided 1000 200 (E2E) 1500 200
+
+2000 200
+
+21.99 22.62 23.00 22.95
+
+19.94 20.54 21.66 21.58
+
+19.29 19.80 20.14 20.03
+
+19.70 20.54 21.50 21.34
+
+20.23 20.88 21.58 21.48
+
+–
+
+–
+
+WebRTC 1000 200 (E2E) 1500 200
+
+2000 200
+
+13.13 20.95 21.00 20.25
+
+12.97 20.66 20.99 21.81
+
+11.07 17.09 17.67 17.08
+
+13.32 20.87 21.05 20.71
+
+12.62 19.89 20.18 19.96
+
+–
+
+–
+
+1500 200
+
+pyannote 1500 100 (E2E) 2000 200 2000 150
+
+2000 100
+
+2000 50
+
+22.26 25.00 25.92 24.10 24.25 24.97 24.50
+
+16.84 22.22 22.81 21.98 22.26 22.66 20.67
+
+17.78 21.97 22.51 21.00 21.41 22.20 22.14
+
+19.98 22.67 22.88 22.71 22.99 23.41 22.89
+
+19.22 22.97 23.53 22.45 22.73 23.31 22.55
+
+1500 200 1500 100 pyannote 2000 200 (Cascade) 2000 150 2000 100 2000 50
+
+25.06 25.56 24.41 24.50 25.04 24.33
+
+22.65 22.85 22.76 23.03 23.17 20.79
+
+23.01 23.03 22.15 23.12 23.05 23.12
+
+22.51 22.82 22.08 23.11 23.19 23.11
+
+23.31 23.57 22.85 23.44 23.61 22.84
+
+Table 9: Impact of audio segmentation for ST. A4 was used for the E2E model. † (Potapczyk and Przybysz,
+2020)
+
+provements over the best single model, B1. We found that an ensemble of all of our models, A1-4 and B1, achieved the best result of 23.61 BLEU on tst2019 and outperformed B1 by 2.55 BLEU. Although A1 as a single system performs worse on tst2019 than the other single systems as shown in Table 7, including it in an ensemble with the two best single systems, B1 and A4, still yielded a slight gain of 0.32 BLEU (E2). Therefore, we can conclude that weak models are still beneﬁcial for ensembling.
+5.3.2 Segmentation
+Similar to §5.1.2, we also investigated the impact of audio segmentation for E2E-ST models. To this end, we used the A4 model. Note that we used the same decoding hyperparameters tuned on Must-C. The results are shown in Table 9. We conﬁrmed a similar trend to ASR. Although (Mdur, Mint) = (1500, 100) showed the best performance on average, we decided to use (Mdur, Mint) = (2000, 100) for submission considering the best performance on the latest IWSLT test, tst2019.
+5.3.3 Cascade system
+We also evaluated the cascade system with the Conformer ASR and the Transformer-Base MT trained on the WMT10M data (C1). The MT model was trained by feeding source sentences without case
+
+information and punctuation marks. The results in Table 9 showed that the BLEU scores correlated to the WER in Table ,5 and the performance was comparable with that of A4. Although there is some room for improving the performance of the cascade system further by using in-domain English LM, it is difﬁcult to conclude which modeling (cascade or E2E) is effective because the cascade system had more model parameters in the ASR decoder and MT encoder. This means that the E2E model could also be enhanced by using a similar amount of parameters.
+5.3.4 Final system Our ﬁnal system was the best ensemble system E4, using the pyannote.audio based segmentation with (Mdur, Mint) = (2000, 200)8. This system, which was our primary submission, scored 24.14 BLEU on tst2019 as shown in Table 10. Compared to the result in Table 8, it improved by 0.53 BLEU thanks to better audio segmentation. It was also slightly higher than the IWSLT20 winner’s submission by SPROL (Potapczyk and Przybysz, 2020).
+We also present the results on tst2020 and tst2021 in Table 10. Our primary submission E4 outperformed the result of last year’s winner system on tst2020.
+6 Conclusion
+In this paper, we have presented the ESPnet-ST group’s ofﬂine systems on the IWSLT 2021 submission. We signiﬁcantly improved the baseline Conformer performance with multi-referenced SeqKD, Multi-Decoder architecture, segment merging algorithm, and model ensembling. Our future work includes scaling training data and careful analysis of the performance gap in different test sets.
+7 Acknowledgement
+This work was partly supported by ASAPP and JHU HLTCOE. This work used the Extreme Science and Engineering Discovery Environment (XSEDE) (Towns et al., 2014), which is supported by National Science Foundation grant number ACI1548562. Speciﬁcally, it used the Bridges system (Nystrom et al., 2015), which is supported by NSF award number ACI-1445606, at the Pittsburgh Supercomputing Center (PSC).
+8Because of time limitation, we submitted the systems before completing tuning segmentation hyperparameters.
+
+System
+
+Segmentation
+
+Segment merging
+
+Mint
+
+tst2019
+
+BLEU (↑)
+
+tst2020
+
+tst2021
+
+ref1 ref2 both
+
+IWSLT’20 winner♣
+
+given own
+
+–
+
+– 20.1
+
+21.5
+
+–
+
+–
+
+–
+
+–
+
+–
+
+23.96 25.3
+
+–
+
+–
+
+–
+
+E4 (primary)
+
+pyannote
+
+
+
+200 24.14 25.6 19.3 21.2 31.4
+
+E4+* E4+* E4+* E4+*
+B1
+
+pyannote pyannote
+given given pyannote
+
+
+
+200 24.41 25.5 19.7 20.6 30.8
+
+
+
+100 24.87 26.0 19.5 21.1 31.3
+
+
+
+100 23.72 25.1 19.4 21.4 31.5
+
+
+
+– 21.10 22.3 17.4 18.4 27.7
+
+
+
+100 23.78 25.0 18.9 20.9 31.1
+
+Table 10: BLEU scores of submitted systems on tst2020 and tst2021. ♣ (Potapczyk and Przybysz, 2020). Mdur = 2000 was used for the segment merging algorithm. *Late submission (not ofﬁcial). E4+ denotes E4 trained for more steps.
+
+References
+Naveen Arivazhagan, Ankur Bapna, Orhan Firat, Dmitry Lepikhin, Melvin Johnson, Maxim Krikun, Mia Xu Chen, Yuan Cao, George Foster, Colin Cherry, et al. 2019. Massively multilingual neural machine translation in the wild: Findings and challenges. arXiv preprint arXiv:1907.05019.
+Parnia Bahar, Tobias Bieschke, Ralf Schlu¨ter, and Hermann Ney. 2021. Tight integrated end-to-end training for cascaded speech translation. In Proceedings of SLT, pages 950–957. IEEE.
+Herve´ Bredin, Ruiqing Yin, Juan Manuel Coria, Gregory Gelly, Pavel Korshunov, Marvin Lavechin, Diego Fustes, Hadrien Titeux, Wassim Bouaziz, and Marie-Philippe Gill. 2020. Pyannote.audio: neural building blocks for speaker diarization. In Proceedings of ICASSP, pages 7124–7128. IEEE.
+Siddharth Dalmia, Brian Yan, Vikas Raunak, Florian Metze, and Shinji Watanabe. 2021. Searchable hidden intermediates for end-to-end models of decomposable sequence tasks. In Proceedings of the 2021 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, pages 1882–1896, Online. Association for Computational Linguistics.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. BERT: Pre-training of deep bidirectional transformers for language understanding. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), pages 4171–4186, Minneapolis, Minnesota. Association for Computational Linguistics.
+Mattia A. Di Gangi, Roldano Cattoni, Luisa Bentivogli, Matteo Negri, and Marco Turchi. 2019. MuST-C: a Multilingual Speech Translation Corpus. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), pages 2012–2017,
+
+Minneapolis, Minnesota. Association for Computational Linguistics.
+Marco Gaido, Mattia A. Di Gangi, Matteo Negri, Mauro Cettolo, and Marco Turchi. 2020. Contextualized translation of automatically segmented speech. In Proceedings of Interspeech, pages 1471– 1475.
+Marco Gaido, Matteo Negri, Mauro Cettolo, and Marco Turchi. 2021. Beyond voice activity detection: Hybrid audio segmentation for direct speech translation. arXiv preprint arXiv:2104.11710.
+Mitchell A Gordon and Kevin Duh. 2019. Explaining sequence-level knowledge distillation as dataaugmentation for neural machine translation. arXiv preprint arXiv:1912.03334.
+Anmol Gulati, James Qin, Chung-Cheng Chiu, Niki Parmar, Yu Zhang, Jiahui Yu, Wei Han, Shibo Wang, Zhengdong Zhang, Yonghui Wu, and Ruoming Pang. 2020. Conformer: Convolution-augmented Transformer for speech recognition. In Proceedings of Interspeech, pages 5036–5040.
+Pengcheng Guo, Florian Boyer, Xuankai Chang, Tomoki Hayashi, Yosuke Higuchi, Hirofumi Inaguma, Naoyuki Kamo, Chenda Li, Daniel GarciaRomero, Jiatong Shi, et al. 2020. Recent developments on ESPnet toolkit boosted by Conformer. arXiv preprint arXiv:2010.13956.
+Tomoki Hayashi, Ryuichi Yamamoto, Katsuki Inoue, Takenori Yoshimura, Shinji Watanabe, Tomoki Toda, Kazuya Takeda, Yu Zhang, and Xu Tan. 2020. Espnet-TTS: Uniﬁed, reproducible, and integratable open source end-to-end text-to-speech toolkit. In Proceedings of ICASSP, pages 7654–7658. IEEE.
+Hirofumi Inaguma, Kevin Duh, Tatsuya Kawahara, and Shinji Watanabe. 2019. Multilingual end-to-end speech translation. In Proceedings of ASRU, pages 570–577.
+
+Hirofumi Inaguma, Yosuke Higuchi, Kevin Duh, Tatsuya Kawahara, and Shinji Watanabe. 2021a. Orthros: Non-autoregressive end-to-end speech translation with dual-decoder. In Proceedings of ICASSP.
+Hirofumi Inaguma, Tatsuya Kawahara, and Shinji Watanabe. 2021b. Source and target bidirectional knowledge distillation for end-to-end speech translation. arXiv preprint arXiv:2104.06457.
+Hirofumi Inaguma, Shun Kiyono, Kevin Duh, Shigeki Karita, Nelson Yalta, Tomoki Hayashi, and Shinji Watanabe. 2020. ESPnet-ST: All-in-one speech translation toolkit. In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics: System Demonstrations, pages 302– 311, Online. Association for Computational Linguistics.
+Niehues Jan, Roldano Cattoni, Stu¨ker Sebastian, Mauro Cettolo, Marco Turchi, and Marcello Federico. 2018. The iwslt 2018 evaluation campaign. In Proceedings of IWSLT, pages 2–6.
+Shigeki Karita, Nanxin Chen, Tomoki Hayashi, Takaaki Hori, Hirofumi Inaguma, Ziyan Jiang, Masao Someki, Nelson Enrique Yalta Soplin, Ryuichi Yamamoto, Xiaofei Wang, et al. 2019. A comparative study on Transformer vs RNN in speech applications. In Proceedings of ASRU, pages 499–456.
+Yoon Kim and Alexander M. Rush. 2016. Sequencelevel knowledge distillation. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, pages 1317–1327, Austin, Texas. Association for Computational Linguistics.
+Tom Ko, Vijayaditya Peddinti, Daniel Povey, and Sanjeev Khudanpur. 2015. Audio augmentation for speech recognition. In Proceedings of Interspeech, pages 3586–3589.
+Philipp Koehn, Hieu Hoang, Alexandra Birch, Chris Callison-Burch, Marcello Federico, Nicola Bertoldi, Brooke Cowan, Wade Shen, Christine Moran, Richard Zens, Chris Dyer, Ondˇrej Bojar, Alexandra Constantin, and Evan Herbst. 2007. Moses: Open source toolkit for statistical machine translation. In Proceedings of the 45th Annual Meeting of the Association for Computational Linguistics Companion Volume Proceedings of the Demo and Poster Sessions, pages 177–180, Prague, Czech Republic. Association for Computational Linguistics.
+Chenda Li, Jing Shi, Wangyou Zhang, Aswin Shanmugam Subramanian, Xuankai Chang, Naoyuki Kamo, Moto Hira, Tomoki Hayashi, Christoph Boeddeker, Zhuo Chen, and Shinji Watanabe. 2021. ESPnet-SE: End-to-end speech enhancement and separation toolkit designed for ASR integration. In Proceedings of SLT, pages 785–792. IEEE.
+Marco Lui and Timothy Baldwin. 2012. langid.py: An off-the-shelf language identiﬁcation tool. In Proceedings of the ACL 2012 System Demonstrations,
+
+pages 25–30, Jeju Island, Korea. Association for Computational Linguistics.
+Robert C. Moore and William Lewis. 2010. Intelligent selection of language model training data. In Proceedings of the ACL 2010 Conference Short Papers, pages 220–224, Uppsala, Sweden. Association for Computational Linguistics.
+Nicholas A Nystrom, Michael J Levine, Ralph Z Roskies, and J Ray Scott. 2015. Bridges: a uniquely ﬂexible hpc resource for new communities and data analytics. In Proceedings of the 2015 XSEDE Conference: Scientiﬁc Advancements Enabled by Enhanced Cyberinfrastructure, pages 1–8.
+Vassil Panayotov, Guoguo Chen, Daniel Povey, and Sanjeev Khudanpur. 2015. Librispeech: an ASR corpus based on public domain audio books. In Proceedings of ICASSP, pages 5206–5210. IEEE.
+Kishore Papineni, Salim Roukos, Todd Ward, and WeiJing Zhu. 2002. Bleu: a method for automatic evaluation of machine translation. In Proceedings of the 40th Annual Meeting of the Association for Computational Linguistics, pages 311–318, Philadelphia, Pennsylvania, USA. Association for Computational Linguistics.
+Daniel S Park, William Chan, Yu Zhang, Chung-Cheng Chiu, Barret Zoph, Ekin D Cubuk, and Quoc V Le. 2019. SpecAugment: A simple data augmentation method for automatic speech recognition. In Proceedings of Interspeech, pages 2613–2617.
+Ngoc-Quan Pham, Thanh-Le Ha, Tuan-Nam Nguyen, Thai-Son Nguyen, Elizabeth Salesky, Sebastian Stu¨ker, Jan Niehues, and Alex Waibel. 2020. Relative positional encoding for speech recognition and direct translation. In Proceedings of Interspeech, pages 31–35.
+Tomasz Potapczyk and Pawel Przybysz. 2020. SRPOL’s system for the IWSLT 2020 end-to-end speech translation task. In Proceedings of the 17th International Conference on Spoken Language Translation, pages 89–94, Online. Association for Computational Linguistics.
+Daniel Povey, Arnab Ghoshal, Gilles Boulianne, Lukas Burget, Ondrej Glembek, Nagendra Goel, Mirko Hannemann, Petr Motlicek, Yanmin Qian, Petr Schwarz, et al. 2011. The kaldi speech recognition toolkit. In Proceedings of ASRU.
+Anthony Rousseau, Paul Dele´glise, and Yannick Este`ve. 2012. TED-LIUM: An automatic speech recognition dedicated corpus. In Proceedings of LREC, pages 125–129.
+Neville Ryant, Kenneth Church, Christopher Cieri, Alejandrina Cristia, Jun Du, Sriram Ganapathy, and Mark Liberman. 2019. The second DIHARD diarization challenge: Dataset, task, and baselines. In Proceedings of Interspeech, pages 978–982.
+
+Rico Sennrich, Barry Haddow, and Alexandra Birch. 2016. Neural machine translation of rare words with subword units. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1715– 1725, Berlin, Germany. Association for Computational Linguistics.
+John Towns, Timothy Cockerill, Maytal Dahan, Ian Foster, Kelly Gaither, Andrew Grimshaw, Victor Hazlewood, Scott Lathrop, Dave Lifka, Gregory D Peterson, et al. 2014. Xsede: Accelerating scientiﬁc discovery computing in science & engineering, 16 (5): 62–74, sep 2014. URL https://doi. org/10.1109/mcse, 128.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Proceedings of NeurIPS, pages 5998– 6008.
+Shinji Watanabe, Takaaki Hori, Shigeki Karita, Tomoki Hayashi, Jiro Nishitoba, Yuya Unno, Nelson Enrique Yalta Soplin, Jahn Heymann, Matthew Wiesner, Nanxin Chen, Adithya Renduchintala, and Tsubasa Ochiai. 2018. ESPnet: End-to-end speech processing toolkit. In Proceedings of Interspeech, pages 2207–2211.
+Shinji Watanabe, Takaaki Hori, Suyoun Kim, John R Hershey, and Tomoki Hayashi. 2017. Hybrid CTC/attention architecture for end-to-end speech recognition. IEEE Journal of Selected Topics in Signal Processing, 11(8):1240–1253.
+
+

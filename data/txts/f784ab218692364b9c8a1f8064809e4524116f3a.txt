@@ -1,0 +1,6666 @@
+SECURE DISTRIBUTED TRAINING AT SCALE
+
+Eduard Gorbunov* MIPT Yandex eduard.gorbunov@phystech.edu
+
+Alexander Borzunov* HSE University Yandex borzunov.alexander@gmail.com
+
+Michael Diskin HSE University Yandex michael.s.diskin@gmail.com
+
+Max Ryabinin HSE University Yandex mryabinin0@gmail.com
+
+arXiv:2106.11257v2 [cs.LG] 7 Oct 2021
+
+ABSTRACT
+Some of the hardest problems in deep learning can be solved via pooling together computational resources of many independent parties, as is the case for scientiﬁc collaborations and volunteer computing. Unfortunately, any single participant in such systems can jeopardize the entire training run by sending incorrect updates, whether deliberately or by mistake. Training in presence of such peers requires specialized distributed training algorithms with Byzantine tolerance. These algorithms often sacriﬁce efﬁciency by introducing redundant communication or passing all updates through a trusted server. As a result, it can be infeasible to apply such algorithms to large-scale distributed deep learning, where models can have billions of parameters. In this work, we propose a novel protocol for secure (Byzantinetolerant) decentralized training that emphasizes communication efﬁciency. We rigorously analyze this protocol: in particular, we provide theoretical bounds for its resistance against Byzantine and Sybil attacks and show that it has a marginal communication overhead. To demonstrate its practical effectiveness, we conduct large-scale experiments on image classiﬁcation and language modeling in presence of Byzantine attackers.
+1 INTRODUCTION
+Many hard scientiﬁc problems were solved through collaboration between many nations, groups and individuals. This is especially evident in natural sciences, where researchers formed multinational collaborations to run large-scale experiments and share compute infrastructure (Aad et al., 2012; Ruttley et al., 2017; Abbott et al., 2016). Projects like Folding@home (Beberg et al., 2009) and BOINC (Anderson, 2004) push this trend even further by recruiting volunteers that donate their compute to collectively run computational experiments at an unprecedented scale (Merritt, 2020).
+Similar techniques were recently proposed for machine learning, aiming to solve two key challenges. The ﬁrst challenge is the sheer computational complexity of many machine learning tasks, such as pretraining transformers for NLP (Devlin et al., 2019; Brown et al., 2020; Liu et al., 2019) or learning on huge datasets in vision (Sun et al., 2017; Kolesnikov et al., 2020; Goyal et al., 2021). Recent works propose several systems (Kijsipongse et al., 2018; Ryabinin & Gusev, 2020; Atre et al., 2021; Diskin et al., 2021) that can share the computation across many volunteers that donate the idle time of their computers. Another challenge arises in federated learning, where participants train a shared model on decentralized data that is not shared for privacy reasons (McMahan et al., 2017; Hard et al., 2018; Bonawitz et al., 2019).
+Despite their strengths, both volunteer computing and federated learning systems have so far seen limited practical applications (Huang & Liu, 2019; Kijsipongse et al., 2018). A major roadblock towards the global adoption of these techniques is trust in reliability of each participant. For distributed
+*Equal contribution
+1
+
+training, all progress made by the collaboration can be undermined if a single peer sends incorrect outputs due to an error in computation (Smith, 2019) or malicious intent (Tolpegin et al., 2020).
+Prior art in decentralized optimization proposed several optimization algorithms that are resistant to such “Byzantine” faults. However, most Byzantine-tolerant training protocols require either passing all updates through a trusted central server or exchanging additional messages that increase the network load by several times (Chen et al., 2018; Rajput et al., 2019). This is a major problem for large-scale distributed deep learning, where hundreds of peers must exchange updates for millions of parameters at regular intervals (Li et al., 2020; Sergeev & Balso, 2018; Shoeybi et al., 2019). Thus, in many practical scenarios, the computation and communication overhead of Byzantine-tolerant algorithms outweighs the potential beneﬁts of collaborating with others.
+In this work, we set out to solve this problem by proposing a novel distributed training protocol designed for large-scale deep learning workloads. Our approach combines the scalability and communication efﬁciency of modern distributed training techniques such as All-Reduce SGD (Sergeev & Balso, 2018) with resilience against Byzantine and Sybil attackers. To achieve this, we leverage secure multi-party computing to verify the integrity of training with minimal overhead that does not depend on the model size. Our protocol does not require trusted peers, operating under the assumption that anyone can be an attacker. Our contributions can be summarized as follows:
+• We propose a novel strategy for decentralized Byzantine-tolerant training where the extra communication cost does not depend on the number of parameters.
+• We rigorously analyze the proposed strategy and prove convergence bounds for convex and nonconvex losses with Byzantine attackers. Furthermore, we derive accelerated convergence rates for the same task under realistic assumptions about model gradients.
+• Based on the above algorithm, we describe a system that allows multiple parties to train a shared model with zero trust assumptions. We prove that this system is resistant to both Byzantine and Sybil attacks from a computationally constrained attacker.
+• We verify the effectiveness of our algorithm through both controlled experiments1 and actual large-scale training runs. Speciﬁcally, we start with ResNet-18 for CIFAR-10 classiﬁcation and follow up with pretraining ALBERT-large in a setup where almost half of all peers are malicious.
+2 RELATED WORK
+2.1 DISTRIBUTED DEEP LEARNING
+Nowadays, training neural networks often requires the amount of computation that is infeasible to achieve on any single machine. As a result, one has to train such models on multiple machines using specialized distributed training methods. Most of these methods fall into two groups: in data-parallel training, each worker trains the entire model by sampling batches from the training data (Sergeev & Balso, 2018; Goyal et al., 2017); in contrast, model-parallel training allocates parts of the model on different workers (Huang et al., 2019; Narayanan et al., 2019; Shoeybi et al., 2019). In this study, we consider only the ﬁrst group; notably, most model-parallel systems still rely on data parallelism between nodes at the same stage (Rajbhandari et al., 2020; Narayanan et al., 2021).
+Usually, data-parallel training consists of two phases: ﬁrst, each worker computes the gradients over its data; then, all workers aggregate the gradients and run an SGD step. The simplest aggregation strategy is known as Parameter Servers (PS) (Li, 2014; Dean et al., 2012; Recht et al., 2011): one of the servers stores and updates the model parameters, while all others iteratively compute the gradients, send them to the PS, and download the updated parameters. This strategy can be quite efﬁcient with a small number of workers; as it increases, the parameter server eventually becomes unable to handle the load. Gradient compression (Seide et al., 2014; Lin et al., 2018; Mishchenko et al., 2019; Koloskova et al., 2020; Gorbunov et al., 2020; 2021) or local updates (Zinkevich et al., 2010) can partially alleviate this issue, but it remains a fundamental bottleneck of the approach.
+In practice, most distributed training systems leverage All-Reduce (AR) (Goyal et al., 2017; Mikami et al., 2019; You et al., 2020) — a family of collective communication protocols that allow servers to average their data and receive the result on each machine. The resulting method, named All-Reduce
+1Source code for the experiments is available at https://github.com/yandex-research/btard
+2
+
+SGD (AR-SGD), runs AR on local gradients of each peer to compute the global average. Usually, AR-SGD uses bandwidth-optimal versions of All-Reduce (Sergeev & Balso, 2018; Patarasuk & Yuan, 2009); depending on the exact algorithm, they require each peer to transfer O(d) or O(d log n) data when averaging a vector of size d across n peers (compared to O(dn) for PS).
+2.2 BYZANTINE-TOLERANT OPTIMIZATION
+Standard distributed training methods are not robust against Byzantine attacks. In the vanilla parallel SGD, one malicious worker can break the convergence of the whole method by shifting the mean of the resulting vector in an arbitrary way. Therefore, the research community invented specialized algorithms that can train models even in this setup. These algorithms are different in nature and provide an extra layer of complexity on top of distributed training methods described in Section 2.1.
+Parameter-server (PS) based approaches. Majority of the algorithms designed to be Byzantineresilient rely on the existence of a trusted parameter-server. In such approaches, the standard mean estimator, e.g., the one used in parallel SGD, is typically substituted by a more robust aggregation rule (Blanchard et al., 2017; Yin et al., 2018; Damaskinos et al., 2019; El Mhamdi et al., 2018; Pillutla et al., 2019). However, recent works show that it is not enough via proposing the special types of Byzantine attacks (Baruch et al., 2019; Xie et al., 2020) and showing that permutation-invariant algorithms cannot converge to any predeﬁned accuracy of the solution (Karimireddy et al., 2020).
+Although several approaches aiming to circumvent this issue exist, most of them have signiﬁcant limitations such as no convergence analysis (Chen et al., 2018; Rajput et al., 2019; Rodríguez-Barroso et al., 2020; Xu & Lyu, 2020), too restrictive assumptions in the analysis (Alistarh et al., 2018; Allen-Zhu et al., 2021; Regatti et al., 2020), or the usage of variance-reduced estimators Wu et al. (2020), which are known to converge slowly in deep learning applications (Defazio & Bottou, 2019). The only paper without such limitations is (Karimireddy et al., 2020), where the authors propose a new aggregation rule called CENTEREDCLIP, apply it to SGD with client momentum, and prove convergence results for the obtained method in the non-convex case under reasonable assumptions. We provide more details on Byzantine-tolerant PS based approaches in Appendix A.1.1.
+Decentralized approaches for Byzantine-tolerant optimization are studied only in a few papers. Unfortunately, the known approaches are not well-suited for distributed deep learning since they either rely on full gradient computations (Yang & Bajwa, 2019a;b) or require peer-to-peer communication of full vectors at each step (Gupta et al., 2021; Gupta & Vaidya, 2021), which is not scalable, or provide the convergence guarantees that are inferior to non-parallel SGD (Peng et al., 2021), which has prohibitively slow convergence on modern deep learning tasks. Further details on Byzantine-tolerant decentralized approaches are deferred to Appendix A.1.2.
+2.3 SECURITY IN DISTRIBUTED SYSTEMS
+In this work, we circumvent the restrictions of existing Byzantine-tolerant techniques with secure multi-party computing (MPC). This is a family of cryptographic protocols that allow multiple parties to perform secure collective computations in the presence of malicious participants. While most MPC protocols are designed to preserve data privacy (which is irrelevant to us), there are two ideas used in MPC that are crucial to our approach.
+Broadcast channels. Several key stages of our algorithm require peers to send a certain value to all their groupmates. Since we rely exclusively on peer-to-peer connections, a malicious peer could violate this process by deliberately sending different values to each participant. To protect against this attack, distributed systems can use broadcast channels built on top of the protocols for Byzantine broadcast (Pease et al., 1980; Dolev & Strong, 1983; Hirt & Raykov, 2014). These protocols ensure that the peers agree on the same broadcasted value even if some of them are malicious. We provide more details on the Byzantine broadcast protocols and their guarantees in Appendix A.2.1.
+Multi-party random number generators. To ensure that peers compute gradients honestly, our approach veriﬁes a random subset of all computed gradients. These veriﬁcations would not be effective if malicious peers could predict (or inﬂuence) whether they are going to be veriﬁed. Hence, we need to choose who is going to be checked in such a way that the attackers can neither predict nor inﬂuence the random draw. This can be done with a multi-party random number generator (MPRNG)
+3
+
+B
+
+A
+
+R
+
+R
+
+I
+
+E
+
+R
+
+Outliers are
+
+clipped
+
+Verify that CenteredClip was performed correctly using
+random projections to
+
+Figure 1: An intuitive scheme demonstrating one step of Byzantine-Tolerant All-Reduce. This is a part of the Algorithm 1 executed between the consecutive SGD steps. Here, t is the step number, xt is the model weights, and ξit is a publicly known random seed for sampling a minibatch.
+based on a multi-party coin tossing protocol, such as the protocol from Blum (1983). We provide an overview of these techniques in Appendix A.2.2.
+3 METHOD
+We consider secure distributed training on public datasets, where each peer can access the entire training data. In this scenario, multiple parties cooperate by combining their computational resources for a single large-scale training run. More precisely, we consider a data-parallel training setup with All-Reduce SGD, as described previously in Section 2.1. We describe our strategy in several stages, progressively moving from the theoretical setup to real-world distributed training:
+• Section 3.1 outlines our approach for Byzantine-Tolerant All-Reduce (BTARD) and analyze its communication overhead for training models with a large number of parameters.
+• In Section 3.2, we formulate the underlying optimization problem and our attack model, then we derive the convergence bounds.
+• In Section 3.3, we propose a decentralized system design for distributed training with zero trust.
+3.1 BYZANTINE-TOLERANT ALL-REDUCE
+The core design principle behind our algorithm is that all types of Byzantine faults must have limited effect and a chance of being discovered. Together, these properties impose a limit on the total damage that an attacker can do over the entire training run. To control the magnitude of attacks over a single SGD step, we modify All-Reduce with a robust aggregation technique known as CENTEREDCLIP (Karimireddy et al., 2020). Speciﬁcally, we use Butterﬂy All-Reduce2 (Li et al., 2017) and apply CENTEREDCLIP in parallel to each partition of the gradient vector. We refer to this procedure as BUTTERFLYCLIP (Algorithm 2).
+However, Byzantine peers can circumvent robust aggregation by attacking over many iterations. To protect against this, BTARD periodically chooses random peers to serve as validators. The validators must then recalculate the gradients of other peers and report any discrepancies. However, such tests are only effective if the attackers cannot predict when they will be validated3. To ensure that, we use the multi-party random number generation protocol described in Section 2.3.
+After each training step, peers use MPRNG to choose m workers that will validate m other workers. As a result, malicious peers are unable to predict “safe” iterations before they commit to an attack. Thus, any persistent attacker will eventually be found by an honest validator.
+However, since validators can also be malicious, BTARD uses a separate accuse procedure to root out false reports. Before each averaging round, peers broadcast the hash of their gradients for that round. These values serve the same purpose as commitments in MPRNG. If peer i accuses peer j of
+2We choose Butterﬂy All-Reduce so that peers aggregate non-overlapping parts of the gradient vector. This helps to identify the attacker if the gradients are aggregated incorrectly. Jiang et al. (2020) report that Butterﬂy All-Reduce is near-optimal for distributed training over high-latency networks such as the Internet.
+3Otherwise, Byzantine peers can simply defer the attack to subsequent steps when they are not validated.
+4
+
+modifying gradients, all other peers must also recalculate j’s gradients. If the majority ﬁnds that j is innocent, the accusing peer i is banned instead (Hammurabi & Harper, 1904).
+The resulting algorithm is resilient to attacks made through incorrect gradients. However, malicious peers may also harm training by violating the CENTEREDCLIP procedure for the portion of gradients they are aggregating. Fortunately, we can design a test through which peers can verify that the vector they received was indeed the output of CENTEREDCLIP. To formulate this test, we need to view CENTEREDCLIP as a ﬁxed-point iteration for the equation:
+
+n
+
+τ
+
+(gi − x) min 1, gi − x = 0 (1)
+
+i=1
+
+The workers are not able to test whether (1) holds directly since collecting gi would lead to O(dn) extra communication, defeating the purpose of our algorithm. Instead, workers should use MPRNG to sample a random direction z in the space of model gradients. Then, each peer computes the inner product (2) and sends it through the broadcast channel (as described in Section 2.3):
+
+τ si= z, (gi − x) min 1, gi − x (2)
+
+Finally, all peers verify that
+
+n i=1
+
+si
+
+=
+
+0.
+
+Similarly
+
+to
+
+our
+
+previous
+
+use
+
+of
+
+MPRNG,
+
+all
+
+aggregators
+
+must commit to their aggregation results before they learn z. This ensures that a malicious aggregator
+
+cannot modify the results in such a way that the difference would be orthogonal to z (this and more
+
+complex attack vectors are reviewed and analyzed in Appendices C and D.3).
+
+We combine all these procedures in Algorithm 1 (see its intuitive scheme in Figure 1 and a more formal version in Algorithm 6). While gradients gi, random vector z, and some other variables are not the same during different steps, we omit the step index t in their notation for brevity.
+
+Algorithm 1 BTARD-SGD for peer i (informal)
+
+Input: rank i, model x0, seed ξi0, step count T , peer count n
+
+1: for t ∈ 0, . . . , T −1 do 2: gi = COMPUTEGRADIENTS(xt, ξit) 3: gˆ = BUTTERFLYCLIP(i, gi) 4: rt = MPRNG()
+5: z = GETRANDOMVECTOR(rt)
+
+6: for j ∈ 1, . . . , n do
+
+7:
+
+// gˆ[j] is the aggregated part from peer j
+
+8: ∆ji =(gi[j] − gˆ[j]) min 1, gi[j]−τ gˆ[j] 2
+
+9:
+
+broadcast sji =
+
+z
+
+[j
+
+],
+
+∆
+
+j i
+
+10: for j ∈ 1, . . . , n do
+
+11:
+
+// We know ∆ij from CENTEREDCLIP
+
+12:
+
+if sij =
+
+z
+
+[j
+
+]
+
+,
+
+∆
+
+i j
+
+then
+
+13:
+
+ACCUSE(i, j, sij is wrong)
+
+14:
+
+if
+
+n t
+
+sjt
+
+=
+
+0
+
+then
+
+15:
+
+// Peer j veriﬁed that sj· are correct
+
+16:
+
+ACCUSE(i, j, gˆ[j] is wrong)
+
+17: xt+1 = SGDSTEP(xt, gˆ)
+
+18: ξit+1 = hash(rt||i) 19: if i ∈ CHOOSEVALIDATORS(rt) then
+
+20:
+
+j = CHOOSETARGET(rt, i)
+
+21:
+
+VALIDATEPEER(j, xt, ξjt, cj , h*j , s*j )
+
+22: return xT
+
+Algorithm 2 BUTTERFLYCLIP for peer i
+Input: rank i, gradients gi∈Rd 1: gi[1], ..., gi[n] = SPLIT(gi, n) 2: broadcast ∀j, hji = hash(gi[j]) 3: send ∀j, gi[j] → peerj 4: receive ∀j, gj[i] ← peerj 5: verify ∀j, hash(gj[i]) = hij 6: gˆi = CENTEREDCLIP(g1[i], ..., gn[i]) 7: send ∀j, gˆi → peerj 8: receive ∀j, gˆj ← peerj 9: return MERGE(gˆ1, ..., gˆn)
+
+Algorithm 3 ACCUSE (i, j, allegation)
+
+Input: accuser i, target j 1: gj = COMPUTEGRADIENTS(xt, ξjt)
+
+2: if ∃k : (hash(gj[k]) = hkj
+
+3:
+
+or skj =
+
+z
+
+[k
+
+]
+
+,
+
+∆
+
+k j
+
+) or
+
+then
+
+nk=1 sjk=0
+
+4: VOTEFORBAN(peerj ) 5: // ... and everyone who covered it up
+
+6: else
+
+7: VOTEFORBAN(peeri)
+
+8: for k ∈ 1, . . . , n do
+
+9: if NUMVOTES(peerk) ≥ n/2 then
+
+10:
+
+BA N(peerk )
+
+5
+
+3.2 CONVERGENCE ANALYSIS
+
+From the perspective of optimization theory, our task is the expectation minimization problem:
+
+min {f (x) := Eξ∼D [f (x, ξ)]}
+
+(3)
+
+x∈Q⊆Rd
+
+Here, the objective function f is smooth and uniformly lower bounded, Q ⊆ Rd is a closed convex set of admissible parameters and ξ is the source of stochasticity, such as minibatch indices. We assume that the problem (3) can be solved in a distributed manner, i.e., one can use n workers performing (mini-batched) stochastic gradients calculations in parallel and communicating according to some protocol. For simplicity, we will deﬁne the set of workers as [n] := {1, 2, . . . , n}.
+
+Furthermore, we assume that some workers can be malicious, i.e., they can deviate from our algorithm: send arbitrary vectors instead of the stochastic gradients or violate the communication protocol. Such workers are denoted as Byzantine nodes or just Byzantines. We assume them to be omniscient (Karimireddy et al., 2020) except for the honest nodes’ private keys and the internals of MPRNG. We deﬁne the set of all “good” workers as G and the set of Byzantine workers as B: [n] = G B. We further assume that B is ﬁxed throughout the optimization process, and no more than a half of the nodes are Byzantine: |B| ≤ δn, where δ ∈ [0, 1/2). Finally, we consider the setup where all workers have access to the data deﬁning function f , so they can sample minibatches from the full dataset.4
+
+There are many ways for Byzantines to affect the training. To simplify further analysis, we group these strategies into 4 broad categories: (i) gradient attacks, where Byzantines modify their gik, but otherwise behave normally; (ii) aggregation attacks, where Byzantine aggregator returns wrong gˆi and relies on others to cover it up by misreporting si; (iii) reputation attacks such as frame-up or slander via false ACCUSE(i, j, ·); and ﬁnally, (iv) protocol errors are any other deviations from the
+steps of Algorithm 1, e.g. refusing to send any data. We elaborate on each attack type in Appendix C.
+
+For the purpose of this analysis, the latter two attacks can be repelled with an extra policy that allows an active worker to eliminate any other worker at the cost of also being banned. Whenever a benign peer i encounters a protocol error from another peer j, it invokes that policy to remove both himself and peer j from training. The design of this policy ensures that every invocation, whether by normal or Byzantine peers, eliminates at least 1 Byzantine peer and at most 1 benign peer. Thus, if a Byzantine minority uses this against benign peers, this will only decrease their relative numbers: (δn − 1)/(n − 2) < δ. This leaves us with two attacks that both target the aggregated gradients.
+
+We provide convergence guarantees for variants of BTARD-SGD with Q = Rd under different sets of assumptions about the function f and its stochastic gradients. Our ﬁrst two setups assume, that:
+Assumption 3.1. There exist such constant σ ≥ 0, s0 ∈ [d] that for any set of indices S = (i1, . . . , is), 1 ≤ i1 < i2 < . . . < is ≤ d, s ≥ s0 stochastic gradient ∇f (x, ξ) satisfy
+2 sσ2 E[∇f (x, ξ)] = ∇f (x), E ∇[S]f (x, ξ) − ∇[S]f (x) ≤ d , (4)
+where ∇[S]f (x, ξ) = (∇i1 f (x, ξ), . . . , ∇is f (x, ξ)) , ∇[S]f (x) = (∇i1 f (x), . . . , ∇is f (x)) , and ∇fj(x, ξ), ∇jf (x) are j-th components of ∇f (x, ξ) and f (x) respectively.
+
+Here, (4) is an extension of the classical uniformly bounded variance (UBV) assumption (Nemirovski
+
+et al., 2009; Ghadimi & Lan, 2012; 2013) ensuring that the noise in all subvectors of large enough dimension has the variance dependent on the ratio between the dimension of the subvector s and the dimension of the full vector d. For example, it holds when the noise is isotropic. Moreover, one
+
+can relax this assumption to the standard UBV assumption, if blocks for aggregation in BTARD
+
+are chosen uniformly at random (see Appendix E.3.1 for further details). In order to further reduce overhead from Veriﬁcation 3 in the full Algorithm 6, we also assume that the stochastic gradient
+
+distributions have sub-quadratically decreasing tails (see details in Appendix E.3.1).
+
+Assumption 3.2. There exist such constant σ ≥ 0, s0 ∈ [d] that for any set of indices S =
+
+(i1, . . . , is), 1 ≤ i1 < i2 < . . . < is ≤ d, s ≥ s0 stochastic gradient ∇f (x, ξ) satisfy
+
+ 1 k
+
+2
+
+
+
+tsσ2  1
+
+P k ∇[S]f (x, ξi) − ∇[S]f (x) > kd < t2 , ∀t > 0,
+
+(5)
+
+ i=1
+
+
+
+4He et al. (2020) show that it is impossible to achieve any predeﬁned accuracy of the solution without this assumption, i.e., in the heterogeneous case (see discussion in Appendix E.2).
+
+6
+
+Table 1: Summary of complexity bounds for BTARD-SGD in different scenarios. By complexity we mean the number of iterations sufﬁcient to ﬁnd such point x that E[ ∇f (x) 2] ≤ ε2 for non-convex problems and E[f (x) − f (x∗)] ≤ ε for convex and µ-strongly convex problems (see Def. E.2) with x∗ being the solution. Notation: “known |Bka|” = the exact number of attacking Byzantine workers at iteration k is known to each participant, L = smoothness constant (see Def. E.1), ∆0 = f (x0) − f∗, f∗ = uniform lower bound for f , σ2 =
+variance parameter from As. 3.1, n = the initial number of peers, b = the initial number of Byzantine workers, δ = b/n, m = number of peers checked at each iteration, R0 = x0 − x∗ .
+
+Assumptions
+As. 3.1+ As. 3.2 + known |Bka| As. 3.1 + As. 3.2
+
+Non-convex
+
++ + L∆0 ε2
+
+L∆0 σ2 nε4
+
+nδσ2 mε2
+
++ + L∆0 ε2
+
+L∆0 σ2 nε4
+
+n2 δσ2 mε2
+
+Convexity of f
+
+Convex
+
++ + LR02 ε
+
+σ2 R02 nε2
+
+√ n δσR0
+mε
+
++ + LR02 ε
+
+σ2 R02 nε2
+
+n2 δσR0 mε
+
+Strongly convex
+
+L log µR02 +
+
+σ2
+
+√
++ n √δσ
+
+µ
+
+ε
+
+nµε m µε
+
+L log µR02 + σ2 + n√2δσ
+
+µ
+
+ε
+
+nµε m µε
+
+where ξ1, . . . , ξk are i.i.d. samples from D, and ∇[S]f (x, ξ), ∇[S]f (x) are deﬁned in As. 3.1.
+
+Under these assumptions, we derive the following convergence bounds for strongly convex, generally convex, and non-convex objectives (see Table 1). The respective proofs are deferred to Appendix E.4.
+
+Let us brieﬂy discuss the main properties of the derived results. When δ = 0, i.e., there are no Byzantine peers, we recover the tightest known rates for parallel SGD for strongly convex, generally convex, and non-convex objectives with both sets of assumptions. Next, we notice that in all complexity bounds in the known |Bka| case, the term depending on the ratio of Byzantine workers δ (the third one in all bounds) has better dependence on the accuracy of the solution ε than the classical variance term (the second one in all bounds). Therefore, for sufﬁciently small ε, the derived complexity bounds are the same as in the case when there are no Byzantine workers and parallel SGD is used. However, these bounds are obtained under the assumption that all participants know the exact number of attacking Byzantine workers at each iteration, which is not realistic.
+
+As for the more general case, the third term is much worse than the corresponding term in the
+previous setup. Nevertheless, the term that depends on the ratio of Byzantine workers δ has the same dependence on ε as in the known |Bka| case. This implies that for sufﬁciently small ε the derived complexity bounds are the same as in the case when there are no Byzantine workers and parallel SGD
+is used. For complete formulations, proofs and other details we refer the reader to Appendix E.3.
+
+So far, all our convergence results rely on As. 3.2, i.e., that the stochastic gradients have not too
+
+heavy tails. This assumption holds for many real-world neural networks. However, there are
+
+important NLP tasks such as BERT training (Zhang et al., 2020), where the noise in the stochastic
+
+gradient has such a heavy noise that As. 3.2 becomes unlrealistic. The third and ﬁnal setup in
+
+our analysis aims to address such heavy-tailed problems with BTARD-CLIPPED-SGD (see full
+
+Algorithm 8 in appendix). We analyse the method under the assumption that α-th moments of
+
+the stochastic gradients are uniformly upper-bounded for some α ∈ (1, 2]. We notice that for
+
+α < 2 this assumption allows the variance of the stochastic gradient to be unbounded. In this
+
+setting, we prove that BTARD-CLIPPED-SGD ﬁnds an ε-solution of the convex problem after
+
+O
+
+ε−α/(α−1)
+
+√
+
+α/(α−1)
+
+1 + n δ/m
+
+iterations when the number of attacking Byzantine peers is
+
+known at each iteration and O ε−α/(α−1) 1 + n2δ2/m α/(α−1) iterations otherwise. One can ﬁnd
+
+the full statements and complete proofs of our results in Appendix E.
+
+3.3 RESISTING SYBIL ATTACKS
+The algorithm described in Section 3.1 operates with a pre-deﬁned list of peers that can only decrease in size. However, many real-world scenarios would beneﬁt from new peers joining midway through training. Unfortunately, this exposes the system to Sybil attacks (Douceur, 2002), when a single computationally constrained attacker adopts multiple pseudonymous identities in order to establish a dishonest majority and break the algorithm.
+To handle this, one may augment BTARD with a heuristic protocol that dictates how new peers can join. A new participant must prove that it has honestly computed enough gradients over multiple
+
+7
+
+Test accuracy
+
+Convergence
+
+Convergence (zoomed in)
+0.94
+
+Ours, = 1, attack at step 1000
+
+0.8
+
+Baseline (AR-SGD)
+
+0.8
+
+0.6
+
+Coord-wise median 0.93
+
+0.6
+
+Geometric median
+
+0.4
+
+CenteredClip with PS 0.92
+
+0.4
+
+Ours, = 1
+
+0.2
+
+Ours, = 10
+
+0.91
+
+0.2
+
+0 5000 10000 15000 20000 25000 14000 16000 18000 20000 22000 24000
+
+0 1000 2000 3000 4000
+
+Ours, = 10, attack at step 1000
+0.8 0.6 0.4 0.2
+
+Ours, = 10, attack at step 10000
+0.95 0.90 0.85 0.80 0.75
+
+Ours, = 1, attack at step 10000
+0.95
+
+0.90
+
+No attacks
+
+0.85
+
+Sign flipping
+
+0.80
+
+Random direction
+
+Label flipping
+
+0.75
+
+Delayed gradients
+
+0 1000 2000 3000 4000 Training step
+
+9500 10000 10500 11000 11500 12000 Training step
+
+9500 10000 10500 11000 11500 12000 Training step
+
+Figure 2: (Upper-Left, Upper-Middle:) ResNet-18 test accuracy with different robust aggregation techniques. (Remaining plots:) Effectiveness of Byzantine attacks against BTARD-SGD.
+
+Test accuracy
+
+continious iterations before it is allowed to actually contribute to the training. This ensures that the inﬂuence of Sybil attackers is proportional to their computing power (see details in Appendix F).
+4 EXPERIMENTS
+4.1 CIFAR10 CLASSIFICATION
+First, we evaluate our approach with a realistic image-classiﬁcation workload in controlled conditions. Our setup is a ResNet-18 (He et al., 2015) model trained to solve the CIFAR10 classiﬁcation task (Krizhevsky et al., 2009). We train the model on 16 peers (each peer processes 8 samples per batch) using the SGD with Nesterov (1983) momentum and the cosine annealing learning rate (Loshchilov & Hutter, 2017). We deliberately use a tuned setup that achieves 93.5% test accuracy in order to measure how Byzantine attacks affect this training outcome.
+We evaluate our method with constant τ = 10 (weaker clipping) and with τ = 1 (stronger clipping). These values were chosen based on the maximal standard deviation of the gradient parts averaged by the workers during normal training, so that almost no vectors are clipped for the weaker clipping and approximately half of the vectors are clipped for the stronger clipping scenario. BTARD randomly selects 1 validator on each step. If the validator happens to be Byzantine, it does not accuse its peers.
+We compare our method to the regular All-Reduce without clipping, the coordinate-wise median and geometric median approaches, and the original variant of CENTEREDCLIP that uses a trusted parameter server (Karimireddy et al., 2020). Some other popular robust aggregation techniques are omitted because they were shown to be inferior (Karimireddy et al., 2020). We run all iterative algorithms (such as CENTEREDCLIP) to convergence with = 10−6, as we have found that limiting the number of iterations can signiﬁcantly decrease the ﬁnal model quality (see Fig. 7 in Appendix I.1).
+In addition to training convergence, we evaluate our setup in presence of malicious peers. To test pessimistic conditions, we pick a setting where 7 of 16 peers are Byzantine (other setups can be found in Appendix I.1). We experiment with the following attack types:
+• SIGN FLIPPING: each attacker sends the opposite of its true gradient.
+• RANDOM DIRECTION: all attackers send large vectors pointed at a common random direction.
+• LABEL FLIPPING: each attacker computes its gradient based on the cross-entropy loss with ﬂipped labels. For CIFAR-10, we replace label l ∈ {0, ..., 9} with 9 − l.
+• DELAYED GRADIENT: attackers send their real gradients delayed by 1000 steps.
+8
+
+Loss
+
+10 8 6 4 2
+0
+Ours,
+12
+11
+10
+
+Convergence
+
+1000
+
+2000
+
+= 0.5, attack at step 1000
+
+3000
+15 Ours,
+
+10
+
+5
+
+Baseline (AR-SGD) Ours, = 0.125 10.0 Ours, = 0.25
+9.8
+
+9.6
+
+4000
+
+5000
+
+= 0.5, attack at step 5000
+
+4
+
+3
+
+Ours, = 0.125, attack at step 1000
+1000 1050 1100 1150
+Ours, = 0.125, attack at step 5000 No attacks Sign flipping Random direction Label flipping
+
+9 1000 1050 1100 1150 Training step
+
+5000 5050 5100 5150 Training step
+
+2 5000 5050 5100 5150 Training step
+
+Figure 3: (Upper-Left:) ALBERT-large training objective using AR-SGD and BTARD-ClippedSGD. (Remaining plots:) Effectiveness of Byzantine attacks against BTARD.
+
+Loss
+
+We further amplify the Byzantine gradients from the ﬁrst two attacks by a large coefﬁcient λ = 1000 so they would dominate the aggregated gradient if no clipping is used. While in practice such attacks can be identiﬁed right away due to the large gradient norms, we deliberately avoid doing that to test our clipping approach. We omit some common low-magnitude attacks (Baruch et al., 2019; Xie et al., 2020; Allen-Zhu et al., 2021) designed to bypass variance and magnitude checks, as BTARD does not use these checks anyway.
+For each experiment conﬁguration, Byzantines behave honestly prior to step s, then simultaneously attack on each subsequent step until they are banned (another setup with the Byzantines attacking periodically is reported in Appendix I.1). We consider attacks in two training regions: early stages (s = 1000) and closer to convergence (s = 10, 000). We repeat each experiment 5 times and report the mean and range of the test accuracy during at least 2000 steps after all Byzantines are banned. In our experiments, this usually happened within 150 steps after s.
+The results are shown in the Fig. 2. Comparing to the All-Reduce baseline, we note that our method does not worsen the speed of convergence but introduces a minor negative effect on the ﬁnal test accuracy. For τ = 10, this effect is indistinguishable from random variation. In terms of test accuracy, the two most effective attacks are the random direction and sign ﬂipping. The effect of label ﬂipping is smaller, and the effect of delayed gradients is almost undetectable.
+4.2 PRE-TRAINING TRANSFORMERS
+For our second experiment, we choose a more compute-intensive and hyperparameter-sensitive model with adaptive optimizers to demonstrate that our approach may be applied to models that are commonly used in distributed training scenarios. Our setup is pre-training the ALBERT-large model (Lan et al., 2019) on the Wikitext 103 dataset (Merity et al., 2017) using LAMB (You et al., 2020). Since the original ALBERT setup uses gradient clipping, we use BTARD-CLIPPED-SGD (see Alg. 8 in Appendix). We train the model on 16 machines that jointly accumulate 4096 samples for every batch. Similarly to the previous section, we evaluate two conﬁgurations with τ = 0.5 (weaker clipping) and τ = 0.125 respectively, in addition to an All-Reduce baseline. To evaluate Byzantine tolerance, we also use 7 out of 16 Byzantine workers, 1 validator and two attack regions: s = 1000 and s = 5000. We omit reporting of the delayed gradient attack as we have found it completely ineffective. The full conﬁguration of this experiment is provided in Appendix H.
+The results shown in Figure 3 demonstrate a pattern similar to the previous section. During normal training, both τ values had no signiﬁcant effect on the training progress. However, τ = 0.125 shows signiﬁcantly faster recovery from all three attacks. One important observation from these experiments is that while some attacks signiﬁcantly increase the loss function, the model returns to the previous
+9
+
+loss value much faster than it takes to reach the same loss when training from scratch. We further study the computation overhead of BTARD in this setup in Appendix I.2 and provide the experiments with a larger number of peers in Appendix I.3.
+5 CONCLUSION
+In this work, we formulated BTARD-SGD — a Byzantine-tolerant training strategy for large neural networks. We veriﬁed its robustness and effectiveness through rigorous theoretical analysis and large-scale distributed training experiments. While our research is mostly algorithmical, it can open new opportunities in many deep learning applications. Perhaps the most important one is making it possible to train large neural networks in a cooperative manner. BTARD-SGD could allow small research groups to host open cooperative training projects where the training hardware is crowdsourced by volunteers around the world. Alternatively, a group of small companies could collectively compete with larger corporations by combining their compute clusters. While these applications also require engineering effort to become practical, our algorithm ensures that they can run securely without the need to carefully screen every potential participant.
+ACKNOWLEDGMENTS
+Eduard Gorbunov was supported by the Ministry of Science and Higher Education of the Russian Federation (Goszadaniye) 075-00337-20-03, project No. 0714-2020-0005. We thank Sai Praneeth Karimireddy for useful discussions and suggestions, Lie He for providing the code with CENTEREDCLIP, William Cappelletti for pointing out several relevant papers, Gennady Pekhimenko for his technical expertize and infrastructure support for actual distributed training experiments, and Dmitrii Emelianenko for helpful discussions. The computational resources for the experiments were provided entirely by the Amazon Research Awards program.
+10
+
+REFERENCES
+Georges Aad, Tatevik Abajyan, and The ATLAS Collaboration. Observation of a new particle in the search for the Standard Model Higgs boson with the ATLAS detector at the LHC. Physics Letters B, 716:1–29, 09 2012.
+Benjamin Abbott, LIGO Scientiﬁc Collaboration, and Virgo Collaboration. Observation of gravitational waves from a binary black hole merger. Physical Review Letters, 116, 02 2016. doi: 10.1103/PhysRevLett.116.061102.
+Ittai Abraham, TH Hubert Chan, Danny Dolev, Kartik Nayak, Rafael Pass, Ling Ren, and Elaine Shi. Communication complexity of byzantine agreement, revisited. In Proceedings of the 2019 ACM Symposium on Principles of Distributed Computing, pp. 317–326, 2019.
+Dan Alistarh, Zeyuan Allen-Zhu, and Jerry Li. Byzantine stochastic gradient descent. In Proceedings of the 32nd International Conference on Neural Information Processing Systems, pp. 4618–4628, 2018.
+Zeyuan Allen-Zhu, Faeze Ebrahimianghazani, Jerry Li, and Dan Alistarh. Byzantine-resilient nonconvex stochastic gradient descent. In International Conference on Learning Representations, 2021. URL https://openreview.net/forum?id=PbEHqvFtcS.
+David P Anderson. Boinc: A system for public-resource computing and storage. In Fifth IEEE/ACM international workshop on grid computing, pp. 4–10. IEEE, 2004.
+Medha Atre, Birendra Jha, and Ashwini Rao. Distributed deep learning using volunteer computinglike paradigm. 2021 IEEE International Parallel and Distributed Processing Symposium Workshops (IPDPSW), Jun 2021. doi: 10.1109/ipdpsw52791.2021.00144. URL http://dx.doi.org/ 10.1109/ipdpsw52791.2021.00144.
+Hari Balakrishnan, M Frans Kaashoek, David Karger, Robert Morris, and Ion Stoica. Looking up data in p2p systems. Communications of the ACM, 46(2):43–48, 2003.
+Gilad Baruch, Moran Baruch, and Yoav Goldberg. A little is enough: Circumventing defenses for distributed learning. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett (eds.), Advances in Neural Information Processing Systems, volume 32. Curran Associates, Inc., 2019. URL https://proceedings.neurips.cc/paper/2019/file/ ec1c59141046cd1866bbbcdfb6ae31d4-Paper.pdf.
+Adam L. Beberg, Daniel L. Ensign, Guha Jayachandran, Siraj Khaliq, and Vijay S. Pande. Folding@home: Lessons from eight years of volunteer distributed computing. 2009 IEEE International Symposium on Parallel & Distributed Processing, pp. 1–8, 2009.
+Walid Ben-Ameur, Pascal Bianchi, and Jérémie Jakubowicz. Robust distributed consensus using total variation. IEEE Transactions on Automatic Control, 61(6):1550–1564, 2016. doi: 10.1109/ TAC.2015.2471755.
+Peva Blanchard, El Mahdi El Mhamdi, Rachid Guerraoui, and Julien Stainer. Machine learning with adversaries: Byzantine tolerant gradient descent. In Proceedings of the 31st International Conference on Neural Information Processing Systems, pp. 118–128, 2017.
+Manuel Blum. Coin ﬂipping by telephone a protocol for solving impossible problems. ACM SIGACT News, 15(1):23–27, 1983.
+Keith Bonawitz, Hubert Eichner, Wolfgang Grieskamp, Dzmitry Huba, Alex Ingerman, Vladimir Ivanov, Chloe Kiddon, Jakub Konecˇný, Stefano Mazzocchi, H. Brendan McMahan, Timon Van Overveldt, David Petrou, Daniel Ramage, and Jason Roselander. Towards federated learning at scale: System design. In SysML 2019, 2019. URL https://arxiv.org/abs/1902.01046. To appear.
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel Ziegler,
+11
+
+Jeffrey Wu, Clemens Winter, Chris Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever, and Dario Amodei. Language models are few-shot learners. In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, and H. Lin (eds.), Advances in Neural Information Processing Systems, volume 33, pp. 1877–1901. Curran Associates, Inc., 2020. URL https://proceedings.neurips.cc/ paper/2020/file/1457c0d6bfcb4967418bfb8ac142f64a-Paper.pdf.
+Saikiran Bulusu, Prashant Khanduri, Pranay Sharma, and Pramod K Varshney. On distributed stochastic gradient descent for nonconvex functions in the presence of byzantines. In ICASSP 2020-2020 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), pp. 3137–3141. IEEE, 2020.
+Lingjiao Chen, Hongyi Wang, Zachary Charles, and Dimitris Papailiopoulos. Draco: Byzantineresilient distributed training via redundant gradients. In International Conference on Machine Learning, pp. 903–912. PMLR, 2018.
+Richard Cleve. Limits on the security of coin ﬂips when half the processors are faulty. In Proceedings of the eighteenth annual ACM symposium on Theory of computing, pp. 364–369, 1986.
+Georgios Damaskinos, El Mahdi El Mhamdi, Rachid Guerraoui, Arsany Hany Abdelmessih Guirguis, and Sébastien Louis Alexandre Rouault. Aggregathor: Byzantine machine learning via robust gradient aggregation. In The Conference on Systems and Machine Learning (SysML), 2019, 2019.
+Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark Mao, Marc' aurelio Ranzato, Andrew Senior, Paul Tucker, Ke Yang, Quoc Le, and Andrew Ng. Large scale distributed deep networks. In F. Pereira, C. J. C. Burges, L. Bottou, and K. Q. Weinberger (eds.), Advances in Neural Information Processing Systems, volume 25, pp. 1223–1231. Curran Associates, Inc., 2012. URL https://proceedings.neurips.cc/paper/2012/file/ 6aca97005c68f1206823815f66102863-Paper.pdf.
+Aaron Defazio and Leon Bottou. On the ineffectiveness of variance reduced optimization for deep learning. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett (eds.), Advances in Neural Information Processing Systems, volume 32. Curran Associates, Inc., 2019. URL https://proceedings.neurips.cc/paper/2019/file/ 84d2004bf28a2095230e8e14993d398d-Paper.pdf.
+Aaron Defazio, Francis Bach, and Simon Lacoste-Julien. Saga: A fast incremental gradient method with support for non-strongly convex composite objectives. In Advances In Neural Information Processing Systems, 2014.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. In NAACL-HLT, 2019.
+Michael Diskin, Alexey Bukhtiyarov, Max Ryabinin, Lucile Saulnier, Quentin Lhoest, Anton Sinitsin, Dmitriy Popov, Dmitry Pyrkin, Maxim Kashirin, Alexander Borzunov, Albert Villanova del Moral, Denis Mazur, Ilia Kobelev, Yacine Jernite, Thomas Wolf, and Gennady Pekhimenko. Distributed deep learning in open collaborations. CoRR, abs/2106.10207, 2021. URL https: //arxiv.org/abs/2106.10207.
+Danny Dolev and H. Raymond Strong. Authenticated algorithms for byzantine agreement. SIAM Journal on Computing, 12(4):656–666, 1983.
+John R. Douceur. The sybil attack. In Revised Papers from the First International Workshop on Peer-to-Peer Systems, IPTPS ’01, pp. 251–260, Berlin, Heidelberg, 2002. Springer-Verlag. ISBN 3540441794.
+El Mahdi El Mhamdi, Rachid Guerraoui, and Sébastien Rouault. The hidden vulnerability of distributed learning in Byzantium. In Jennifer Dy and Andreas Krause (eds.), Proceedings of the 35th International Conference on Machine Learning, volume 80 of Proceedings of Machine Learning Research, pp. 3521–3530. PMLR, 10–15 Jul 2018. URL http://proceedings.mlr.press/ v80/mhamdi18a.html.
+12
+
+Saeed Ghadimi and Guanghui Lan. Optimal stochastic approximation algorithms for strongly convex stochastic composite optimization i: A generic algorithmic framework. SIAM Journal on Optimization, 22(4):1469–1492, 2012.
+Saeed Ghadimi and Guanghui Lan. Stochastic ﬁrst-and zeroth-order methods for nonconvex stochastic programming. SIAM Journal on Optimization, 23(4):2341–2368, 2013.
+Shaﬁ Goldwasser, Silvio Micali, and Ronald L Rivest. A digital signature scheme secure against adaptive chosen-message attacks. SIAM Journal on computing, 17(2):281–308, 1988.
+Eduard Gorbunov, Dmitry Kovalev, Dmitry Makarenko, and Peter Richtarik. Linearly converging error compensated SGD. In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, and H. Lin (eds.), Advances in Neural Information Processing Systems, volume 33, pp. 20889–20900. Curran Associates, Inc., 2020. URL https://proceedings.neurips.cc/paper/2020/file/ ef9280fbc5317f17d480e4d4f61b3751-Paper.pdf.
+Eduard Gorbunov, Konstantin Burlachenko, Zhize Li, and Peter Richtárik. MARINA: Faster nonconvex distributed learning with compression. arXiv preprint arXiv:2102.07845, 2021.
+Priya Goyal, Piotr Dollár, Ross Girshick, Pieter Noordhuis, Lukasz Wesolowski, Aapo Kyrola, Andrew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch SGD: Training imagenet in 1 hour. arXiv preprint arXiv:1706.02677, 2017.
+Priya Goyal, Quentin Duval, Jeremy Reizenstein, Matthew Leavitt, Min Xu, Benjamin Lefaudeux, Mannat Singh, Vinicius Reis, Mathilde Caron, Piotr Bojanowski, Armand Joulin, and Ishan Misra. Vissl, 2021. URL https://github.com/facebookresearch/vissl.
+Nirupam Gupta and Nitin H Vaidya. Byzantine fault-tolerance in peer-to-peer distributed gradientdescent. arXiv preprint arXiv:2101.12316, 2021.
+Nirupam Gupta, Thinh T Doan, and Nitin H Vaidya. Byzantine fault-tolerance in decentralized optimization under 2f-redundancy. In 2021 American Control Conference (ACC), pp. 3632–3637. IEEE, 2021.
+King of Babylon Hammurabi and Robert Francis Harper. The Code of Hammurabi, King of Babylon: About 2250 BC: Autographed Text, Transliteration, Translation, Glossary Index of Subjects, Lists of Proper Names, Signs, Numuerals... University of Chicago Press, 1904. URL https: //books.google.ru/books?id=jeLz_BYUoeQC&pg=PA11. Page 11, §1.
+Andrew Hard, Chloé M Kiddon, Daniel Ramage, Francoise Beaufays, Hubert Eichner, Kanishka Rao, Rajiv Mathews, and Sean Augenstein. Federated learning for mobile keyboard prediction, 2018. URL https://arxiv.org/abs/1811.03604.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image recognition. 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), pp. 770–778, 2015.
+Lie He, Sai Praneeth Karimireddy, and Martin Jaggi. Byzantine-robust learning on heterogeneous datasets via resampling. arXiv preprint arXiv:2006.09365v3, 2020.
+Martin Hirt and Pavel Raykov. Multi-valued byzantine broadcast: The t< n case. In International Conference on the Theory and Application of Cryptology and Information Security, pp. 448–465. Springer, 2014.
+Li Huang and Dianbo Liu. Patient clustering improves efﬁciency of federated machine learning to predict mortality and hospital stay time using distributed electronic medical records. Journal of biomedical informatics, pp. 103291, 2019.
+Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. GPipe: Efﬁcient training of giant neural networks using pipeline parallelism. In Advances in Neural Information Processing Systems, pp. 103–112, 2019.
+13
+
+Yimin Jiang, Yibo Zhu, Chang Lan, Bairen Yi, Yong Cui, and Chuanxiong Guo. A uniﬁed architecture for accelerating distributed DNN training in heterogeneous gpu/cpu clusters. In 14th USENIX Symposium on Operating Systems Design and Implementation (OSDI 20), pp. 463–479. USENIX Association, November 2020. ISBN 978-1-939133-19-9. URL https://www.usenix.org/ conference/osdi20/presentation/jiang.
+Sai Praneeth Karimireddy, Lie He, and Martin Jaggi. Learning from history for byzantine robust optimization. arXiv preprint arXiv:2012.10333v3, 2020.
+Ekasit Kijsipongse, Apivadee Piyatumrong, and Suriya U-ruekolan. A hybrid gpu cluster and volunteer computing platform for scalable deep learning. The Journal of Supercomputing, 04 2018. doi: 10.1007/s11227-018-2375-9.
+Alexander Kolesnikov, Lucas Beyer, Xiaohua Zhai, Joan Puigcerver, Jessica Yung, S. Gelly, and N. Houlsby. Big transfer (bit): General visual representation learning. In ECCV, 2020.
+Anastasia Koloskova, Tao Lin, Sebastian U Stich, and Martin Jaggi. Decentralized deep learning with arbitrary communication compression. In International Conference on Learning Representations, 2020. URL https://openreview.net/forum?id=SkgGCkrKvH.
+Alex Krizhevsky, Vinod Nair, and Geoffrey Hinton. Cifar-10 (canadian institute for advanced research), 2009. URL http://www.cs.toronto.edu/~kriz/cifar.html.
+Zhen-Zhong Lan, Mingda Chen, Sebastian Goodman, Kevin Gimpel, Piyush Sharma, and Radu Soricut. ALBERT: A lite BERT for self-supervised learning of language representations. ArXiv, abs/1909.11942, 2019.
+Liping Li, Wei Xu, Tianyi Chen, Georgios B Giannakis, and Qing Ling. Rsa: Byzantine-robust stochastic aggregation methods for distributed learning from heterogeneous datasets. In Proceedings of the AAAI Conference on Artiﬁcial Intelligence, volume 33, pp. 1544–1551, 2019.
+Mu Li. Scaling distributed machine learning with the parameter server. In Proceedings of the 2014 International Conference on Big Data Science and Computing, BigDataScience ’14, New York, NY, USA, 2014. Association for Computing Machinery. ISBN 9781450328913. doi: 10.1145/2640087.2644155. URL https://doi.org/10.1145/2640087.2644155.
+Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li, Adam Paszke, Jeff Smith, Brian Vaughan, Pritam Damania, and Soumith Chintala. PyTorch Distributed: Experiences on accelerating data parallel training. Proc. VLDB Endow., 13(12):3005–3018, August 2020. ISSN 2150-8097. doi: 10.14778/3415478.3415530. URL https://doi.org/10.14778/ 3415478.3415530.
+Zhenyu Li, James Davis, and Stephen Jarvis. An efﬁcient task-based all-reduce for machine learning applications. In Proceedings of the Machine Learning on HPC Environments, MLHPC’17, New York, NY, USA, 2017. Association for Computing Machinery. ISBN 9781450351379. doi: 10.1145/3146347.3146350. URL https://doi.org/10.1145/3146347.3146350.
+Yujun Lin, Song Han, Huizi Mao, Yu Wang, and William J Dally. Deep Gradient Compression: Reducing the communication bandwidth for distributed training. In The International Conference on Learning Representations, 2018.
+Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer, and Veselin Stoyanov. Roberta: A robustly optimized bert pretraining approach. ArXiv, abs/1907.11692, 2019.
+I. Loshchilov and F. Hutter. SGDR: Stochastic gradient descent with warm restarts. In International Conference on Learning Representations (ICLR) 2017 Conference Track, April 2017.
+Lingjuan Lyu, Han Yu, Xingjun Ma, Lichao Sun, Jun Zhao, Qiang Yang, and Philip S Yu. Privacy and robustness in federated learning: Attacks and defenses. arXiv preprint arXiv:2012.06337, 2020.
+Petar Maymounkov and David Mazieres. Kademlia: A peer-to-peer information system based on the xor metric. In International Workshop on Peer-to-Peer Systems, pp. 53–65. Springer, 2002.
+14
+
+Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise Aguera y Arcas. Communication-efﬁcient learning of deep networks from decentralized data. In Artiﬁcial Intelligence and Statistics, pp. 1273–1282, 2017.
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models. In 5th International Conference on Learning Representations, ICLR, Conference Track Proceedings, 2017. URL https://openreview.net/forum?id=Byj72udxe.
+Rick Merritt. Folding@home gets 1.5+ Exaﬂops to Fight COVID-19, 04 2020. https://blogs.nvidia.com/blog/2020/04/01/foldingathome-exaflopcoronavirus/(accessed on Apr 29, 2021).
+Hiroaki Mikami, Hisahiro Suganuma, Pongsakorn U-chupala, Yoshiki Tanaka, and Yuichi Kageyama. Massively distributed sgd: Imagenet/resnet-50 training in a ﬂash, 2019.
+Konstantin Mishchenko, Eduard Gorbunov, Martin Takácˇ, and Peter Richtárik. Distributed learning with compressed gradient differences. arXiv preprint arXiv:1901.09269, 2019.
+Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R. Devanur, Gregory R. Ganger, Phillip B. Gibbons, and Matei Zaharia. PipeDream: Generalized pipeline parallelism for DNN training. In Proceedings of the 27th ACM Symposium on Operating Systems Principles, SOSP ’19, pp. 1–15, New York, NY, USA, 2019. Association for Computing Machinery. doi: 10.1145/3341301.3359646.
+Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al. Efﬁcient large-scale language model training on GPU clusters. arXiv preprint arXiv:2104.04473, 2021.
+Arkadi Nemirovski, Anatoli Juditsky, Guanghui Lan, and Alexander Shapiro. Robust stochastic approximation approach to stochastic programming. SIAM Journal on optimization, 19(4):1574– 1609, 2009.
+Yurii Nesterov. A method for solving the convex programming problem with convergence rate o(1/k2). Proceedings of the USSR Academy of Sciences, 269:543–547, 1983.
+Yurii Nesterov. Introductory lectures on convex optimization: A basic course, volume 87. Springer Science & Business Media, 2003.
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. PyTorch: An imperative style, high-performance deep learning library. In Advances in Neural Information Processing Systems, pp. 8024–8035, 2019.
+Pitch Patarasuk and Xin Yuan. Bandwidth optimal all-reduce algorithms for clusters of workstations. J. Parallel Distrib. Comput., 69(2):117–124, February 2009. ISSN 0743-7315. doi: 10.1016/ j.jpdc.2008.09.002. URL https://doi.org/10.1016/j.jpdc.2008.09.002.
+Marshall Pease, Robert Shostak, and Leslie Lamport. Reaching agreement in the presence of faults. Journal of the ACM (JACM), 27(2):228–234, 1980.
+Jie Peng, Weiyu Li, and Qing Ling. Byzantine-robust decentralized stochastic optimization over static and time-varying networks. Signal Processing, 183:108020, 2021.
+Krishna Pillutla, Sham M Kakade, and Zaid Harchaoui. Robust aggregation for federated learning. arXiv preprint arXiv:1912.13445, 2019.
+Tal Rabin and Michael Ben-Or. Veriﬁable secret sharing and multiparty protocols with honest majority. In Proceedings of the twenty-ﬁrst annual ACM symposium on Theory of computing, pp. 73–85, 1989.
+Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. ZeRO: Memory optimizations toward training trillion parameter models. SC20: International Conference for High Performance Computing, Networking, Storage and Analysis, pp. 1–16, 2020.
+15
+
+Shashank Rajput, Hongyi Wang, Zachary Charles, and Dimitris Papailiopoulos. DETOX: A redundancy-based framework for faster and more robust gradient aggregation. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett (eds.), Advances in Neural Information Processing Systems, volume 32. Curran Associates, Inc., 2019. URL https://proceedings.neurips.cc/paper/2019/file/ 415185ea244ea2b2bedeb0449b926802-Paper.pdf.
+Benjamin Recht, Christopher Re, Stephen Wright, and Feng Niu. Hogwild: A lock-free approach to parallelizing stochastic gradient descent. In Advances in neural information processing systems, pp. 693–701, 2011.
+Jayanth Regatti, Hao Chen, and Abhishek Gupta. ByGARS: Byzantine SGD with arbitrary number of attackers. arXiv preprint arXiv:2006.13421, 2020.
+Ronald L Rivest, Adi Shamir, and Leonard Adleman. A method for obtaining digital signatures and public-key cryptosystems. Communications of the ACM, 21(2):120–126, 1978.
+Nuria Rodríguez-Barroso, Eugenio Martínez-Cámara, M Luzón, Gerardo González Seco, Miguel Ángel Veganzones, and Francisco Herrera. Dynamic federated learning model for identifying adversarial clients. arXiv preprint arXiv:2007.15030, 2020.
+Antony Rowstron and Peter Druschel. Pastry: Scalable, decentralized object location, and routing for large-scale peer-to-peer systems. In IFIP/ACM International Conference on Distributed Systems Platforms and Open Distributed Processing, pp. 329–350. Springer, 2001.
+Tara Ruttley, Julie Robinson, and William Gerstenmaier. The international space station: Collaboration, utilization, and commercialization. Social Science Quarterly, 98:1160–1174, 12 2017. doi: 10.1111/ssqu.12469.
+Max Ryabinin and Anton Gusev. Towards crowdsourced training of large neural networks using decentralized mixture-of-experts. In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, and H. Lin (eds.), Advances in Neural Information Processing Systems, volume 33, pp. 3659–3672. Curran Associates, Inc., 2020. URL https://proceedings.neurips.cc/paper/2020/ file/25ddc0f8c9d3e22e03d3076f98d83cb2-Paper.pdf.
+Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and its application to data-parallel distributed training of speech dnns. In Fifteenth Annual Conference of the International Speech Communication Association, 2014.
+Rico Sennrich, Barry Haddow, and Alexandra Birch. Neural machine translation of rare words with subword units. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp. 1715–1725, Berlin, Germany, August 2016. Association for Computational Linguistics. doi: 10.18653/v1/P16-1162. URL https://www.aclweb.org/ anthology/P16-1162.
+Alexander Sergeev and Mike Del Balso. Horovod: fast and easy distributed deep learning in tensorﬂow, 2018.
+Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. Megatron-LM: Training multi-billion parameter language models using gpu model parallelism. arXiv preprint arXiv:1909.08053, 2019.
+Bob Smith. Flakey AMD/ATI GPUs, including RX 5700 XT, Cross Validating, polluting the Database, 2019. URL https://setiathome.berkeley.edu/forum_thread.php?id=84508. Accessed: 2021-05-20.
+Chen Sun, Abhinav Shrivastava, Saurabh Singh, and Abhinav Gupta. Revisiting unreasonable effectiveness of data in deep learning era. In Proceedings of the IEEE International Conference on Computer Vision (ICCV), Oct 2017.
+Vale Tolpegin, Stacey Truex, Mehmet Emre Gursoy, and Ling Liu. Data poisoning attacks against federated learning systems. In ESORICS, 2020.
+16
+
+Zied Trifa and Maher Khemakhem. Sybil nodes as a mitigation strategy against sybil attack. Procedia Computer Science, 32:1135–1140, 2014.
+Guido Urdaneta, Guillaume Pierre, and Maarten Van Steen. A survey of DHT security techniques. ACM Computing Surveys (CSUR), 43(2):1–49, 2011.
+Liang Wang and Jussi Kangasharju. Real-world sybil attacks in bittorrent mainline DHT. In 2012 IEEE Global Communications Conference (GLOBECOM), pp. 826–832. IEEE, 2012.
+Zhaoxian Wu, Qing Ling, Tianyi Chen, and Georgios B Giannakis. Federated variance-reduced stochastic gradient descent with robustness to byzantine attacks. IEEE Transactions on Signal Processing, 68:4583–4596, 2020.
+Cong Xie, Oluwasanmi Koyejo, and Indranil Gupta. Fall of empires: Breaking byzantine-tolerant sgd by inner product manipulation. In Uncertainty in Artiﬁcial Intelligence, pp. 261–270. PMLR, 2020.
+Xinyi Xu and Lingjuan Lyu. Towards building a robust and fair federated learning system. arXiv preprint arXiv:2011.10464, 2020.
+Zhixiong Yang and Waheed U Bajwa. Bridge: Byzantine-resilient decentralized gradient descent. arXiv preprint arXiv:1908.08098, 2019a.
+Zhixiong Yang and Waheed U Bajwa. Byrdie: Byzantine-resilient distributed coordinate descent for decentralized learning. IEEE Transactions on Signal and Information Processing over Networks, 5 (4):611–627, 2019b.
+Dong Yin, Yudong Chen, Ramchandran Kannan, and Peter Bartlett. Byzantine-robust distributed learning: Towards optimal statistical rates. In International Conference on Machine Learning, pp. 5650–5659. PMLR, 2018.
+Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Srinadh Bhojanapalli, Xiaodan Song, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. Large batch optimization for deep learning: Training BERT in 76 minutes. In International Conference on Learning Representations, 2020. URL https://openreview.net/forum?id=Syx4wnEtvH.
+Jingzhao Zhang, Sai Praneeth Karimireddy, Andreas Veit, Seungyeon Kim, Sashank Reddi, Sanjiv Kumar, and Suvrit Sra. Why are adaptive methods good for attention models? In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, and H. Lin (eds.), Advances in Neural Information Processing Systems, volume 33, pp. 15383–15393. Curran Associates, Inc., 2020. URL https://proceedings.neurips.cc/paper/2020/file/ b05b57f6add810d3b7490866d74c0053-Paper.pdf.
+Ben Zhao, Ling Huang, Jeremy Stribling, Sean Rhea, Anthony Joseph, and John Kubiatowicz. Tapestry: A resilient global-scale overlay for service deployment. IEEE Journal on Selected Areas in Communications, 22, 07 2003. doi: 10.1109/JSAC.2003.818784.
+Martin Zinkevich, Markus Weimer, Lihong Li, and Alex Smola. Parallelized stochastic gradient descent. In J. Lafferty, C. Williams, J. Shawe-Taylor, R. Zemel, and A. Culotta (eds.), Advances in Neural Information Processing Systems, volume 23, pp. 2595–2603. Curran Associates, Inc., 2010. URL https://proceedings.neurips.cc/paper/2010/file/ abea47ba24142ed16b7d8fbf2c740e0d-Paper.pdf.
+17
+
+SUPPLEMENTARY MATERIAL
+
+TABLE OF CONTENTS
+
+1 Introduction
+
+1
+
+2 Related work
+
+2
+
+2.1 Distributed deep learning . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 2
+
+2.2 Byzantine-tolerant optimization . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 3
+
+2.3 Security in distributed systems . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 3
+
+3 Method
+
+4
+
+3.1 Byzantine-Tolerant All-Reduce . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 4
+
+3.2 Convergence analysis . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 6
+
+3.3 Resisting Sybil attacks . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 7
+
+4 Experiments
+
+8
+
+4.1 CIFAR10 classiﬁcation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 8
+
+4.2 Pre-training transformers . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 9
+
+5 Conclusion
+
+10
+
+A Additional related work
+
+19
+
+A.1 Byzantine-tolerant optimization: additional details . . . . . . . . . . . . . . . . . . . . . . . 19
+
+A.1.1 Parameter-server (PS) based approaches . . . . . . . . . . . . . . . . . . . . . . . . 19
+
+A.1.2 Decentralized approaches . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 19
+
+A.2 Security in distributed systems: additional details . . . . . . . . . . . . . . . . . . . . . . . . 21
+
+A.2.1 Broadcast channels . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 21
+
+A.2.2 Multi-party random number generators . . . . . . . . . . . . . . . . . . . . . . . . . 21
+
+B Network and compute overhead of BTARD-SGD
+
+22
+
+C Overview of attack vectors
+
+22
+
+D Detailed algorithm description
+
+24
+
+D.1 BTARD and CenteredClip . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 24
+
+D.2 Protocols for banning Byzantine peers . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 26
+
+D.3 BTARD-SGD and detecting protocol violations . . . . . . . . . . . . . . . . . . . . . . . . . 26
+
+E Convergence analysis: missing proofs and extra details
+
+29
+
+E.1 Preliminaries . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 29
+
+E.2 Impossibility of Byzantine-tolerant learning in heterogeneous case . . . . . . . . . . . . . . . 29
+
+E.3 Convergence guarantees for BTARD-SGD . . . . . . . . . . . . . . . . . . . . . . . . . . . 30
+
+E.3.1 On Assumptions 3.1 and 3.2 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 30
+
+E.3.2 Quality of the aggregation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 31
+
+E.3.3 Non-convex case . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 34
+
+E.3.4 Convex case . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 37
+
+E.3.5 Strongly convex case: Restarted-BTARD-SGD . . . . . . . . . . . . . . . . . . . . . 41
+
+E.4 Convergence guarantees for BTARD-Clipped-SGD . . . . . . . . . . . . . . . . . . . . . . . 44
+
+E.4.1 Quality of the aggregation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 45
+
+E.4.2 Convex case . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 47
+
+E.4.3 Strongly convex case: Restarted-BTARD-Clipped-SGD . . . . . . . . . . . . . . . . 53
+
+F Reputation system for public collaborations
+
+57
+
+G Secure distributed hash tables
+
+59
+
+H ALBERT experiment setup
+
+59
+
+I Additional experiments
+
+60
+
+I.1 Extra evaluations on the CIFAR10 classiﬁcation task . . . . . . . . . . . . . . . . . . . . . . 60
+
+I.2 Evaluating computation overhead in terms of wall time . . . . . . . . . . . . . . . . . . . . . 61
+
+I.3 Experiments at a larger scale . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 62
+
+18
+
+A ADDITIONAL RELATED WORK
+A.1 BYZANTINE-TOLERANT OPTIMIZATION: ADDITIONAL DETAILS
+In this section, we provide extra details on the related work discussed in Section 2.2. The summary of complexity results is presented in Table 2.
+A.1.1 PARAMETER-SERVER (PS) BASED APPROACHES
+There is a quite large number of papers on Byzantine-tolerant optimization that aim to robustify parallel SGD in the case when a trusted parameter-server (PS) is available. Since in the classical parallel SGD even one Byzantine worker can break the convergence of the whole method by shifting the mean of the resulting vector in an arbitrary way, it is natural to substitute averaging of the vectors received from the workers by a more robust aggregation rule, e.g., Krum (Blanchard et al., 2017), coordinate-wise median, trimmed median (Yin et al., 2018), Multi-Krum (Damaskinos et al., 2019), Bulyan (El Mhamdi et al., 2018), geometric median (Pillutla et al., 2019). However, all these methods were shown to be brittle and not robust to special types of Byzantine attacks (Baruch et al., 2019; Xie et al., 2020; Karimireddy et al., 2020). Moreover, Karimireddy et al. (2020) show that all permutation-invariant algorithms cannot converge to any predeﬁned accuracy of the solution, meaning that simple application of some aggregation rules on top of SGD does not lead to Byzantine tolerance.
+There are several approaches to circumvent this issue. Alistarh et al. (2018) propose BYZANTINESGD and prove the convergence results for convex problems. Allen-Zhu et al. (2021) extend this approach to handle non-convex problems as well. In both papers, the key idea is based on applying the concentration properties of the sums depending on the stochastic gradients as well as iterative removing of Byzantine peers. However, theoretical guarantees from Alistarh et al. (2018); Allen-Zhu et al. (2021) rely on the restrictive assumption that the noise in the stochastic gradients is uniformly bounded with probability 1. Bulusu et al. (2020) propose similar approach to the one from (AllenZhu et al., 2021) but analyze their method under more restrictive assumptions (boundedness of the gradient). Next, Wu et al. (2020) propose a Byzantine-tolerant version of parallel SAGA (Defazio et al., 2014), i.e., variance-reduced version of SGD, with geometric median as an aggregation rule — BYRD-SAGA – and prove its convergence for strongly convex objectives. However, the authors do not establish the convergence of BYRD-SAGA to any predeﬁned accuracy of the solution. Moreover, variance-reduced methods are known to converge slowly in deep learning applications (Defazio & Bottou, 2019), which limits the practical utility of BYRD-SAGA. Finally, Karimireddy et al. (2020) propose a new aggregation rule called CENTEREDCLIP, apply it to SGD with client momentum, and prove convergence results for the obtained method in the non-convex case under reasonable assumptions. Alternative lines of work achieve Byzantine-tolerant optimization through redundant computations (Chen et al., 2018; Rajput et al., 2019) or reputation-based approaches (RodríguezBarroso et al., 2020; Regatti et al., 2020; Xu & Lyu, 2020). Unfortunately, these papers either do not contain theoretical (non-asymptotic) convergence results for the proposed methods or rely on too restrictive assumptions in the analysis. See more references in the recent survey by Lyu et al. (2020).
+A.1.2 DECENTRALIZED APPROACHES
+Byzantine-tolerant optimization methods for decentralized communication architectures are studied only in a couple of papers. Yang & Bajwa (2019a;b) consider a speciﬁc scenario when workers compute full gradients, local loss functions on peers are heterogeneous, and the trimmed coordinatewise median is used as an aggregation rule. In this setup, the authors prove convergence results in the strongly convex case to some accuracy depending on the heterogeneity level of local loss functions, which is natural in the presence of Byzantine peers. However, these results are not applicable to a wide range of practically important problems where stochastic gradients have to be used. This issue was partially resolved in Peng et al. (2021), where the authors propose a version of GOSSIP SGD applied to the equivalent reformulation of the original problem based on TV-regularization (Ben-Ameur et al., 2016). However, the established convergence results in the strongly convex case do not show any beneﬁts of using communications with other workers in the homogeneous data regime that appears in large-batch training of deep learning models. Li et al. (2019) use the same idea for a parameter-server architecture. Finally, there are approaches requiring peer-to-peer communications of full vectors at each step (Gupta et al., 2021; Gupta & Vaidya, 2021), which is not scalable.
+19
+
+Table 2: Summary of the complexity results for Parameter-Server (PS) based and distributed Byzantine-tolerant
+optimization. By default, columns “Non-convex”, “Convex”, and “Strongly convex” contain the complexity
+bounds for L-smooth non-convex, convex, and µ-strongly convex problems respectively. By complexity we mean the number of iterations sufﬁcient to ﬁnd such point x that E[ ∇f (x) 2] ≤ ε2 for non-convex problems and E[f (x) − f (x∗)] ≤ ε for convex and µ-strongly convex problems (see Def. E.2) with x∗ being the solution.
+For simplicity we omit numerical factors, logarithmic terms depending on the parameters of the problem, and factors, quantifying suboptimality of the starting point, i.e., R0 = x0 − x∗ and f (x0) − infx∈Rd f (x). Notation: δ = |B|/n, m = number of peers checked at each iteration. The results from (Yang & Bajwa, 2019a;b)
+are not included in the table since they rely on full-gradient computations.
+
+Non-PS?
+
+Work
+
+Non-convex
+
+Convex
+
+Strongly convex
+
+(Alistarh et al., 2018)(1),(2)
+
+
+
+1ε + nσε22 + δ2εσ2 2
+
+1 + σ2 + δ2σ2
+
+µ nµε
+
+µε
+
+
+
+(Allen-Zhu et al., 2021)(1),(3)
+
++ 1
+
+δ2
+
+nε4
+
+ε4
+
+
+
+
+
+(Wu et al., 2020)(4)   Lµ22 (5)
+
+(Karimireddy et al., 2020)(6) ε12 + nσε24 + δεσ42  
+
+(Peng et al., 2021)(6),(7) This work(8)
+
+ ε12 + nσε24 + nmδεσ22
+
+
+
+1+
+
+σ2
+
+√
++ n δσ
+
+ε nε2
+
+mε
+
+µ1ε + nµσ2ε2 + λ2√µd2Nε 2 1 + σ2 + n √δσ
+µ nµε m µε
+
+
+
+This work(9)
+
++ + 1
+
+σ2
+
+n2 δσ2
+
+ε2
+
+nε4
+
+mε2
+
+1ε + nσε22 + nm2δεσ
+
+1 + σ2 + n√2δσ
+µ nµε m µε
+
+This work(10)
+
+
+
+α GΛ1 α−1
+
+G2 Λ1
+
+α 2(α−1)
+
+ε
+
+µε
+
+This work(11)
+
+ GΛ2 ε
+
+α α−1
+
+G2 Λ2 µε
+
+α 2(α−1)
+
+(1) The results are proven under uniformly bounded noise assumption: ∇f (x, ξ) − ∇f (x) ≤ σ for all x and ξ.
+
+High-probability guarantees are established, i.e., it is proven that with probability at least 1 − β algorithms from (Alistarh et al., 2018) ﬁnd xˆ such that f (xˆ) − f (x∗) ≤ ε and algorithms from (Allen-Zhu et al., 2021) ﬁnd xˆ
+
+such that ∇f (xˆ) ≤ ε.
+
+(2) Dependencies on β are logarithmic and, therefore, omitted. Optimization problems is assumed to be deﬁne on
+
+a bounded set, the rates depends on the diameter of this set. (3) The results are derived for the case σ = 1. Allen-Zhu et al. (2021) also derive convergence guarantees for
+
+ﬁnding second-order stationary points.
+
+(4) Wu et al. (2020) consider ﬁnite-sum case of (3), i.e., f (x) = N1 Nj=1 f (x, j). The results are derived under
+
+uniformly bounded variance assumption: Ej[ ∇f (x, j) − ∇f (x) 2] ≤ σ2 for all x ∈ Rd, where j is sampled
+
+uniformly at random from {1, . . . , N }. Wu et al. (2020) also derive convergence guarantees under ζ-bounded
+
+dissimilarity assumption, i.e., when f (x) = |G1|
+
+i∈G fi(x), fi(x)
+
+=
+
+1 N
+
+N j=1
+
+fi(x,
+
+j
+
+)
+
+for
+
+all
+
+i
+
+∈
+
+G,
+
+and
+
+1 |G|
+
+i∈G ∇fi(x) − ∇f (x) 2 ≤ ζ2.
+
+(5) This result is obtained the main result of (Wu et al., 2020) and states that the method from (Wu et al., 2020) ﬁnds xˆ such that f (xˆ) − f (x∗) ≤ ε only for ε ≥ σ2/µ2( 21 −δ)2, which can be large.
+(6) The result is derived under uniformly bounded variance assumption, i.e., Eξ∼D[ ∇f (x, ξ) − ∇f (x) 2] ≤ σ2
+
+for all x ∈ Rd. (7) Peng et al. (2021) consider the case, when peers are allowed to communicate with their neighbors that are
+
+deﬁned via some communication graph. The result establishes the total number of iterations/communication
+
+rounds needed to ﬁnd xˆ such that E xˆ − x∗ 2 ≤ ε for ε ≥ λµ22d i∈G |Bi|2, where λ ≥ 0 is any non-negative
+
+number and Bi is the set of Byzantine peers neighboring with the i-th peer. In the complexity result, we use
+
+the notation N 2 = i∈G(|Gi|2 + |Bi|2), where Gi is the set of good neighbors of the i-th peer. When λ = 0, the workers do not communicate at all. Moreover, Peng et al. (2021) analyze the case of heterogeneous local
+
+functions, composite optimization problems and time-varying setup but in that case λ is lower bounded by
+
+a strictly positive quantity depending on the heterogeneity level and minimal non-zero singular value of the
+
+node-edge incidence matrix, i.e., any predeﬁned accuracy cannot be achieved. (8) The results are derived for BTARD-SGD (in the strongly convex case, for RESTARTED-BTARD-SGD)
+
+under Assumptions 3.1 and 3.2 in the case when the exact number of attacking Byzantine workers at iteration k
+
+is known to each participant. See Theorems E.2, E.4, and E.6. (9) The results are derived for BTARD-SGD (in the strongly convex case, for RESTARTED-BTARD-SGD)
+
+under Assumptions 3.1 and 3.2. See Theorems E.3, E.5, and E.7. (10) The results are derived for BTARD-CLIPPED-SGD (in the strongly convex case, for RESTARTED-BTARD-
+
+CLIPPED-SGD) under Assumption E.1 without any additional assumptions on the tails of the distribution.
+
+Moreover, it is assumed that the exact number of attacking Byzantine workers at iteration k is known to each √
+participant. See Theorems E.8 and E.10. In the complexity results, we use the notation Λ1 = 1 + nmδ . (11) The results are derived for BTARD-CLIPPED-SGD (in the strongly convex case, for RESTARTED-BTARD-
+
+CLIPPED-SGD) under Assumption E.1 without any additional assumptions on the tails of the distribution. See
+
+Theorems E.9 and E.11. In the complexity results, we use the notation Λ2 = 1 + nm2δ .
+
+20
+
+In contrast, our results do beneﬁt from the communications between workers. First of all, as one can see from Table 2, the terms depending on the fraction δ of Byzantine peers in our complexity bounds for BTARD-SGD and RESTARTED-BTARD-SGD (the third terms) have better dependence on the target accuracy ε than the corresponding terms in the complexity bounds from all previous works (even from those relying on the existence of a PS). Moreover, for sufﬁciently small ε these terms in our complexity results are smaller than the second terms, which correspond to the main term in the complexity of parallel SGD. That is, BTARD-SGD/RESTARTED-BTARD-SGD applied to the problem with Byzantine peers has convergence guarantees that are not worse than the corresponding guarantees for parallel SGD applied to the problem without any Byzantine workers.
+We notice that Assumptions 3.1 and 3.2 used in the analysis of BTARD-SGD/RESTARTED-BTARDSGD are slightly stronger than uniformly bounded variance assumption used in (Wu et al., 2020; Karimireddy et al., 2020; Peng et al., 2021). However, as we explain in Appendix E.3.1, our analysis allows to relax Assumptions 3.1 to uniformly bounded variance assumption, and Assumption 3.2 is reasonable for many practically important problems. Finally, we also propose and analyze BTARDCLIPPED-SGD and RESTARTED-BTARD-CLIPPED-SGD under Assumption E.1 that may hold even in the case of unbounded variance of the stochastic gradient. To the best of our knowledge, this is the ﬁrst time in the literature on the Byzantine-tolerant optimization when the complexity results are obtained without assuming boundedness of the stochastic gradient’s variance.
+A.2 SECURITY IN DISTRIBUTED SYSTEMS: ADDITIONAL DETAILS
+In this section, we provide extra details on the related work discussed in Section 2.3.
+A.2.1 BROADCAST CHANNELS
+Many distributed systems rely exclusively on direct peer-to-peer connections, avoiding any centralized servers to increase reliability and avoid the performance bottleneck. In presence of malicious participants, this introduces additional security challenges since an attacker can send corrupted data to one participant and behave honestly with others. If a peer accuses another peer in sending corrupted data, it is impossible for remaining peers to determine whether the accusation is fair since only these two peers had access to the contents of the communication channel between them.
+To overcome this, distributed systems can build secure broadcast channels over the peer-to-peer connections using the protocols for Byzantine broadcast. These protocols guarantee that if a peer p sends a message, (a) all honest peers receive the same message and (b) the received message coincides with the original one if p is honest.
+Pease et al. (1980) suggest such a protocol for the case when the share of malicious peers δ < 1/3, and Dolev & Strong (1983) suggest a protocol tolerating any δ < 1 assuming the presence of a public key infrastructure and usage of the digital signatures (Rivest et al., 1978; Goldwasser et al., 1988).
+Hirt & Raykov (2014) review how the communication complexity of various Byzantine broadcast protocols depends on the maximal tolerated δ and the length of the broadcasted message. Abraham et al. (2019) review protocols with additional practical assumptions improving the communication complexity.
+A.2.2 MULTI-PARTY RANDOM NUMBER GENERATORS
+Many distributed systems may beneﬁt from the multi-party random number generators (MPRNG) where a group of malicious peers would have little inﬂuence (bias) on the generator output. MPRNGs are usually based on multi-party coin tossing protocols, such as the protocol from Blum (1983) (we provide its intuitive scheme in Figure 4). As an example, MPRNG allows to choose a participant winning a lottery or choose a peer whose calculations are going to be validated by other peers to detect possible cheating.
+While there are MPRNGs (Rabin & Ben-Or, 1989) with a negligible bias for the case when more than a half parties are honest (assuming the presence of the broadcast channel), Cleve (1986) proves that it is impossible to reach the negligible bias for the case of dishonest majority, which may be reached in practice with the Sybil attacks.
+21
+
+Legend
+Peers Local command Broadcast protocol
+
+B
+
+A
+
+R
+
+R
+
+hi
+
+I
+
+si, xi
+
+E
+
+R
+
+xi=rand() hi=h(i||xi||si)
+
+Verify ∀ j hj=h(j||xj||sj)
+
+x=h(x1||…||xn)
+
+Figure 4: An intuitive scheme of MPRNG based on Blum (1983). The || operation denotes concatenation, h(x) denotes a cryptographic hash function. The hashed value includes the peer identiﬁer i to protect from replay attacks (an attacker repeats someone else’s message) and a large random string si to resist dictionary attacks (an attacker reverses the hash function using a large dictionary).
+
+However, we note that the bias in Blum (1983) appears only in the case when an attacker learns the result earlier than other peers and aborts the procedure. If we are using MPRNG to choose a peer that to be checked for cheating, we may ban all peers that aborted the procedure and restart from scratch without them, therefore eliminating the bias problem.
+
+B NETWORK AND COMPUTE OVERHEAD OF BTARD-SGD
+Despite having complex structure, BTARD-SGD has only limited communication overhead, when compared to regular All-Reduce SGD. A single step of BTARD requires each peer to send each gradient tensor exactly once for aggregation, then download the results, exactly as in Butterﬂy All-Reduce. On top of that, peers are only required to broadcast O(n) scalars that are independent of the total size of the trained model.
+Hirt & Raykov (2014) discuss that a simple modiﬁcation of the protocol from Dolev & Strong (1983) leads to the communication complexity of O(n3 + ln2) bits for each peer in the worst case, where l is the length of the broadcasted message. For the O(n) scalars, this gives O(n3) communication.
+As a result, the communication complexity of a single BTARD-SGD step for each peer is O(d + n3) bits. We note that for models that beneﬁt from distributed training, the n3 component is usually dominated by the vector size d, as they usually contain at least tens of millions of trainable parameters.
+Still, if necessary, the n3 component may be improved using the Byzantine broadcast protocols with additional practical assumptions, such as allowing a small probability of error. Abraham et al. (2019) review such protocols, their assumptions, and communication complexity.
+In terms of computation, BTARD-SGD introduces two main overheads: from validators and CENTEREDCLIP respectively. As we have shown empirically, both BTARD-SGD and BTARDCLIPPED-SGD can withstand attacks even with 1 random validator chosen from 16 peers. As such, the computation overhead for these validators is under 10% of the total compute.
+As for the CENTEREDCLIP, our algorithm executes the same amount of computation as the original CENTEREDCLIP (Karimireddy et al., 2020), except that now the extra load is distributed evenly across all peers. We provide an empirical evaluation of such overhead in Appendix I.2.
+
+C OVERVIEW OF ATTACK VECTORS
+In Section 3.2, we have outlined the 4 main types of Byzantine attacks that can affect BTARD-SGD. Here, we analyze each of these types in detail and provide a list of attacks that ﬁt these types.
+Gradient attacks. This attack vector encompasses all attacks where Byzantine peers replace their true gradients with something else, but otherwise act normally. With this attack, b Byzantine peers can collectively shift the outputs of CENTEREDCLIP by up to τ · b/n in any chosen direction. However, since Byzantine peers will need to commit hash of their incorrect gradients, every honest validator can accuse one of these peers with probability b/n .
+Aggregation attacks. A similar, but opposite attack type can be attempted when a Byzantine peer performs gradient aggregation. Instead of honestly computing CENTEREDCLIP, an attacker may
+
+22
+
+modify the returned vector to incorporate the same kinds of changes as in gradient attacks (see above). This time, the maximum difference that can be applied through such attacks is larger, but it only affects b/n of vector coordinates that are aggregated by Byzantines.
+Done naively, such attacks can be detected and banned by the gradient checksum (see L15-17 in Algorithm 1). In order to ensure that the above check passes, Byzantines can misreport their sji in such a way that i sji =0. However, since actual sji depend only on gik and gˆk, these values can be veriﬁed by the chosen validators, and, in case of mismatch, reported via ACCUSE. We rigorously prove this in Appendix D.3.
+Furthermore, if an honest validator ﬁnds that a certain peer has broadcast incorrect sji , the validator can simultaneously accuse the corresponding Byzantine aggregator j that should have notiﬁed about the incorrect sji (see L12-14 in Algorithm 1).
+Reputation abuse. Since BTARD-SGD provides means by which benign participants can ban Byzantine attackers, it is important to ensure that the same means cannot be exploited by Byzantine peers to eliminate benign ones or otherwise abuse the system. There are three potential attack vectors that ﬁt this description:
+• Falsely accusing a benign peer, • Persistently calling the ACCUSE procedure to slow down training, • Automatically approving gradients without actual validation,
+In BTARD-SGD, we protect against slander (issues 1. and 2.) by the design of ACCUSE protocol, by which a peer that initiates false allegations will itself be banned. As such, Byzantines can only invoke ACCUSE protocol a limited number of times before they are all permanently banned.
+In turn, the attack vector (3.) is more effective: if one Byzantine was chosen as validator for another Byzantine, they can automatically report successful validation without negative consequences for either of them. However, since all validators are chosen through MPRNG, an attacker has no way of predicting whether its validator will be benign or Byzantine. Thus, any malicious activity will always have a chance of being caught by an honest validator.
+Protocol violations. Finally, a Byzantine attacker can deviate from the protocol prescribed by BTARD-SGD in simpler ways ways, for instance:
+1. Not committing the hash of its gradient when required by 4, 2. Not sending data to a particular peer when required (or sending data twice), 3. Deliberately broadcasting a hash that mismatches the subsequently sent data, 4. Sending metadata (e.g. gradient norm) that is inconsistent with previously sent gradient part, 5. Sending si that is inconsistent with previously sent gradient, 6. Not validating when chosen as validator, validating when not chosen, or validating a different
+peer than was chosen by BTARD-SGD.
+For protocol deviations that are visible to all benign participants, such as in (1.) or (6.), benign peers can ban the offender instantaneously. However, this is not the case for attacks such as (2.), where the deviation is only visible to one or few peers.
+As described earlier in Section 3.2, we address this issue with a special procedure that allows any peer to ban any other peer at the cost of also being banned. Thus, if an attacker sends inconsistent gradients, norms or inner products to only one benign peer, that peer can still get the attacker banned even though it wouldn’t be able to call ACCUSE.
+Protecting from attacks 3, 4 and 5 from the above list also relies on this mutual elimination procedure. Speciﬁcally, if an attacker sends provably incorrect data to a benign peer, that peer will immediately trigger the mutual elimination procedure. The only exception to this rule is if one Byzantine peer sends incorrect data to another Byzantine peer: this behavior is neither punishable nor, in itself, harmful. In turn, the mutuality of this elimination procedure prevents potential misuse by Byzantines: if an attacker decides to ban someone through this procedure, that attacker will also be banned.
+23
+
+D DETAILED ALGORITHM DESCRIPTION
+
+In this section, we provide more formal versions of the BTARD (Alg. 4) and BTARD-SGD (Alg. 6) algorithms, as well as auxiliary subroutines and further details. For completeness, we describe our approach in a bottom-up manner. First, in Appendix D.1, we describe Algorithm 4 and one of its main building block called CENTEREDCLIP (Karimireddy et al., 2020). Then, we formulate the ACCUSE and ELIMINATE subroutines for blocking malicious peers in Algorithm 5 and comment on them in Appendix D.2. Finally, we formulate the full BTARD-SGD in Algorithm 6 using the above subroutines as building blocks and rigorously analyze its robustness to the violations of its steps by Byzantine peers in Appendix D.3.
+
+D.1 BTARD AND CENTEREDCLIP
+
+Algorithm 4 deﬁnes a single gradient aggregation step (outlined earlier in Alg. 2) with additional veriﬁcations needed to reduce the negative inﬂuence of Byzantine peers. For simplicity, we assume that workers run each line in a synchronous manner (e.g. wait for all peers to broadcast hash(gi) before communicating the actual gradients). In practice, this restriction can be lifted in favor of asynchronous steps with several explicit synchronization barriers, but that would further complicate the pseudo-code.
+
+One of the key building blocks of BTARD is CENTEREDCLIP – a robust aggregation rule proposed in (Karimireddy et al., 2020). Unlike a number of other aggregation rules as coordinate-wise median, Krum, geometric median, CENTEREDCLIP is provably robust against Byzantine attacks (see Theorem III from (Karimireddy et al., 2020) and Lemma E.1).
+
+Let G be the set of good peers, B be the set of Byzantine workers, and, for simplicity, let [n] = G B, |B| = δn ≤ δ0n < n/2. Assume that we have n random vectors x1, . . . , xn, such that ∀i, j ∈ G
+
+E[xi] = E[xj] = x, E[ xi − xj 2] ≤ σ2,
+
+and for all i ∈ B vectors xi can be arbitrary. CENTEREDCLIP works as follows: it is an iterative procedure generating a sequence {vl}l≥0 satisfying
+
+l+1 l 1 n l
+
+τl
+
+v
+
+=v + n
+
+(xi − v ) min 1, xi − vl
+
+,
+
+i=1
+
+(CenteredClip)
+
+where
+
+τl = 4 (1 − δ) √B3l2δ/3 + σ2 , Bl2+1 = 6.45δBl2 + 5σ2. (6)
+
+The goal of this procedure is natural: ﬁnd good enough approximation x of x = |G1| i∈G xi.
+
+In (Karimireddy et al., 2020), it is shown5 that for δ ≤ 0.1 the sequence {vl}l≥0 generated by
+
+CENTEREDCLIP satisﬁes
+
+E[ vl − x 2] ≤ (9.7δ)l3E[ v0 − x 2] + 4000δσ2.
+
+(7)
+
+Moreover, Karimireddy et al. (2020) prove that for all possible aggregation rules producing x and given δ0, σ there exists such set of vectors x1, . . . , xn and such a partition [n] = G B that
+
+E[ x − x 2] = Ω(δσ2).
+
+Therefore, CENTEREDCLIP can be seen as an optimal aggregation rule neglecting numerical constants. The usage of CENTEREDCLIP helps the good peer i to produce a good enough approximation of the ideal average of the i-th parts of stochastic gradients among good peers in BTARD.
+
+Moreover, since δ ≤ 0.1 we have that 6.45δ ≤ 0.645 implying that Bl2 → B2 ∼ σ2 when l → ∞, and τl → τ ∼ σ2/δ. These limits can be easily computed from (6). Next, for l → ∞ CenteredClip
+
+converges to the solution of the following equation:
+
+n
+
+τ
+
+(xi − v) min 1, xi − v = 0. (8)
+
+i=1
+
+5In fact, Karimireddy et al. (2020) derive this result for two-staged version of CENTEREDCLIP. One can
+derive similar result for the original CENTEREDCLIP under the assumption that for all i, j ∈ G we have E[ xi − xj 4] ≤ σ4.
+
+24
+
+Algorithm 4 Byzantine-Tolerant All-Reduce (BTARD)
+
+Input: number of workers n, gradient vectors on the workers g1, g2, . . . , gn ∈ Rd, d > n, ∆max > 0
+
+– parameter for veriﬁcation 3
+
+1: for workers i = 1, . . . , n in parallel do
+
+2: Split gi into n parts: gi = (gi(1) , . . . , gi(n) ) , gi(j) ∈ Rdj for all i, j ∈ [n]
+
+3:
+
+4: broadcast ci = hash(gi)
+
+5: for j = 1, . . . , n do
+
+6:
+
+broadcast ci(j) = hash(gi(j))
+
+7:
+
+8: Aggregate gradients (same as Alg. 2):
+
+9: Send gi(j) to peer j for all j = i and receive gj(i) from peer j for all j = i 10: for j = 1, . . . , n do
+
+11:
+
+if hash(gj(i)) = cj(i) then
+
+12:
+
+ELIMINATE(i, j) // Signed with peeri private key
+
+13: g(i) = CENTEREDCLIP(g1(i), g2(i), . . . , gn(i)) 14: broadcast c(i) = hash(g(i))
+
+15: Send g(i) to each worker and receive g(j) for all j = i from other workers
+
+16: for j = 1, . . . , n do
+
+17:
+
+if hash(g(j)) = c(j) then
+
+18:
+
+ELIMINATE(i, j) // Signed with peeri private key
+
+19: g = MERGE(g(1), . . . , g(n))
+
+20:
+
+21: Send metadata for veriﬁcation:
+
+22: Generate r via MPRNG
+
+23: z = GETRANDOMVECTOR(r)
+
+24: for j ∈ 1, ..., n do
+
+25: ∆ji =(gi(j) − g(j)) · min 1, gi(j)−τ g(j) 2
+
+26:
+
+broadcast sji =
+
+z
+
+[j
+
+],
+
+∆
+
+j i
+
+27:
+
+broadcast normij = gi(j) − g(j) 2
+
+28:
+
+for l = 1, . . . , n do
+
+29: wlj = min 1, norτmlj
+
+30:
+
+31: for j = 1, . . . , n do
+
+32:
+
+Veriﬁcation 1:
+
+33:
+
+if normji = gj(i) − g(i) 2 then
+
+34:
+
+ACCUSE(i, j, normji does not mach cj(i))
+
+35:
+
+Veriﬁcation 2:
+
+36:
+
+// peer i knows ∆ij from CenteredClip
+
+37:
+
+if sij =
+
+z
+
+k
+
+[j
+
+],
+
+∆
+
+i j
+
+then
+
+38:
+
+ACCUSE(i, j, sji does not match cj(i))
+
+39:
+
+if
+
+n i
+
+sji
+
+=
+
+0
+
+then
+
+40:
+
+// peerj already veriﬁed that all sj· are correct
+
+41:
+
+ACCUSE(i, j, g(j) is wrong)
+
+42:
+
+Veriﬁcation 3:
+
+43:
+
+broadcast checkij = [ gi(j) − g(j) 2 > ∆max]
+
+44:
+
+if
+
+l
+
+checklj
+
+>
+
+n 2
+
+then
+
+45:
+
+CHECKAVERAGING(j)
+
+46: return g
+
+In other words, CenteredClip for large enough l approximates the ﬁxed point iteration process of solving (8). This property plays a key role in Veriﬁcation 2 of BTARD.
+25
+
+Algorithm 5 ACCUSE (i, j, allegation), detailed version
+
+Input: accuser i, target j, peer count n, all values exchanged in Algorithm 4
+
+1: Recalculate gjk = COMPUTEGRADIENTS(xk, ξjk)
+
+2: Split gi into n parts: gi = (gi(1) , . . . , gi(n) ) , gi(j) ∈ Rdj for all i, j ∈ [n]
+
+3:
+
+4: for l = 1 . . . n do
+
+5: if hash(gjk) = ckj or hash(gjk(l)) = hlj then
+
+6:
+
+VOTEFORBAN(peerj) // For gradient attack
+
+7:
+
+8: ∆jl =(gl(j) − g(j)) · min 1, gl(j)−τ g(j) 2
+
+9:
+
+if
+
+gj(l) − g(l) 2 = normjl or
+
+∆
+
+j l
+
+,
+
+zj
+
+= sjl or
+
+nl=1 sjl = 0 then
+
+10:
+
+VOTEFORBAN(peerj) // For aggregation attack
+
+11:
+
+for o = 1, . . . , n do
+
+12:
+
+if peer o approved normjo or soj then
+
+13:
+
+VOTEFORBAN(peero) // For covering up the j-th peer’s aggregation attack
+
+14:
+
+15: for l = 1 . . . n do
+
+16: if NUMVOTES(peerl) ≥ n/2 then
+
+17:
+
+BAN(peerl)
+
+D.2 PROTOCOLS FOR BANNING BYZANTINE PEERS
+ACCUSE and ELIMINATE are the two protocols by which peers ban Byzantine attackers from training. The ACCUSE protocol is only invoked if there the malicious activity of the target peer can be proven to others (we detail the exact mechanism in Algorithm 3). In contrast, ELIMINATE is a mechanism that allows any peer i to ban any other peer j from training without proof — but at the cost of peer i also being banned. We have described this protocol earlier as a countermeasure for protocol violations (see Appendix C).
+
+D.3 BTARD-SGD AND DETECTING PROTOCOL VIOLATIONS
+Finally, the Algorithm 6 incorporates the two above procedures into a secure decentralized SGD training loop. This algorithm is intended as a more formal version of Alg. 1 from Section 3.1.
+
+Algorithm 6 BTARD-SGD
+
+Input: x0 – starting point, γ – stepsize, K – number of iterations, {si,k}in,,kK=−0,10 – seeds for batches
+
+computations
+
+1: C0 = Banned−1 = ∅
+
+2: for k = 0, 1, . . . , K − 1 do
+
+3: Worker i computes gk = ∇f (xk, ξi,k), if i ∈ Gk \ Ck, , where ξ is generated via seed
+
+i
+
+∗,
+
+if i ∈ Bk \ Ck,
+
+i,k
+
+si,k available to every worker
+
+4:
+
+gk, public_infok = BTARD(gikk , gikk , . . . , gikk ), where {ik1 , . . . , ikak } = (Gk ∪ Bk) \ Ck
+
+1
+
+1
+
+ak
+
+5: // BTARD is described in Algorithm 4
+
+6: Choose 2m workers ck1+1, . . . , ckm+1, uk1+1, . . . , ukm+1 uniformly at random without replacement, Ck+1 = {ck1+1, . . . , ckm+1}, Uk+1 = {uk1+1, . . . , ukm+1}
+7: Bannedk = CHECKCOMPUTATIONS(Ck+1, Uk+1, public_infok) 8: xk+1 = projQ(xk − γgk) := argminx∈Q x − (xk − γgk)
+
+9: Gk+1 = Gk \ Bannedk−1
+
+10: Bk+1 = Bk \ Bannedk−1
+
+26
+
+Veriﬁcations 1 and 2. While good peers always run CENTEREDCLIP, Byzantine peers can arbitrary violate the protocol meaning that they can send an arbitrary vector instead of sending the result of CENTEREDCLIP. Veriﬁcation 1 and 2 are needed to prevent such violations and make it possible to identify them during the check of computations.
+
+First of all, both veriﬁcations are split into 2 rounds in order to let the aggregators of the corresponding
+part accuse those peers who send inconsistent norms or inner products. Next, in theory, we assume
+that all good peers ﬁnd exactly the solution of CENTEREDCLIP equaition (8). Therefore, it is possible
+to compute the weights from (8) for each worker i and each component j knowing only a norm of the difference of corresponding vectors, i.e., one can compute min{1, gi(j)τ−g(i) } by gi(j) − g(i) . That is, if Byzantine peer i sends normij = gi(j) − g(j) , it will be either revealed by j-th worker if j ∈ G or it will be revealed with some probability during the subsequent checks of computations.
+
+However, Veriﬁcation 1 is insufﬁcient to prevent malicious behavior: at iteration k Byzantine peer can send gik(j) such that gik(j) − gk(j) = ∇(j)f (xk, ξi,k) − gk(j) . If j ∈ B, then it can be the case that i-th worker commits the hash of ∇(j)f (xk, ξi,k) and the check of gradient computation will
+not identify the violation of the protocol. That is why, Veriﬁcation 2 is required.
+
+GETRANDOMVECTOR is a function that generates a random unit vector z in the space of model parameters. This vector is based on a random seed r obtained from MPRNG.
+
+The goal of Veriﬁcation 2, is to check that CENTEREDCLIP equation (8) holds for the received vector. The idea is simple: if
+
+n
+
+τ
+
+(gl(i) − g(i)) min 1, gl(i) − g(i) = 0, (9)
+
+l=1
+
+then for any zi of an appropriate dimension
+
+n
+
+τ
+
+gl(i) − g(i), zi min 1, gl(i) − g(i) = 0. (10)
+
+l=1
+
+Since zi in BTARD is generated from the uniform distribution on the unit Euclidean sphere, we have
+
+P {(9) does not hold & (10) holds} = 0.
+
+(11)
+
+However, it is impossible to verify (10) explicitly for workers j = i. Therefore, in the algorithm, good workers check
+
+n sil = 0, where sil = gl(i) − g(i), zi min 1, gl(i)τ−g(i) , if l ∈ G, (12)
+
+l=1
+
+∗,
+
+if l ∈ B.
+
+Unfortunately, Byzantine peers can send arbitrary sil. This can lead to the situations when (12) holds while (10) and, as a consequence, (9) do not. Below, we rigorously show that all possible violations
+of the protocol that are not detected by veriﬁcations of BTARD can be detected by the auxiliary
+check of computations with some probability.
+
+Veriﬁcation 3. This is an additional veriﬁcation that serves to limit the potential scope of aggregation attacks (as described in Appendix C). If the result of CenteredClip landed far from too many benign participants, BTARD will verify it by re-running the same aggregation across all peers. While this procedure is costly, our analysis proves that it is has a very small probability of triggering unless some of the peers perform aggregation attacks. In the latter case, verifying the gradient accumulation will root out such attacks and ban the corresponding peers.
+
+Check of computations. As we mentioned earlier, it is possible to violate the protocol without being detected by the veriﬁcations of BTARD. Therefore, extra checks of computations are required. In particular, after each aggregation in BTARD-SGD 2m workers are selected uniformly at random: m workers check the computations at the previous step of other m workers. That is, each Byzantine peer is checked at iteration k with probability ∼ m/n by some good worker (see the proof of Thm. E.2). Consider an arbitrary Byzantine peer j and all possible violations of the protocol at iteration k that are not detected by veriﬁcations of BTARD.
+
+27
+
+First of all, we notice that if cj(i) = hash(∇(i)f (xk, ξj,k)), then it will be detected during the check of computations with some probability6. Moreover, if i ∈ G, then j-th worker has to send cj(i) = hash(gj(i)) to avoid ban.
+Therefore, the only non-trivial case is when i ∈ B as well. In this case, j-th worker can commit cj(i) = hash(∇(i)f (xk, ξj,k)) since it is meaningless for i-th worker to accuse j-th one. Since normij, sji and g(i) are known for all i and j, j-th worker has to broadcast normji =
+∇(i)f (xk, ξj,k) − g(i) and sij = ∇(i)f (xk, ξj,k) − g(i), zi min 1, ∇(i)f(xk,τξj,k)−g(i) to avoid the ban during the check of the computations. Therefore, regardless to the choice gj(i), to pass Veriﬁcation 2 i-th worker should send such g(i) that
+
+∇(i)f (xk, ξl,k) − g(i), zi min 1,
+
+τ
+
+∇(i)f (xk, ξl,k) − g(i)
+
+l∈G∪{j}
+
++
+
+sil = 0.
+
+l∈B\{j}
+
+In this case, the behavior of the j-th worker along i-th component is equivalent to the behavior of the good one. It means, that to avoid ban during the check of computations, each Byzantine worker l should broadcast normli = ∇(i)f (xk, ξl,k) − g(i) and sil = ∇(i)f (xk, ξl,k) −
+g(i), zi min 1, ∇(i)f(xk,τξl,k)−g(i) implying that i-th worker should send such g(i) that
+
+n
+
+τ
+
+∇(i)f (xk, ξl,k) − g(i), zi min 1,
+
+l=1 ∇(i)f (xk, ξl,k) − g(i)
+
+= 0.
+
+In view of (11), it implies that
+
+g(i) = CENTEREDCLIP(∇(i)f (xk, ξ1,k), ∇(i)f (xk, ξ2,k), . . . , ∇(i)f (xk, ξ2,k)),
+
+i.e., there are no violations of the protocol along the i-th component.
+
+6Here and below, this means that the attack/violation will be detected iff a non-Byzantine peer is chosen to validate the perpetrator.
+28
+
+E CONVERGENCE ANALYSIS: MISSING PROOFS AND EXTRA DETAILS
+
+E.1 PRELIMINARIES
+
+For convenience, we provide the classical deﬁnitions and facts on smooth and strongly convex functions below.
+
+Deﬁnition E.1 (L-smoothness). We say that function f : Q → R, Q ⊆ Rd is L-smooth if it is differentiable and
+
+∀x, y ∈ Q ∇f (x) − ∇f (y) ≤ L x − y .
+
+(13)
+
+One can show (Nesterov, 2003) that L-smoothness implies
+
+∀x, y ∈ Q
+
+f (y) ≤ f (x) +
+
+∇f (x), y − x
+
+L +
+
+y−x
+
+2,
+
+(14)
+
+2
+
+∀x ∈ Q ∇f (x) 2 ≤ 2L (f (x) − f∗) ,
+
+(15)
+
+where f∗ is a uniform lower bound for f .
+
+Deﬁnition E.2 (µ-strong convexity). Differentiable function f : Q → R, Q ⊆ Rd is called µ-strongly
+
+convex if
+
+∀x, y ∈ Q
+
+f (y) ≥ f (x) +
+
+∇f (x), y − x
+
+µ +
+
+y−x
+
+2.
+
+(16)
+
+2
+
+E.2 IMPOSSIBILITY OF BYZANTINE-TOLERANT LEARNING IN HETEROGENEOUS CASE
+
+Several papers on Byzantine-tolerant optimization consider non-homogeneous setup, when good
+
+workers have different local functions (Wu et al., 2020; He et al., 2020). Formally, it means that
+
+instead of solving
+
+min {f (x) := Eξ∼D [f (x, ξ)]} ,
+
+(17)
+
+x∈Q⊆Rd
+
+where good peers sample stochastic gradients from the full dataset (i.e., they can sample ξ from D), the following problem is considered:
+
+1 x∈mQi⊆nRd f (x) := |G| fi(x) , (18)
+i∈G
+
+where fi(x) = Eξi∼Di [f (x, ξi)] and there exists ζ ≥ 0 such that for all x ∈ Q
+
+1
+
+∇fi(x) − ∇f (x) 2 ≤ ζ2.
+
+(19)
+
+|G| i∈G
+
+However, under ζ-bounded heterogeneity assumption (19) it is impossible in general to solve (18) with any predeﬁned accuracy in the presence of Byzantine peers (He et al., 2020). Moreover, this is true even when trusted Parameter-Server is available.
+Theorem E.1 (Theorem III from (He et al., 2020)). For any optimization method Alg there exist n functions f1(x), . . . , fn(x) such that at least (1 − δ)n of them are good (corresponding workers belong to G), 1-smooth, µ-strongly convex and satisfy (19) such that the output x of Alg given the access to these n functions has an error at least
+
+E f (x) − min f (x) ≥ Ω δζ2 and E ∇f (x) 2 ≥ Ω δζ2 , (20)
+
+x∈Rd
+
+µ
+
+where the expectation is taken w.r.t. the randomness of Alg.
+
+The intuition behind this negative result is as following: since the only assumption on the similarity of “good” functions is (19), Byzantine peers can shift the gradients by a vector with a norm ∼ ζ without being detected. In this case, it is impossible to distinguish good peers from Byzantines but the solution of (18) depends on which workers are good and which are bad. Therefore, the best one can hope for is the convergence to some neighborhood of the solution.
+
+29
+
+The lower bounds from (20) are proportional to δζ2 and cannot be made arbitrary small for given δ and ζ2. It means that the convergence to any predeﬁned accuracy of the solution is impossible to
+achieve when local loss functions are ζ-heterogeneous. In this sense, Byzantine-tolerant learning is
+impossible in the heterogeneous case. Moreover, in some practical applications (e.g., in Federated
+Learning (McMahan et al., 2017)), ζ from (19) can be large implying that one cannot achieve
+reasonable accuracy of the solution when δ is not too small (e.g., δ ≥ 0.01). Finally, strong convexity
+parameter µ is typically much smaller than 1 (assuming that the smoothness parameter is 1). In these cases, δζ2/µ can be too large and, as a result, all methods are not converging at all.
+
+E.3 CONVERGENCE GUARANTEES FOR BTARD-SGD
+
+E.3.1 ON ASSUMPTIONS 3.1 AND 3.2
+
+First of all, Assumption 3.1 holds whenever standard uniformly bounded variance (UBV) assumption is satisﬁed. Indeed, if Eξ∼D[ ∇f (x, ξ)−∇f (x) 2] ≤ σ2, then Eξ∼D[(∇if (x, ξ)−∇if (x))2] ≤ σ2 for all i = 1, . . . , d, since ∇f (x, ξ) − ∇f (x) 2 = di=1(∇if (x, ξ) − ∇if (x))2. This implies that Assumption 3.1 holds with σ2 ≤ dσ2. However, σ2 can be signiﬁcantly smaller than dσ2. For example, if the noise in stochastic gradients is isotropic, e.g., Gaussian, then
+Eξ∼D[(∇1f (x, ξ) − ∇1f (x))2] = . . . = Eξ∼D[(∇df (x, ξ) − ∇df (x))2],
+
+implying that
+
+Eξ∼D[(∇if (x, ξ) − ∇if (x))2] = 1 Eξ∼D[(∇f (x, ξ) − ∇f (x))2] ≤ σ2
+
+d
+
+d
+
+for all i = 1, . . . , d. Therefore, in this case, Asssumption 3.1 holds with σ2 = σ2.
+
+Next, it is possible to relax Assumption 3.1 to the classical UBV assumption. Indeed, in our proofs, we
+use Assumption 3.1 to bound the variance in the blocks of the stochastic gradients, where the blocks
+of components are chosen for workers to execute BTARD. If these blocks are chosen uniformly at
+random, i.e., the vector is split into several parts of the given sizes uniformly at random, then it is
+enough to have E ∇f[S](x, ξ) − ∇[S]f (x) 2 ≤ sσ2 (21) d
+for a random subset S of {1, . . . , d} such that |S| = s, where expectation is taken w.r.t. ξ and S. To derive inequality (21) from UBV assumption Eξ∼D[ ∇f (x, ξ) − ∇f (x) 2] ≤ σ2 we use tower property of the expectation:
+
+E ∇f[S](x, ξ) − ∇[S]f (x) 2 = Eξ∼D ES ∇f[S](x, ξ) − ∇[S]f (x) 2
+
+= Eξ∼D
+
+d
+P{i ∈ S}(∇if (x, ξ) − ∇if (x))2
+
+i=1
+
+s = Eξ∼D
+
+d
+(∇if (x, ξ) − ∇if (x))2
+
+d
+
+i=1
+
+= s Eξ∼D ∇f (x, ξ) − ∇f (x) 2 ≤ sσ2 ,
+
+d
+
+d
+
+i.e., (21) holds for σ2 = σ2.
+
+Finally, as we show in Lemmas E.2 and E.4, under As. 3.2 Veriﬁcation 3 at BTARD leads to extra checking of computations with probability ∼ 1/n at each iteration when all workers honestly follow the protocol and under a proper choice of ∆max. Therefore, extra computations either appear due to malicious manipulations of Byzantine peers, and lead eventually to the ban for the Byzantine peers who deviate from the protocol, or, when all workers honestly follow the protocol, only once per n iterations on average. There are a number of important machine learning tasks, such as training ResNet-50 on Imagenet (Zhang et al., 2020) and many others image classiﬁcation problems, where the noise in the stochastic gradient has much “lighter” (sub-Gaussian) tails. That is, As. 3.2 is reasonable for a large class of practically important problems. Moreover, in Appendix E.4, we also provide an analysis of BTARD-CLIPPED-SGD and RESTARTED-BTARD-CLIPPED-SGD without any assumptions on the tails of the stochastic gradients distribution.
+
+30
+
+E.3.2 QUALITY OF THE AGGREGATION
+
+The quality of the aggregation at each iteration of BTARD-SGD signiﬁcantly affects the rate of the method. That is, properties of gk are highly important for the convergence of BTARD-SGD. This aggregator is obtained via BTARD that requires to know a tight estimate of the total number of Byzantine workers violating the protocol at iteration k – clipping parameter τ depends on this quantity. Therefore, it is natural to start with relatively simple setup when the number of Byzantine workers violating the protocol is known at each iteration.
+Before we formulate the ﬁrst result we introduce some useful notations. Let nk be the total number of peers at iteration k, bk be the total number of Byzantine peers at iteration k, bk be the total number of Byzantine peers violating the protocol at iteration k, and δk = nbkk , δk = nkb−km . In view of new notation, we start with the ideal situation when bk is known for each worker at each iteration k. First of all, it is needed to to estimate the quality of the aggregation for good workers.
+Lemma E.1 (Theorem IV from Karimireddy et al. (2020)). Let As. 3.1 hold, δ ≤ 0.1(n − m), and
+i ∈ Gk \ Ck. Assume that bk is known for each worker at iteration k and δ = δk is used to compute clipping parameter τl for CenteredClip. If the total number of iterations T of CenteredClip satisﬁes T ≥ log9.7δ 3E[ vδ0σ−2gk 2] , then
+
+E gk(i) − gk(i) 2 | xk ≤ 4001δk σ2 , (22) nk − m
+
+where gk(i) = |Gk1\Ck|
+
+gjk (i).
+
+j ∈Gk \Ck
+
+Proof. The proof follows directly from (7).
+
+Unlike the good peers, Byzantine workers can cooperate and shift the result of CENTEREDCLIP in the components they aggregate without being revealed at Veriﬁcation 2 of BTARD. However, they cannot produce an arbitrary large shifts due to Veriﬁcation 3. The next lemma estimates the maximal possible magnitude of a shift together with probability of triggering CHECKAVERAGING at iteration k for at least one worker.
+
+Lemma E.2.
+
+Let
+
+As.
+
+3.1
+
+and
+
+3.2
+
+hold,
+
+b
+
+≤
+
+0.1(n − m), and
+√√
+
+i
+
+∈
+
+Bk
+
+\ Ck.
+
+Assume that bk
+
+is known for each worker at iteration k, ∆kmax
+
+=
+
+(1√+ 3) 2σ n −m
+
+and δ
+
+=
+
+δk
+
+is used to compute
+
+k
+
+clipping parameter τl for CenteredClip. If the total number of iterations T of CenteredClip satisﬁes
+
+T ≥ log9.7δ 3E[ vδ0σ−2gk 2] and CHECKAVERAGING(i) is not triggered, then
+
+√ E gk(i) − gk(i) 2 | xk ≤ 4 (1 + 3)2 + 4 σ2 , (23)
+nk − m
+
+where gk(i) = |Gk1\Ck|
+
+gjk(i). Moreover, if bk = 0 and nk − m ≥ 170, then gk(i) = gk(i)
+
+j ∈Gk \Ck
+
+and
+
+P CHECKAVERAGING is triggered for ≥ 1 peer | xk ≤
+
+149 .
+
+(24)
+
+49(nk − m)
+
+Proof.
+
+If CHECKAVERAGING(i) is not triggered at iteration k, then for rk
+
+≥
+
+nk −m 2
+
+good workers
+
+i1, i2, . . . , irk ∈ Gk \ Ck we have gikj (i) − gk(i) ≤ ∆kmax. Therefore, due to the independence of
+
+31
+
+gik, i ∈ Gk \ Ck for ﬁxed xk we have 
+E gk(i) − gk(i) 2 | xk ≤ 2E  
+
+gk(i) − 1 rk
+
+rk
+gikj (i)
+j=1
+
+2 | xk 
+
+ +2E 
+
+
+1 rk gik (i) − gk(i)
+rk j=1 j
+
+2 | xk 
+
+
+
+
+
+1 rk
+
+≤ 2E 
+
+gk(i) − gik (i) 2 + 4E ∇(i)f (xk) − gk(i) 2 | xk
+
+rk j=1 j
+
+ 4E 
+
+
+1 rk gik (i) − ∇(i)f (xk)
+rk j=1 j
+
+2 | xk 
+
+k2
+
+4σ2
+
+8σ2
+
+≤
+
+2(∆max)
+
++
+
++
+
+|Gk \ Ck| nk − m
+
+√
+
+4 (1 + 3)2 + 4 σ2
+
+≤
+
+,
+
+nk − m
+
+where we use |Gk
+
+\ Ck|
+
+≥
+
+rk
+
+≥
+
+nk −m 2
+
+and ∇f(i)(xk)
+
+=
+
+E[gikj
+
+|
+
+xk ].
+
+Finally, let us estimate the
+
+probability of triggering CHECKAVERAGING when all workers follow the protocol. In this case,
+
+g(i) = gk(i). Next, due to As. 3.2 and b ≤ 0.1(n − m) we have
+
+
+
+
+
+ P gk(i) − ∇f(i)(xk) 2 >
+
+
+σ2
+
+ | xk ≤
+
+1
+
+≤
+
+100
+
+nk − m  |Gk \ Ck|2 49(nk − m)2
+
+and for all j ∈ Gk \ Ck
+
+ P gjk(i) − ∇f(i)(xk) 2 >
+
+
+
+
+3σ2
+
+|
+
+ xk
+
+≤
+
+1 .
+
+nk − m  9
+
+Consider the independent random variables ηj, j ∈ Gk \ Ck, where
+
+ηj = 1, if gjk(i) − ∇f(i)(xk) 2 ≤ 0, otherwise,
+
+n3kσ−2m ,
+
+where xk is ﬁxed. Then, ηj is a Bernoulli random variable with parameter of “success” q ≥ 8/9. Applying Hoeffding’s inequality we get that
+
+
+
+
+
+P  ηj ≤ nk − m | xk ≤ exp −2(nk − m) q − nk − m 2
+
+ 2
+
+2|Gk \ Ck|
+
+j ∈Gk \Ck
+
+8
+
+n−m 2
+
+≤ exp −2(nk − m) 9 − 1.4(n − m)
+
+= exp − 242(nk − m) . 3969
+
+Since for all j ∈ Gk \ Ck we have gk(i) − gjk(i) 2 ≤ gk(i) − ∇(i)f (xk) 2 + ∇(i)f (xk) − gjk(i) 2 the obtained bounds imply that CHECKAVERAGING is triggered for at least one worker at iteration k
+with probability not greater than
+
+100 + (nk − m) exp − 242(nk − m) ≤ 149 ,
+
+49(nk − m)
+
+3969
+
+49(nk − m)
+
+where we use that exp − 234926x9
+
+≤
+
+1 x2
+
+for
+
+all
+
+x
+
+≥
+
+170.
+
+32
+
+We notice that Byzantine peers can trigger CHECKAVERAGING by violating the protocol. However, each Byzantine is checked at iteration k with probability p ∼ m/n (see Thm. E.2). Therefore, Byzantine workers can trigger only O (bn/m) extra rounds of communications and computations on average via triggering CHECKAVERAGING. In contrast, when there are no Byzantine workers or all workers follow the protocol CHECKAVERAGING is triggered only once per O(n − m) iterations that is a negligible communication an computation overhead when n is large.
+
+Combining two previous lemmas we get the following result.
+
+Lemma E.3.
+
+Let As. 3.1 hold and b
+√√
+
+≤
+
+0.1(n − m).
+
+Assume that bk
+
+is known for each worker
+
+at iteration k, ∆kmax
+
+=
+
+(1√+ 3) 2σ n −m
+
+and δ
+
+=
+
+δk is used to compute clipping parameter τl for
+
+k
+
+CenteredClip. If the total number of iterations T of CenteredClip satisﬁes T ≥ log9.7δ 3E[ vδ0σ−2gk 2]
+
+and CHECKAVERAGING is not triggered for any worker, then
+
+E gk − gk 2 | xk ≤ Cδkσ2,
+
+(25)
+
+E gk 2 | xk ≤ 2Cδkσ2 + 2 ∇f (xk) 2 + 2σ2 , (26)
+
+√ n − 2b − m
+
+where gk = |Gk1\Ck|
+
+gjk and C = 4001 + 4 (1 + 3)2 + 4 .
+
+j ∈Gk \Ck
+
+Proof. We have
+
+E gk − gk 2 | xk
+
+=
+
+E gk(i) − gk(i) 2 | xk +
+
+E gk(i) − gk(i) 2 | xk
+
+(22),(23)
+≤
+=
+
+i∈Gk \Ck
+
+i∈Bk \Ck
+
+√
+
+σ2
+
+4 (1 + 3)2 + 4 σ2
+
+(1 − δk)(nk − m) · 4001δk nk − m + δk(nk − m) ·
+
+nk − m
+
+C δk σ 2 .
+
+Next, using the independence of gjk for j ∈ Gk \ Ck and ﬁxed xk we derive
+
+E gk 2 | xk
+
+≤ 2E gk − gk 2 | xk + 2E gk 2 | xk
+(25)
+≤ 2Cδkσ2 + 2 ∇f (xk) 2 + 2E gk − ∇f (xk) 2 | xk ≤ 2Cδkσ2 + 2 ∇f (xk) 2 + 2σ2
+|Gk \ Ck| ≤ 2Cδkσ2 + 2 ∇f (xk) 2 + 2σ2 .
+n − 2b − m
+
+In view of the deﬁnition of (δ, c)-robust aggregator from Karimireddy et al. (2020), the result of
+BTARD at iteration k is (δk, C)-robust. However, we derive this property under assumption that bk is known to all workers at each iteration k, which is impractical.
+
+When bk is unknown the situation changes dramatically: in general, good peers can only know some upper bound for the fraction of Byzantine peers at iteration k. Unfortunately, if used without bans, this is not enough to converge to any accuracy of the solution since BTARD-SGD is a permutationinvariant algorithm in terms of Karimireddy et al. (2020). Therefore, in this case, we always use CENTEREDCLIP with τl = ∞ for all l ≥ 0, i.e., good peers compute an exact average. In this settings, even 1 Byzantine worker can signiﬁcantly shift the average in all parts of the vector. The next lemma quantiﬁes the negative effect of Byzantine workers in this case.
+
+Lemma E.4. Let As. 3.1 and 3.2 hold, b ≤ 0.1(n − m), m ≤ (n−2b)/2. Assume that
+
+√√
+
+∆kmax
+
+=
+
+(1√+ 3) 2σ n −m
+
+and δ
+
+=
+
+0 is used to compute clipping parameter τl for CenteredClip.
+
+If
+
+k
+
+CHECKAVERAGING is not triggered for any worker, then
+
+E gk − gk 2 | xk ≤ Cσ21k,v,
+
+(27)
+
+33
+
+E gk 2 | xk ≤ 2Cσ21k,v + 2 ∇f (xk) 2 + 2σ2 ,
+
+(28)
+
+n − 2b − m
+
+where gk = |G 1\C |
+
+√
+gjk, C = 4 (1 + 3)2 + 4 , and 1k,v is an indicator function of the
+
+kk
+
+j ∈Gk \Ck
+
+event that at least 1 Byzantine peer violates the protocol at iteration k. Moreover, if bk = 0 and nk − m ≥ 170, then gk(i) = gk(i) and
+
+P CHECKAVERAGING is triggered for ≥ 1 peer | xk ≤
+
+149 .
+
+(29)
+
+49(nk − m)
+
+Proof. If CHECKAVERAGING is not triggered for any worker, then gk(i)−gk(i) 2 ≤ (∆kmax)21k,v
+for all i ∈ (Gk ∪ Ck) \ Ck implying
+
+E gk − gk 2 | xk
+
+=
+
+E gk(i) − gk(i) 2 | xk
+
+i∈(Gk ∪Ck )\Ck
+
+√
+
+≤
+
+2 (1 + (nk − m) ·
+
+3)2 + 8 σ2 1k,v ≤ Cσ21k,v.
+
+nk − m
+
+Next, using the independence of gjk for j ∈ Gk \ Ck and ﬁxed xk we derive
+
+E gk 2 | xk ≤ 2E gk − gk 2 | xk + 2E gk 2 | xk
+(27)
+≤ 2Cσ21k,v + 2 ∇f (xk) 2 + 2E gk − ∇f (xk) 2 | xk ≤ 2Cσ21k,v + 2 ∇f (xk) 2 + 2σ2
+|Gk \ Ck|
+≤ 2Cσ21k,v + 2 ∇f (xk) 2 + 2σ2 .
+n − 2b − m
+The proof of the ﬁnal part of the lemma is identical to the proof of the same result from Lemma E.2.
+
+E.3.3 NON-CONVEX CASE
+
+In this section, we provide the complete statements and the full proofs of the convergence results for BTARD-SGD when the objective function f is smooth, but can be non-convex. We start with the case when the number of attacking Byzantine workers is known at each iteration.
+
+Theorem E.2. Let As. 3.1 and As. 3.2 hold, Q = Rd, and f be L-smooth (see Def. E.1) and uniformly lower bounded by f∗. Moreover, assume that b ≤ 0.1(n − m), m ≤ (n−2b)/2, and the exact number of attacking Byzantine peers is known to all good peers at each iteration. Next, assume that
+
+√√
+
+1 γ = min ,
+
+∆0n
+
+, ∆k
+
+(1 + 3) 2σ
+
+=√
+
+,
+
+(30)
+
+4L Lσ2K
+
+max
+
+nk − m
+
+where ∆0 = f (x0) − f∗ and ∆kmax is the parameter for veriﬁcation 3 at iteration k of BTARD-SGD. Then, we have E[ ∇f (xK ) 2] ≤ ε2 after K iterations of BTARD-SGD, where
+
+L∆0 L∆0σ2 nδσ2
+
+K = O ε2 + nε4 + mε2
+
+(31)
+
+and xK is picked uniformly at random from {x0, x1, . . . , xK−1}.
+
+Proof. From L-smoothness of f we have
+
+f (xk+1)
+
+(14)
+≤
+
+f (xk) +
+
+∇f (xk), xk+1 − xk
+
+L +
+
+xk+1 − xk
+
+2
+
+2
+
+= f (xk) − γ ∇f (xk), gk + Lγ2 gk 2. 2
+
+34
+
+Taking the conditional expectation E[· | xk] from the both sides of the previous inequality we obtain
+
+E f (xk+1) | xk
+
+≤ f (xk) − γ ∇f (xk) 2 − γ ∇f (xk), E gk − gk | xk
+
+Lγ2 +2E
+
+gk 2 | xk
+
+(26)
+≤
+
+f (xk) − γ ∇f (xk) 2 + γ
+
+E gk − gk | xk
+
+2
+
+2
+
+2
+
++CLγ2δkσ2 + Lγ2 ∇f (xk) + Lγ2σ2 n − 2b − m
+
+≤ f (xk) − γ (1 − 2Lγ) ∇f (xk) 2 + γ E gk − gk 2 | xk
+
+2
+
+2
+
++CLγ2δkσ2 + Lγ2σ2 . n − 2b − m
+
+Since γ ≤ 41L we continue our derivations as
+
+E f (xk+1) | xk
+
+≤ f (xk) − γ ∇f (xk) 2 + γCσ2(1 + Lγ)δk + Lγ2σ2
+
+4
+
+n − 2b − m
+
+≤ f (xk) − γ ∇f (xk) 2 + 2γCσ2δk + Lγ2σ2 .
+
+4
+
+n − 2b − m
+
+Taking the full expectation from the both sides of the obtained inequality and summing up the results for k = 0, 1, . . . , K − 1 we get
+
+1 K−1 KE
+k=0
+
+∇f (xk) 2
+
+4 K−1
+
+8Cσ2 K−1
+
+4Lγσ2
+
+≤
+
+E f (xk) − f (xk+1) +
+
+E
+
+δk +
+
+γK
+
+K
+
+n − 2b − m
+
+k=0
+
+k=0
+
+4 f (x0) − E[f (xK )] 8Cσ2 K−1 bk
+
+4Lγσ2
+
+= γK + K E nk − m + n − 2b − m
+
+k=0
+
+4(f (x0) − f∗)
+
+8C σ2
+
+K −1
+
+4Lγσ2
+
+≤ γK + K(n − 2b − m) E bk + n − 2b − m .
+
+k=0
+
+If a Byzantine peer deviates from the protocol at iteration k, it will be detected with some probability pk during the next iteration. One can lower bound this probability as
+
+pk ≥ m · |Gk| · 1 = m(1 − δk) ≥ m .
+
+nk nk
+
+nk
+
+n
+
+Therefore, each individual Byzantine worker can violate the protocol no more than 1/p times on average implying that
+
+1 K−1 KE
+k=0
+
+∇f (xk) 2
+
+≤ 4(f (x0) − f∗) +
+
+8C nbσ2
+
+4Lγσ2 +
+
+γK
+
+Km(n − 2b − m) n − 2b − m
+
+≤ 4(f (x0) − f∗) + 16Cnbσ2 + 8Lγσ2
+
+γK
+
+Km(n − 2b) n − 2b
+
+≤ 4(f (x0) − f∗) + 160Cnδσ2 + 80Lγσ2 .
+
+γK
+
+7K m
+
+7n
+
+Since xK is picked uniformly at random from {x0, x1, . . . , xK−1} we have
+
+E ∇f (xK ) 2 ≤ 4(f (x0) − f∗) + 160Cnδσ2 + 80Lγσ2 .
+
+γK
+
+7K m
+
+7n
+
+Using the stepsize rule
+
+1 γ = min ,
+4L
+
+∆0n Lσ2K
+
+35
+
+we derive meaning that after
+
+E ∇f (xK ) 2 K =O
+
+iterations BTARD-SGD guarantees E
+
+L∆0
+
+√ L∆0σ
+
+nδσ2
+
+=O
+
++√ +
+
+K
+
+nK mK
+
+L∆0 + L∆0σ2 + nδσ2
+
+ε2
+
+nε4
+
+mε2
+
+∇f (xK ) 2 ≤ ε2.
+
+In the main part of the paper, we notice that the rate of BTARD-SGD in the presence of bad workers is asymptotically the same as for SGD without Byzantine peers when ε is sufﬁciently small7. This phenomenon has a clear intuition. When the target accuracy ε is small, the stepsize γ is also needed to be small enough. However, as we show in Lemmas E.3 and E.4, Byzantine workers can produce only a bounded shift independent of the stepsize. Moreover, they can violate the protocol at only ∼ n/m iterations on average. Therefore, the overall impact of Byzantine workers on the convergence of BTARD-SGD decreases when the stepsize γ decreases.
+
+Next, we derive the result without assuming that bk is known to all peers at each iteration.
+
+Theorem E.3. Let As. 3.1 and 3.2 hold, Q = Rd, and f be L-smooth (see Def. E.1) and uniformly
+
+lower bounded by f∗. Moreover, assume that b ≤ 0.1(n − m), m ≤ (n−2b)/2, and δ = 0 is used to
+
+compute clipping parameter τl for CenteredClip. Next, assume that
+
+√√
+
+1 γ = min ,
+
+∆0n
+
+, ∆k
+
+(1 + 3) 2σ
+
+=√
+
+,
+
+(32)
+
+4L Lσ2K
+
+max
+
+nk − m
+
+where ∆0 = f (x0) − f∗ and ∆kmax is the parameter for veriﬁcation 3 at iteration k of BTARD-SGD. Then, we have E[ ∇f (xK ) 2] ≤ ε2 after K iterations of BTARD-SGD, where
+
+L∆0 L∆0σ2 nbσ2
+
+K = O ε2 + nε4 + mε2
+
+(33)
+
+and xK is picked uniformly at random from {x0, x1, . . . , xK−1}.
+
+Proof. The proof is almost identical to the proof of Theorem E.2. Following the same steps and using (27) and (28) instead of (25) and (26) respectively we obtain the same sequence of inequalities up to
+the following change: instead of δk we should use 1k,v. Therefore, we have
+
+1 K−1 KE
+k=0
+
+∇f (xk) 2
+
+≤ 4(f (xγ0K) − f∗) + 8CKσ2 E K−1 1k,v + n −4L2γbσ−2 m . k=0
+
+If a Byzantine peer deviates from the protocol at iteration k, it will be detected with some probability pk during the next iteration. One can lower bound this probability as
+
+pk ≥ m · |Gk| · 1 = m(1 − δk) ≥ m .
+
+nk nk
+
+nk
+
+n
+
+That is, each individual Byzantine worker can violate the protocol no more than 1/p times on average. However, even one Byzantine peer can create a shift of the order ∆kmax at each part of the resulting vector. Therefore, all Byzantine peers can violate the protocol no more than b/p times on average
+implying that
+
+1 K−1 KE
+k=0
+
+∇f (xk) 2
+
+≤ 4(f (x0) − f∗) + 8Cnbσ2 + 4Lγσ2
+
+γK
+
+Km n − 2b − m
+
+≤ 4(f (x0) − f∗) + 8Cnbσ2 + 8Lγσ2
+
+γK
+
+Km n − 2b
+
+≤ 4(f (x0) − f∗) + 8Cnbσ2 + 80Lγσ2 .
+
+γK
+
+Km
+
+7n
+
+7This is true for convex and strongly convex cases as well.
+
+36
+
+Since xK is picked uniformly at random from {x0, x1, . . . , xK−1} we have
+
+E ∇f (xK ) 2 ≤ 4(f (x0) − f∗) + 8Cnbσ2 + 80Lγσ2 .
+
+γK
+
+Km
+
+7n
+
+Using the stepsize rule
+
+1 γ = min ,
+4L
+
+∆0n Lσ2K
+
+we derive meaning that after
+
+E ∇f (xK ) 2 K =O
+
+iterations BTARD-SGD guarantees E
+
+L∆0
+
+√ L∆0σ
+
+nbσ2
+
+=O
+
++√ +
+
+K
+
+nK mK
+
+L∆0 + L∆0σ2 + nbσ2
+
+ε2
+
+nε4
+
+mε2
+
+∇f (xK ) 2 ≤ ε2.
+
+As we notice in the main part of the paper, the third term of the obtained complexity result is signiﬁcantly worse than in (31): it is proportional to b instead of δ = b/n. However, (33) is derived
+without assuming that bk is known for all workers at each iteration. Moreover, as in (31), the third term in (33) has better dependence on ε than the second term implying that for small enough ε the
+rate of BTARD-SGD in the presence of bad workers without assuming that bk is known at each iteration is asymptotically the same as for SGD without Byzantine peers8.
+
+E.3.4 CONVEX CASE
+
+In this section, we provide the complete statements and the full proofs of the convergence results for BTARD-SGD when the objective function f is smooth and convex. We start with the case when the number of attacking Byzantine workers is known at each iteration.
+
+Theorem E.4. Let As. 3.1 and 3.2 hold, Q = Rd, f be L-smooth (see Def. E.1), convex, and x∗ be some optimum of f . Moreover, assume that b ≤ 0.1(n − m), m ≤ (n−2b)/2, and the exact number of attacking Byzantine peers is known to all good peers at each iteration. Next, assume that
+
+√√
+
+1 γ = min ,
+
+7nR02 ,
+
+m2R02
+
+, ∆k
+
+(1 + 3) 2σ
+
+=√
+
+,
+
+(34)
+
+4L 120σ2K 1440Cσ2n2δ
+
+max
+
+nk − m
+
+where R0 ≥ x0 − x∗ and ∆kmax is the parameter for veriﬁcation 3 at iteration k of BTARD-SGD. Then, we have E[f (xK ) − f (x∗)] ≤ ε after K iterations of BTARD-SGD, where
+
+√
+
+LR02 σ2R02 n δσR0
+
+K = O ε + nε2 + mε
+
+(35)
+
+and xK = K1 Kk=−01.
+
+Proof. Lemma E.3 implies
+
+E xk+1 − x∗ 2 | xk
+
+= E xk − x∗ − γgk 2 | xk = xk − x∗ 2 − 2γE xk − x∗, gk | xk + γ2E gk 2 | xk
+(26)
+≤ xk − x∗ 2 − 2γ xk − x∗, ∇f (xk) + 2γ2 ∇f (xk) 2 −2γE xk − x∗, gk − gk | xk + 2γ2Cδkσ2 + 2γ2σ2 . n − 2b − m
+
+8This is true for convex and strongly convex cases as well.
+
+37
+
+Next, we use convexity (see (16) with µ = 0) and L-smoothness of f :
+
+E xk+1 − x∗ 2 | xk
+
+(15),(16)
+≤
+
+xk − x∗ 2 − 2γ (1 − 2Lγ) f (xk) − f (x∗)
+
+−2γE xk − x∗, gk − gk | xk + 2γ2Cσ2 bk + 2γ2σ2 . nk − m n − 2b − m
+
+To estimate the inner product in the right-hand side we apply Cauchy-Schwarz inequality:
+
+−2γE xk − x∗, gk − gk | xk ≤ 2γ xk − x∗ E gk − gk | xk
+
+≤ 2γ xk − x∗ E gk − gk 2 | xk
+
+√
+
+(25)
+
+√
+
+≤ 2γ Cσ xk − x∗
+
+2γ δ ≤√
+
+Cσ
+
+xk − x∗
+
+b
+
+k
+
+nk − m
+
+k
+
+√
+
+≤ √ 2γ Cσ xk − x∗ bk.
+
+n − 2b − m
+
+Putting all together and using b ≤ 0.1(n − m), m ≤ (n−2b)/2, γ ≤ 1/4L, nk − m ≥ n − 2b − m, we obtain
+
+E xk+1 − x∗ 2 | xk ≤ xk − x∗ 2 − γ f (xk) − f (x∗)
+
+√
+
+4γ 5Cσ +√
+
+xk − x∗
+
+n
+
+40γ 2 C σ2
+
+40γ2σ2
+
+bk + 7n bk + 7n .
+
+Taking the full expectation from the both sides of the above inequality and summing up the results for k = 0, 1, . . . , K − 1 we derive
+
+γ K−1 [f (xk) − f (x∗)] ≤
+
+1 K−1 E
+
+xk − x∗ 2 − E
+
+xk+1 − x∗ 2
+
+40γ2σ2 +
+
+KE
+
+K
+
+7n
+
+k=0
+
+k=0
+
+4γ√5Cσ K−1
+
+40γ2Cσ2 K−1
+
++√
+
+E xk − x∗ bk +
+
+E[bk ]
+
+nK k=0
+
+7nK k=0
+
+x0 − x∗ 2 − E[ xK − x∗ 2] 40γ2σ2
+
+≤
+
++
+
+K
+
+7n
+
+4γ√5Cσ K−1
+
+40γ2Cσ2 K−1
+
++√ nK
+
+E [ xk − x∗ 2] E[bk] + 7nK
+
+E[bk ].
+
+k=0
+
+k=0
+
+From Jensen’s inequality we have f (xK ) ≤ K1 kK=−01 f (xk), where xK = K1 and new notation Rk = xk − x∗ , k > 0, R0 ≥ x0 − x∗ we get
+
+Kk=−01 xk. Using this
+
+0 ≤ γE f (xK ) − f (x∗)
+
+≤ R02 − E[RK2 ] + 40γ2σ2
+
+K
+
+7n
+
+4γ√5Cσ K−1
+
+40γ2Cσ2 K−1
+
++√ nK
+
+E [Rk2] E[bk] + 7nK
+
+E[bk](36)
+
+k=0
+
+k=0
+
+implying (after changing the indices) that
+
+40γ2σ2k 4γ√5Cσ k−1
+
+40γ2Cσ2 k−1
+
+E[Rk2] ≤ R02 + 7n + √n
+
+E [Rl2] E[bl] + 7n
+
+E[bl] (37)
+
+l=0
+
+l=0
+
+holds for all k ≥ 0. In the remaining part of the proof we derive by induction that
+
+40γ2σ2k 4γ√5Cσ k−1
+
+40γ2Cσ2 k−1
+
+R02 + 7n + √n
+
+E [Rl2] E[bl] + 7n
+
+E[bl] ≤ 2R02
+
+(38)
+
+l=0
+
+l=0
+
+38
+
+for all k = 0, . . . , K. For k = 0 this inequality trivially holds. Next, assume that it holds for all
+
+k = 0, 1, . . . , T − 1, T ≤ K − 1. Let us show that it holds for k = T as well. From (37) and (38)
+
+we have that E[Rk2] ≤ 2R02 for all k = 0, 1, . . . , T − 1. Therefore,
+
+40γ2σ2T 4γ√5Cσ T −1
+
+40γ2Cσ2 T −1
+
+E[RT2 ] ≤ R02 + 7n + √n
+
+E [Rl2] E[bl] + 7n
+
+E[bl]
+
+l=0
+
+l=0
+
+40γ2σ2T 4γ√10CσR T −1
+
+40γ2Cσ2 T −1
+
+≤ R02 +
+
++
+
+√
+
+0
+
+E[bl] +
+
+E[bl].
+
+7n
+
+n
+
+7n
+
+l=0
+
+l=0
+
+If a Byzantine peer deviates from the protocol at iteration k, it will be detected with some probability pk during the next iteration. One can lower bound this probability as
+
+pk ≥ m · |Gk| · 1 = m(1 − δk) ≥ m .
+
+nk nk
+
+nk
+
+n
+
+Therefore, each individual Byzantine worker can violate the protocol no more than 1/p times on
+
+average implying that
+
+√
+
+E[RT2 ] ≤ R02 + 40γ72nσ2T + 4nγ m1√0CnbσR0 + 40γ72nCmσ2nb
+
+√
+
+2 40γ2σ2T 4nγ 10CδσR0 40γ2Cσ2nδ
+
+= R0 + 7n +
+
+m
+
++
+
+.
+
+7m
+
+Taking
+
+1 γ = min ,
+4L
+
+7nR02 , 120σ2K
+
+m2R02 1440C σ2 n2 δ
+
+we ensure that
+
+√
+
+40γ2σ2T 4nγ 10CδσR0 40γ2Cσ2nδ R02 R02 R02
+
+2
+
++ 7n
+
+m
+
++ 7m ≤ 3 + 3 + 3 = R0,
+
+and, as a result, we get E[RT2 ] ≤ 2R02. Therefore, (38) holds for all k = 0, 1, . . . , K. Together with (36) it implies
+E f (xK ) − f (x∗) ≤ 2R02 . γK
+
+Next, from our stepsize rule (34) it follows that E f (xK ) − f (x∗) = O
+
+√
+
+LR02 + √σR0
+
+n +
+
+δσR0
+
+K
+
+nK mK
+
+meaning that after
+
+K =O
+
+√
+
+LR02 + σ2R02 + n δσR0
+
+ε
+
+nε2
+
+mε
+
+iterations BTARD-SGD guarantees E[f (xK ) − f (x∗)] ≤ ε.
+
+In the convex case, similar observations hold as in the non-convex case. Next, we derive the result
+
+without assuming that bk is known to all peers at each iteration.
+
+Theorem E.5. Let As. 3.1 and 3.2 hold, Q = Rd, f be L-smooth (see Def. E.1), convex, and x∗ be
+
+some optimum of f . Moreover, assume that b ≤ 0.1(n − m), m ≤ (n−2b)/2, and δ = 0 is used to
+
+compute clipping parameter τl for CenteredClip. Next, assume that
+
+√√
+
+1 γ = min ,
+
+7nR02 ,
+
+m2R02
+
+, ∆k
+
+(1 + 3) 2σ
+
+=√
+
+,
+
+(39)
+
+4L 120σ2K 72Cσ2n2b2
+
+max
+
+nk − m
+
+where R0 ≥ x0 − x∗ and ∆kmax is the parameter for veriﬁcation 3 at iteration k of BTARD-SGD. Then, we have E[f (xK ) − f (x∗)] ≤ ε after K iterations of BTARD-SGD, where
+
+LR02 σ2R02 nbσR0
+
+K = O ε + nε2 + mε
+
+(40)
+
+and xK = K1 Kk=−01.
+
+39
+
+Proof. The proof is almost identical to the proof of Theorem E.4. Following the same steps and using (27) and (28) instead of (25) and (26) respectively we obtain the same sequence of inequalities up to
+the following change: instead of δk we should use 1k,v. Therefore, we have
+
+E xk+1 − x∗ 2 | xk ≤ xk − x∗ 2 − 2γ (1 − 2Lγ) f (xk) − f (x∗)
+−2γE xk − x∗, gk − gk | xk + 2γ2Cσ21k,v + 2γ2σ2 ,
+n − 2b − m
+
+−2γE xk − x∗, gk − gk | xk
+
+√
+≤ 2γ Cσ xk − x∗ 1k,v,
+
+that result in
+
+E xk+1 − x∗ 2 | xk ≤ xk − x∗ 2 − γ f (xk) − f (x∗)
+
+√ +2γ Cσ
+
+xk − x∗
+
+1k,v + 2γ2Cσ21k,v + 40γ2σ2 .
+
+7n
+
+Taking the full expectation from the both sides of the above inequality and summing up the results for k = 0, 1, . . . , K − 1 we derive
+
+γ K−1 [f (xk) − f (x∗)] ≤
+
+1 K−1 E
+
+xk − x∗ 2 − E
+
+xk+1 − x∗ 2
+
+40γ2σ2 +
+
+KE
+
+K
+
+7n
+
+k=0
+
+k=0
+
+2γ√Cσ K−1
+
+2γ2Cσ2 K−1
+
++
+
+E xk − x∗ 1k,v +
+
+E[1k,v ]
+
+K k=0
+
+K k=0
+
+x0 − x∗ 2 − E[ xK − x∗ 2] 40γ2σ2
+
+≤
+
++
+
+K
+
+7n
+
+2γ√Cσ K−1
+
+2γ2Cσ2 K−1
+
++
+
+E [ xk − x∗ 2] E[1k,v] +
+
+E[1k,v ].
+
+K k=0
+
+K k=0
+
+From Jensen’s inequality we have f (xK ) ≤ K1 kK=−01 f (xk), where xK = K1 and new notation Rk = xk − x∗ , k ≥ 0 we get
+
+Kk=−01 xk. Using this
+
+0 ≤ γE f (xK ) − f (x∗)
+
+≤ R02 − E[RK2 ] + 40γ2σ2
+
+K
+
+7n
+
+2γ√Cσ K−1
+
+2γ2Cσ2 K−1
+
++ K
+
+E [Rk2] E[1k,v] + K
+
+E[1k,v(]41)
+
+k=0
+
+k=0
+
+implying (after changing the indices) that
+
+E[Rk2] ≤ R02 + 40γ72nσ2k + 2γ√Cσ k−1 E [Rl2] E[1l,v] + 2γ2Cσ2 k−1 E[1l,v] (42)
+
+l=0
+
+l=0
+
+holds for all k ≥ 0. In the remaining part of the proof we derive by induction that
+
+R02 + 40γ72nσ2k + 2γ√Cσ k−1 E [Rl2] E[1l,v] + 2γ2Cσ2 k−1 E[1l,v] ≤ 2R02 (43)
+
+l=0
+
+l=0
+
+for all k = 0, . . . , K. For k = 0 this inequality trivially holds. Next, assume that it holds for all
+k = 0, 1, . . . , T − 1, T ≤ K − 1. Let us show that it holds for k = T as well. From (42) and (43) we have that E[Rk2] ≤ 2R02 for all k = 0, 1, . . . , T − 1. Therefore,
+
+E[RT2 ] ≤ R02 + 40γ72nσ2k + 2γ√Cσ T −1 E [Rl2] E[1l,v] + 2γ2Cσ2 T −1 E[1l,v]
+
+l=0
+
+l=0
+
+≤ R02 + 40γ72nσ2k + 2γ√2CσR0 T −1 E[1l,v] + 2γ2Cσ2 T −1 E[1l,v].
+
+l=0
+
+l=0
+
+40
+
+If a Byzantine peer deviates from the protocol at iteration k, it will be detected with some probability pk during the next iteration. One can lower bound this probability as
+
+pk ≥ m · |Gk| · 1 = m(1 − δk) ≥ m .
+
+nk nk
+
+nk
+
+n
+
+That is, each individual Byzantine worker can violate the protocol no more than 1/p times on average. However, even one Byzantine peer can create a shift of the order ∆kmax at each part of the resulting vector. Therefore, all Byzantine peers can violate the protocol no more than b/p times on average
+
+implying that
+
+√
+
+2
+
+2 40γ2σ2T 2γnb 2CσR0 2γ2nbCσ2
+
+E[RT ] ≤ R0 + 7n +
+
+m
+
++
+
+.
+
+m
+
+Taking
+
+1 γ = min ,
+4L
+
+7nR02 , 120σ2K
+
+m2R02 72C σ2 n2 b2
+
+we ensure that
+
+√
+
+40γ2σ2T 2γnb 2CσR0 2γ2nbCσ2 R02 R02 R02
+
+2
+
++ 7n
+
+m
+
++ m ≤ 3 + 3 + 3 = R0,
+
+and, as a result, we get E[RT2 ] ≤ 2R02. Therefore, (43) holds for all k = 0, 1, . . . , K. Together with (41) it implies
+E f (xK ) − f (x∗) ≤ 2R02 . γK
+
+Next, from our stepsize rule (39) it follows that
+
+E f (xK ) − f (x∗) = O LR02 + √σR0 + nbσR0
+
+K
+
+nK mK
+
+meaning that after
+
+K =O
+
+LR02 + σ2R02 + nbσR0
+
+ε
+
+nε2
+
+mε
+
+iterations BTARD-SGD guarantees E[f (xK ) − f (x∗)] ≤ ε.
+
+E.3.5 STRONGLY CONVEX CASE: RESTARTED-BTARD-SGD
+In this section, we provide the complete statements and the full proofs of the convergence results for the restarted version of BTARD-SGD (RESTARTED-BTARD-SGD, Alg. 7) when the objective function f is smooth and strongly convex.
+
+Algorithm 7 RESTARTED-BTARD-SGD
+
+Input: x0 – starting point, r – number of restarts, {γt}rt=1 – stepsizes for BTARD-SGD, {Kt}rt=1 – number of iterations for BTARD-SGD, {si,k,t}ni,,kK,t−=10,,r0,0 – seeds for batches computations
+
+1: x0 = x0
+
+2: for t = 1, 2, . . . , r do 3: Run BTARD-SGD (Alg. 6) for Kt iterations with stepsize γt, starting point xt−1, and
+
+seeds for batches computations {si,k,t}ni,,kK=−0,10.
+
+Kt
+Deﬁne xt as xt = K1t xk,t, where
+k=0
+
+x0,t, x1,t, . . . , xKt,t are the iterates produced by BTARD-SGD.
+
+Output: xr
+
+We start with the case when the number of attacking Byzantine workers is known at each iteration. 41
+
+Theorem E.6. Let As. 3.1 and 3.2 hold, Q = Rd, f be L-smooth (see Def. E.1), µ-strongly convex (see Def. E.2), and x∗ be some optimum of f . Moreover, assume that b ≤ 0.1(n − m), m ≤ (n−2b)/2,
+and the exact number of attacking Byzantine peers is known to all good peers at each iteration. Next,
+assume that
+
+
+
+
+
+√√
+
+1 γ = min ,
+
+7nR02 ,
+
+m2R02
+
+ ,
+
+∆k,t
+
+(1 + =
+
+3) 2σ ,
+
+(44)
+
+t
+
+4L 120 · 2tσ2Kt 1440 · 2tCσ2n2δ
+
+max
+
+nt − m
+
+
+
+
+
+k
+
+16L 32σ22t 48√10Cn√δσ2 2t µR02
+
+Kt = max µ , µ2R2 ,
+
+mµR0
+
+, r = log2 ε − 1
+
+(45)
+
+0
+
+where R0 ≥ x0 − x∗ , ∆km,atx is the parameter for veriﬁcation 3 at iteration k of BTARD-SGD during the t-th restart, ntk is the total number of workers at iteration k of t-th restart. Then, we have E[f (xr) − f (x∗)] ≤ ε after r restarts of BTARD-SGD and the total number of executed iterations
+
+of BTARD-SGD is
+
+r
+
+√ L µR2 σ2 n δσ
+
+Kt = O log 0 + + √ .
+
+(46)
+
+t=1 µ ε nµε m µε
+
+Proof. Theorem E.4 implies that BTARD-SGD with
+
+1 γ = min ,
+4L
+
+7nR02 , 120σ2K
+
+m2R02 1440C σ2 n2 δ
+
+guarantees
+
+E f (xK ) − f (x∗) ≤ 2R02 γK
+
+after K iterations. Therefore, after the ﬁrst restart we have
+
+E[f (x1) − f (x∗)] ≤ 2R02 ≤ µR02 .
+
+γ1K1
+
+4
+
+From µ-strong convexity of f and ∇f (x∗) = 0 we have
+
+µ x1 − x∗ 2 ≤ f (x1) − f (x∗) =⇒ E[ x1 − x∗ 2] ≤ R02 .
+
+2
+
+2
+
+Next, assume that we have E[f (xt) − f (x∗)] ≤ 2µtR+021 , E[ xt − x∗ 2] ≤ R2t02 for some t ≤ r − 1. Then, Theorem E.4 implies that
+
+E[f (xt+1) − f (x∗) | xt] ≤ 2 xt − x∗ 2 . γtKt
+
+Taking the full expectation from the both sides of previous inequality we get
+
+t+1
+
+∗
+
+2E[ xt − x∗ 2]
+
+2R02
+
+µR02
+
+E[f (x ) − f (x )] ≤
+
+γtKt
+
+≤ 2tγtKt ≤ 2t+2 .
+
+From µ-strong convexity of f and ∇f (x∗) = 0 we have
+
+µ t+1 ∗ 2
+
+t+1
+
+∗
+
+t+1
+
+∗2
+
+R02
+
+x 2
+
+−x
+
+≤ f (x ) − f (x ) =⇒ E[ x
+
+− x ] ≤ 2t+1 .
+
+Therefore, by mathematical induction we have that for all t = 1, . . . , r
+
+t
+
+∗
+
+µR02
+
+t
+
+∗2
+
+R02
+
+E[f (x ) − f (x )] ≤ 2t+1 , E x − x ≤ 2t .
+
+42
+
+Then, after r = log2 µRε 02 − 1 restarts of BTARD-SGD we have E[f (xr) − f (x∗)] ≤ ε. The total
+
+number of iterations executed by BTARD-SGD is
+
+r
+
+r
+
+L σ22t n√δσ2 2t
+
+Kt = O
+
+max µ , µ2R2 , mµR0
+
+t=1
+
+t=1
+
+0
+
+L σ22r n√δσ2 r2
+
+=
+
+O
+
+r µ
+
++
+
+µ2R2
+
++
+
+mµR0
+
+0
+
+√
+
+L µR02 σ2 µR02 n δσ µR02
+
+=
+
+O
+
+log µ
+
+ε
+
++ µ2R2 ·
+
+ε
+
++
+
+·
+
+mµR0
+
+ε
+
+0
+
+√
+
+L µR02 σ2 n δσ = O log + + √ .
+
+µ
+
+ε nµε m µε
+
+In the strongly convex case, similar observations hold as in the non-convex case. Next, we derive the result without assuming that bk is known to all peers at each iteration.
+
+Theorem E.7. Let As. 3.1 and 3.2 hold, Q = Rd, f be L-smooth (see Def. E.1), µ-strongly convex (see Def. E.2), and x∗ be some optimum of f . Moreover, assume that b ≤ 0.1(n − m), m ≤ (n−2b)/2,
+and δ = 0 is used to compute clipping parameter τl for CenteredClip. Next, assume that
+
+
+
+
+
+√√
+
+1 γ = min ,
+
+7nR02 ,
+
+m2R02
+
+ ,
+
+∆k,t
+
+(1 + =
+
+3) 2σ ,
+
+(47)
+
+t
+
+4L 120 · 2tσ2Kt 72 · 2tCσ2n2b2
+
+max
+
+nt − m
+
+
+
+
+
+k
+
+16L 32σ22t 24√2Cnbσ2 2t µR02
+
+Kt = max µ , µ2R2 , mµR0
+
+, r = log2 ε − 1
+
+(48)
+
+0
+
+where R0 ≥ x0 − x∗ , ∆km,atx is the parameter for veriﬁcation 3 at iteration k of BTARD-SGD during the t-th restart, ntk is the total number of workers at iteration k of t-th restart. Then, we have E[f (xr) − f (x∗)] ≤ ε after r restarts of BTARD-SGD and the total number of executed iterations
+
+of BTARD-SGD is
+
+r
+
+L µR02 σ2
+
+nbσ
+
+Kt = O log
+
++
+
++√ .
+
+(49)
+
+µ
+
+ε nµε m µε
+
+t=1
+
+Proof. Theorem E.5 implies that BTARD-SGD with
+
+1 γ = min ,
+4L
+
+7nR02 , 120σ2K
+
+m2R02 72C σ2 n2 b2
+
+guarantees
+
+E f (xK ) − f (x∗) ≤ 2R02 γK
+
+after K iterations. Therefore, after the ﬁrst restart we have
+
+E[f (x1) − f (x∗)] ≤ 2R02 ≤ µR02 .
+
+γ1K1
+
+4
+
+From µ-strong convexity of f and ∇f (x∗) = 0 we have
+
+µ x1 − x∗ 2 ≤ f (x1) − f (x∗) =⇒ E[ x1 − x∗ 2] ≤ R02 .
+
+2
+
+2
+
+Next, assume that we have E[f (xt) − f (x∗)] ≤ 2µtR+021 , E[ xt − x∗ 2] ≤ R2t02 for some t ≤ r − 1. Then, Theorem E.5 implies that
+
+E[f (xt+1) − f (x∗) | xt] ≤ 2 xt − x∗ 2 . γtKt
+
+43
+
+Taking the full expectation from the both sides of previous inequality we get
+
+t+1
+
+∗
+
+2E[ xt − x∗ 2]
+
+2R02
+
+µR02
+
+E[f (x ) − f (x )] ≤
+
+γtKt
+
+≤ 2tγtKt ≤ 2t+2 .
+
+From µ-strong convexity of f and ∇f (x∗) = 0 we have
+
+µ t+1 ∗ 2
+
+t+1
+
+∗
+
+t+1
+
+∗2
+
+R02
+
+x 2
+
+−x
+
+≤ f (x ) − f (x ) =⇒ E[ x
+
+− x ] ≤ 2t+1 .
+
+Therefore, by mathematical induction we have that for all t = 1, . . . , r
+
+t
+
+∗
+
+µR02
+
+t
+
+∗2
+
+R02
+
+E[f (x ) − f (x )] ≤ 2t+1 , E x − x ≤ 2t .
+
+Then, after r = log2 µRε 02 − 1 restarts of BTARD-SGD we have E[f (xr) − f (x∗)] ≤ ε. The total
+
+number of iterations executed by BTARD-SGD is
+
+r
+
+r
+
+L
+
+σ22t
+
+nbσ
+
+2
+
+t 2
+
+Kt = O
+
+max µ , µ2R2 , mµR0
+
+t=1
+
+t=1
+
+0
+
+L
+
+σ22r
+
+nbσ
+
+2
+
+r 2
+
+=
+
+O
+
+r µ
+
++
+
+µ2R2
+
++
+
+mµR0
+
+0
+
+L µR02 σ2 µR02 nbσ
+
+µR02
+
+=
+
+O
+
+log µ
+
+ε
+
++ µ2R2 ·
+
+ε
+
++
+
+·
+
+mµR0
+
+ε
+
+0
+
+L µR02 σ2
+
+nbσ
+
+= O log + + √ .
+
+µ
+
+ε nµε m µε
+
+E.4 CONVERGENCE GUARANTEES FOR BTARD-CLIPPED-SGD
+
+The results for BTARD-SGD and RESTARTED-BTARD-SGD rely on As. 3.2 that the stochastic gradients have not too heavy tails, i.e., sub-quadratically decreasing tails. The main reason why it is needed in the analysis is to prevent too often extra computations because of Veriﬁcation 3 from BTARD when all workers honestly follow the protocol. However, in many important NLP tasks such as BERT training (Zhang et al., 2020), the noise in the stochastic gradient has such a heavy noise that As. 3.2 becomes unnatural.
+
+Algorithm 8 BTARD-CLIPPED-SGD
+
+Input: x0 – starting point, γ – stepsize, K – number of iterations, {si,k}in,,kK=−0,10 – seeds for batches computations, {λk}kK=−01 – gradient clipping parameter
+1: C0 = Banned−1 = ∅ 2: for k = 0, 1, . . . , K − 1 do
+
+3:
+
+Worker i computes gk =
+
+min 1, ∇f (xλkk,ξi,k)
+
+∇f (xk, ξi,k), if i ∈ Gk \ Ck, , where
+
+i
+
+∗,
+
+if i ∈ Bk \ Ck,
+
+ξi,k is generated via seed si,k available to every worker
+
+4:
+
+gk, public_infok = BTARD(gikk , gikk , . . . , gikk ), where {ik1 , . . . , ikak } = (Gk ∪ Bk) \ Ck
+
+1
+
+1
+
+ak
+
+5: Choose 2m workers ck1+1, . . . , ckm+1, uk1+1, . . . , ukm+1 uniformly at random without replacement, Ck+1 = {ck1+1, . . . , ckm+1}, Uk+1 = {uk1+1, . . . , ukm+1}
+
+6: Bannedk = CHECKCOMPUTATIONS(Ck+1, Uk+1, public_infok) 7: xk+1 = projQ(xk − γgk) := argminx∈Q x − (xk − γgk)
+
+8: Gk+1 = Gk \ Bannedk−1 9: Bk+1 = Bk \ Bannedk−1
+
+To handle the problems with heavy-tailed noise distributions we consider BTARD-CLIPPED-SGD (see Alg. 8 in Appendix) applied to solve (3) such that Q is bounded. Essentially, this algorithm
+44
+
+coincides with BTARD-SGD up to the following change: all good peers i ∈ Gk \ Ck use clipped
+
+stochastic gradients gik = (gik(1)
+
+, . . . , gik(nk − m)
+
+)
+
+, where gik(l) = min
+
+1,
+
+λk gk (l)
+
+gik (l),
+
+i
+
+l = 1, . . . , nk − m, and gik is the stochastic gradient. Next, we introduce the following assumption.
+
+Assumption E.1. There exist such constant G > 0, s0 ∈ [d], and α ∈ (1, 2] that for any set of indices S = (i1, . . . , id), 1 ≤ i1 < i2 < . . . < is ≤ d, s ≥ s0 and arbitrary x ∈ Q stochastic gradient ∇f (x, ξ) satisfy
+
+α √sG α
+
+E[∇f (x, ξ)] = ∇f (x), E ∇[S]f (x, ξ) ≤ √
+
+,
+
+(50)
+
+d
+
+where ∇[S]f (x, ξ) is deﬁned in As. 3.1.
+
+This is a modiﬁed version of the assumption used in Zhang et al. (2020). When α < 2 the variance of the stochastic gradient can be unbounded. One can show that in such a regime vanilla SGD can diverge (Zhang et al., 2020).
+Under As. E.1 we derive the convergence results for convex and strongly convex problems.
+
+E.4.1 QUALITY OF THE AGGREGATION
+
+Since now we have As. E.1 instead of As. 3.1 and 3.2 it is needed to derive new guarantees for the quality of the aggregation. We start with the following useful lemma about the properties of clipped stochastic gradeints.
+
+Lemma E.5 (See also Lemma 9 from Zhang et al. (2020)). Let As. E.1 holds and i, j ∈ Gk \ Ck. Then, for all l = 1, 2, . . . , nk − m we have
+
+α
+
+E gk(l) − gk(l) 4 | xk
+
+4−α
+≤ 4λ 2
+
+√G
+
+2
+,
+
+(51)
+
+i
+
+j
+
+k
+
+nk − m
+
+k 2k
+
+Gαλ2k−α
+
+E g (l) | x ≤
+
+α,
+
+(52)
+
+(nk − m) 2
+
+k
+
+k
+
+k2
+
+G2α
+
+E[g (l) | x ] − ∇(l)f (x ) ≤
+
+2(α−1) ,
+
+(53)
+
+(nk − m)αλk
+
+where gk(l) = |Gk1\Ck|
+
+gik(l) for all l = 1, . . . , nk − m.
+
+i∈Gk \Ck
+
+Proof. First of all, we derive
+
+E gik(l) − gjk(l) 4 | xk
+
+= E gik(l) − gjk(l) α gik(l) − gjk(l) 4−α | xk
+
+≤ 8λ4k−αE ∇(l)f (xk, ξi,k) α + ∇(l)f (xk, ξj,k) α | xk
+
+(50)
+
+4−α
+
+G
+
+α
+
+≤ 16λk
+
+√ n −m
+
+k
+
+implying (51). Next, for all i ∈ Gk \ Ck we have
+
+E gik(l) 2 | xk
+
+= E gik(l) α gik(l) 2−α | xk ≤ λ2k−αE ∇(l)f (xk, ξi,k) α | xk
+
+(50) Gαλ2k−α
+
+≤
+
+α
+
+(nk − m) 2
+
+implying
+
+k 2k
+
+1
+
+k 2k
+
+Gαλ2k−α
+
+E g (l) | x ≤ |Gk \ Ck|
+
+E gi (l) | x ≤ (nk − m) α2 .
+
+i∈Gk \Ck
+
+45
+
+Finally, for all i ∈ Gk \ Ck we derive E[gik(l) | xk] − ∇(l)f (xk) = ≤ = ≤
+≤
+(50)
+≤
+implying E[gk(l) | xk] − ∇(l)f (xk) 2
+
+E[gik(l) − ∇(l)f (xk, ξi,k) | xk] E gik(l) − ∇(l)f (xk, ξi,k) | xk
+1 E gik(l) − ∇(l)f (xk, ξi,k) { ∇(l)f (xk,ξi,k) ≥λk} | xk
+
+1 E ∇(l)f (xk, ξi,k) { ∇(l)f (xk,ξi,k) ≥λk} | xk
+
+E ∇(l)f (xk, ξi,k)
+
+Gα
+
+(nk
+
+−
+
+m)
+
+α 2
+
+λkα−1
+
+1 α { ∇(l)f (xk,ξi,k) λkα−1
+
+≥λk} | xk
+
+1 ≤
+|Gk \ Ck|
+
+E gik(l) − ∇(l)f (xk) 2 | xk
+
+i∈Gk \Ck
+
+G2α
+
+≤
+
+.
+
+(nk − m)αλk2(α−1)
+
+Next, we derive the guarantees for the quality of the aggregation in the case when the number of
+Byzantine peers violating the protocol bk is known at each iteration.
+Lemma E.6. Let As. E.1 hold and b ≤ 0.15(n − m). Assume that bk is known for each worker at iteration k, ∆kmax = 2λk = √n2kλ−m and δ = δk is used to compute clipping parameter τl for CenteredClip. If the total number of iterations T of CenteredClip satisﬁes T ≥ log0.94 E[ v20δ−σg2k 2] and CHECKAVERAGING is not triggered for any worker, then
+
+E
+
+gk − gk 2 | xk
+
+≤
+
+4−α α
+δk(C1λ 2 G 2
+
++ C2λ2),
+
+(54)
+
+E
+
+gk 2 | xk
+
+≤
+
+4−α α
+2δk(C1λ 2 G 2
+
++ C2λ2) + 2Gαλ2−α,
+
+(55)
+
+where gk = |Gk1\Ck|
+
+gjk, C1 = 384, and C2 = 4.
+
+j ∈Gk \Ck
+
+Proof. Consider the i-th part of gk, i.e., consider gk(i). If i ∈ Gk \ Ck, then, in view of (51), we can directly apply Lemma E.1 and get
+
+α
+
+4−α α
+
+4−α
+E gk(i) − gk(i) 2 | xk ≤ 384δkλ 2
+
+G2
+
+= 384δkλ 2 G 2 .
+
+k
+
+(nk
+
+−
+
+m
+
+)
+
+α 4
+
+nk − m
+
+Next, if i ∈ Bk \ Ck, then
+
+k
+
+k 2k
+
+k2
+
+2
+
+4λ2
+
+E
+
+g (i) − g (i)
+
+|x
+
+≤ (∆max)
+
+=
+
+4λk
+
+=
+
+nk
+
+−
+
+. m
+
+Putting all together, we derive
+
+E gk − gk 2 | xk
+
+=
+
+E gk(i) − gk(i) 2 | xk +
+
+E gk(i) − gk(i) 2 | xk
+
+i∈Gk \Ck
+
+i∈Bk \Ck
+
+4−α α
+384δkλ 2 G 2
+
+4λ2
+
+≤ (1 − δk)(nk − m) · nk − m + δk(nk − m) · nk − m
+
+≤
+
+4−α α
+δk(C1λ 2 G 2
+
++ C2λ2).
+
+46
+
+Using (52) we obtain E gk 2 | xk
+
+≤ 2E gk − gk 2 | xk + 2E gk 2 | xk
+
+(54)
+≤
+
+4−α α
+2δk(C1λ 2 G 2
+
++ C2λ2) + 2
+
+Gαλ2k−α
+α
+
+i∈(Gk∪Bk)\Ck (nk − m) 2
+
+=
+
+4−α α
+2δk(C1λ 2 G 2
+
++ C2λ2) + 2Gαλ2−α.
+
+We notice that Veriﬁcation 3 can be simpliﬁed in the following way: if at least on good peer i notices that gik(j) − gk(j) > ∆kmax = 2λk, then peer i should accuse j-th peer and both are removed from the training process. In this scenario, there is no sense for Byzantine workers in triggering to
+deviate signiﬁcantly from the clipped stochastic gradients of the good peers.
+
+As for BTARD-SGD, when bk is unknown we always use CENTEREDCLIP with τl = ∞ for all l ≥ 0, i.e., good peers compute an exact average. In this settings, even 1 Byzantine worker can signiﬁcantly shift the average in all parts of the vector. The next lemma quantiﬁes the negative effect of Byzantine workers in this case.
+
+Lemma E.7. Let As. E.1 hold and b ≤ 0.15(n − m). Assume that bk is known for each worker
+at iteration k, ∆kmax = 2λk = √n2kλ−m and δ = δk is used to compute clipping parameter τl for CenteredClip. If the total number of iterations T of CenteredClip satisﬁes T ≥ log0.94 E[ v20δ−σg2k 2] and CHECKAVERAGING is not triggered for any worker, then
+
+E gk − gk 2 | xk ≤ C2λ21k,v,
+
+(56)
+
+E gk 2 | xk ≤ 2C2λ21k,v + 2Gαλ2−α,
+
+(57)
+
+where gk = |Gk1\Ck|
+
+gjk, C2 = 4, and 1k,v is an indicator function of the event that at least 1
+
+j ∈Gk \Ck
+
+Byzantine peer violates the protocol at iteration k.
+
+Proof. For all i ∈ (Gk ∪ Bk) \ Ck we have
+
+E gk(i) − gk(i) 2 | xk ≤ (∆k )21k,v = 4λ2 1k,v = 4λ2 1k,v
+
+max
+
+k
+
+nk − m
+
+implying
+
+E gk − gk 2 | xk Using (52) we obtain
+
+=
+
+E gk(i) − gk(i) 2 | xk
+
+i∈(Gk ∪Bk )\Ck
+
+≤ (nk − m) · 4λ2 1k,v = C2λ21k,v.
+nk − m
+
+E gk 2 | xk
+
+≤ 2E gk − gk 2 | xk + 2E gk 2 | xk
+
+(54)
+≤ 2C2λ21k,v + 2
+
+Gαλ2k−α = 2C2λ21k,v + 2Gαλ2−α.
+
+(nk
+
+−
+
+m)
+
+α 2
+
+i∈(Gk ∪Bk )\Ck
+
+E.4.2 CONVEX CASE In this section, we provide the complete statements and the full proofs of the convergence results for BTARD-CLIPPED-SGD when the objective function f is smooth and convex. We start with the case when the number of Byzantine peers violating the protocol bk is known at each iteration.
+47
+
+Theorem E.8. Let As. E.1 hold, Q is bounded, f be convex, x∗ be some optimum of f , and ∇f (x∗) = 0. Moreover, assume that b ≤ 0.15(n − m), m ≤ (n−2b)/2, and the exact number of
+attacking Byzantine peers is known to all good peers at each iteration. Next, assume that
+
+
+
+ R0
+
+γ = min √
+
+1,
+
+ 6GK α 12Gn
+
+
+
+mR0  ,
+
+4−α
+10δ(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+
+
+∆k
+
+2λ = 2λk = √
+
+, (58)
+
+max
+
+nk − m
+
+1
+
+λ = GK α ,
+
+(59)
+
+where R0 ≥ x0 − x∗ and ∆kmax is the parameter for veriﬁcation 3 at iteration k of BTARDCLIPPED-SGD. Then, we have E[f (xK )−f (x∗)] ≤ ε after K iterations of BTARD-CLIPPED-SGD,
+
+where
+
+
+
+α
+
+√
+
+α
+
+GR0 α−1
+
+n δGR0 α−1
+
+K =O
+
++
+
+
+
+(60)
+
+ε
+
+mε
+
+and xK = K1 Kk=−01.
+
+Proof. Non-expansiveness of the projection operator and convexity of f imply
+
+xk+1 − x∗ 2 = ≤ = = ≤
+
+projQ(xk − γgk) − projQ(x∗) 2 xk − x∗ − γgk 2 xk − x∗ 2 − 2γ xk − x∗, gk + γ2 gk 2 xk − x∗ 2 − 2γ xk − x∗, ∇f (xk) − 2γ xk − x∗, gk − ∇f (xk) + γ2 gk 2 xk − x∗ 2 − 2γ f (xk) − f (x∗) − 2γ xk − x∗, gk − ∇f (xk) + γ2 gk 2.
+
+Taking conditional expectation E[· | xk] from the both sides of previous inequality we derive
+
+E xk+1 − x∗ 2 | xk ≤ xk − x∗ 2 − 2γ f (xk) − f (x∗)
+
+−2γE xk − x∗, gk − ∇f (xk) | xk + γ2E gk 2 | xk
+
+(55)
+≤ xk − x∗ 2 − 2γ f (xk) − f (x∗) + 2γ2Gαλ2−α
+
+−2γ xk − x∗, E gk − gk | xk
+
++
+
+2γ 2 δk (C1 λ
+
+4−α 2
+
+G
+
+α 2
+
++ C2λ2)
+
+=
+
+xk − x∗
+
+2 − 2γ
+
+f (xk) − f (x∗)
+
++
+
+2γ2G2K
+
+2−α α
+
+−2γ xk − x∗, E gk − gk | xk
+
+2γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
++ nk − m bk.
+
+To estimate the inner product in the right-hand side we apply Cauchy-Schwarz inequality:
+
+−2γ xk − x∗, E gk − gk | xk
+
+≤ 2γ xk − x∗ · E gk − gk | xk ≤ 2γ xk − x∗ E gk − gk | xk
+
+≤ 2γ xk − x∗ E gk − gk 2 | xk
+
+(54)
+≤ 2γ xk − x∗
+
+δk
+
+(C1
+
+λ
+
+4−α 2
+
+G
+
+α 2
+
++ C2λ2)
+
+2γG xk − x∗
+
+C K 4−α
+1 2α
+
++
+
+C2K
+
+2 α
+
+= √nk − m bk
+
+2γG xk − x∗ ≤
+
+4−α
+20(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+√
+
+bk ,
+
+7n
+
+48
+
+where in the last inequality we use b ≤ 0.15(n−m), m ≤ (n−2b)/2, γ ≤ 1/4L, nk −m ≥ n−2b−m ≥ 270 n. Putting all together we obtain
+
+E xk+1 − x∗ 2 | xk
+
+≤
+
+xk − x∗
+
+2 − 2γ
+
+f (xk) − f (x∗)
+
++
+
+2γ2G2K
+
+2−α α
+
+2γG xk − x∗ +
+
+4−α
+20(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+√
+
+bk
+
+7n
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
++ 7n bk.
+
+Taking the full expectation from the both sides of the above inequality and summing up the results
+
+for k = 0, 1, . . . , T − 1 we derive
+
+2γ T −1 [f (xk) − f (x∗)] ≤
+
+1 T −1 E
+
+xk − x∗ 2 − E
+
+xk+1 − x∗ 2
+
++
+
+2γ2G2K
+
+2−α α
+
+TE
+
+T
+
+k=0
+
+k=0
+
+4γG
+
+4−α
+5(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
++
+
+√
+
+E xk − x∗ bk
+
+nT k=0
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
++ 7nT
+
+E[bk ]
+
+k=0
+
+≤ x0 − x∗ 2 − E[ xK − x∗ 2] + 2γ2G2K 2−αα K
+
+4γG +
+
+4−α
+5(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
+√
+
+nT k=0
+
+E [ xk − x∗ 2] E bk
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
++ 7nT
+
+E[bk ].
+
+k=0
+
+From Jensen’s inequality we have f (xT ) ≤ T1 Tk=−01 f (xk), where xT = T1 and new notation Rk = xk − x∗ , k > 0, R0 ≥ x0 − x∗ we get
+
+Tk=−01 xk. Using this
+
+0 ≤ 2γE f (xT ) − f (x∗)
+
+≤
+
+R02
+
+−
+
+E[RT2 ]
+
++
+
+2γ2G2K
+
+2−α α
+
+T
+
+4γG +
+
+4−α
+5(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
+√
+
+nT k=0
+
+E
+
+[R
+
+2 k
+
+]
+
+E
+
+bk
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
++ 7nT
+
+E[bk ]
+
+(61)
+
+k=0
+
+implying (after changing the indices) that
+
+2−α
+
+4γG
+
+4−α
+5(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+k−1
+
+E[Rk2] ≤ R02 + 2γ2G2kK α + √n
+
+l=0
+
+E [Rl2] E bl
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+k−1
+
++ 7n
+
+E[bl]
+
+l=0
+
+(62)
+
+holds for all k ≥ 0. In the remaining part of the proof we derive by induction that
+
+2−α 4γG R02 + 2γ2G2kK α +
+
+4−α
+5(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+k−1
+
+√
+
+n l=0
+
+E
+
+[R
+
+2 l
+
+]
+
+E
+
+bl
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+k−1
+
+2
+
++ 7n
+
+E[bl] ≤ 2R0 (63)
+
+l=0
+
+49
+
+for all k = 0, . . . , K. For k = 0 this inequality trivially holds. Next, assume that it holds for all
+k = 0, 1, . . . , T − 1, T ≤ K − 1. Let us show that it holds for k = T as well. From (37) and (38) we have that E[Rk2] ≤ 2R02 for all k = 0, 1, . . . , T − 1. Therefore,
+
+2−α
+
+4γG
+
+4−α
+5(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
+E[RT2 ] ≤ R02 + 2γ2G2T K α + √n
+
+l=0
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
++ 7n
+
+E[bl]
+
+l=0
+
+E [Rl2] E bl
+
+2−α
+
+4γGR0
+
+4−α
+10(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
+≤ R02 + 2γ2G2T K α + √n
+
+l=0
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+T −1
+
++ 7n
+
+E[bl]
+
+l=0
+
+E bl
+
+If a Byzantine peer deviates from the protocol at iteration k, it will be detected with some probability pk during the next iteration. One can lower bound this probability as
+
+pk ≥ m · |Gk| · 1 = m(1 − δk) ≥ m .
+
+nk nk
+
+nk
+
+n
+
+Therefore, each individual Byzantine worker can violate the protocol no more than 1/p times on average implying that
+
+E[R
+
+2 T
+
+]
+
+Taking we ensure that
+
+≤
+T ≤K
+≤
+
+2−α 4γGR0n R02 + 2γ2G2T K α +
+
+4−α
+10(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)b
+
+√
+
+mn
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)nb
+
++
+
+7nm
+
+2 4γGR0n R02 + 2γ2G2K α +
+
+4−α
+10(C1K 2α m
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)nδ
+
++
+
+.
+
+7m
+
++
+
+C2K
+
+2 α
+
+)δ
+
+
+
+ R0
+
+γ = min √
+
+1,
+
+ 6GK α 12Gn
+
+
+
+mR0
+
+
+
+4−α
+10δ(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+
+
+2γ2G2K α2 + 4γGR0n
+
+4−α
+10(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)δ
+
+m
+
+40γ
+
+2
+
+G2
+
+(C1
+
+K
+
+4−α 2α
+
++
+
+C2K
+
+2 α
+
+)nδ
+
+R02 R02 R02
+
+2
+
++ 7m
+
+≤ 3 + 3 + 3 = R0
+
+and, as a result, we get E[RT2 ] ≤ 2R02. Therefore, (63) holds for all k = 0, 1, . . . , K. Together with (61) it implies
+E f (xK ) − f (x∗) ≤ R02 . γK
+
+Next, from our stepsize rule (58) it follows that E f (xK ) − f (x∗) = O
+
+√
+
+G1R−0α + n δG1−Rα0
+
+Kα
+
+mK α
+
+50
+
+meaning that after
+
+ K = O  GR0
+ε
+
+α α−1
++
+
+√ n δGR0
+mε
+
+α
+α−1
+
+
+iterations BTARD-CLIPPED-SGD guarantees E[f (xK ) − f (x∗)] ≤ ε.
+
+If there are no Byzantine peers (δ = 0), the theorem establishes new result for the convergence of CLIPPED-SGD for convex objectives. In the strongly convex case, the theorem recovers the rates that are optimal in this setting as shown in √Zhang et al. (2020). Next, when the number of attacking Byzantines is known at each iteration and n δ/m = O(1), the complexity bound is the same as in the case when δ = 0. This means that the negative impact of Byzantine workers is negligible. Finally, the derived theoretical guarantees do not beneﬁt from the increase of the total number of peers n. However, the result holds even for non-smooth problems and it is known that parallelization does not help to improve the complexity bounds in such generality. Nevertheless, our results show that BTARD-CLIPPED-SGD provably converges to any predeﬁned accuracy ε > 0. This is a property that the majority of previous methods does not have (Karimireddy et al., 2020).
+Next, we derive the result without assuming that bk is known to all peers at each iteration.
+Theorem E.9. Let As. E.1 hold, Q is bounded, f be convex, x∗ be some optimum of f , and ∇f (x∗) = 0. Moreover, assume that b ≤ 0.15(n − m), m ≤ (n−2b)/2, and δ = 0 is used to compute clipping parameter τl for CenteredClip. Next, assume that
+
+γ = min √ R0 , √ mR0
+
+, ∆k
+
+2λ = 2λk = √
+
+,
+
+(64)
+
+6GK
+
+1 α
+
+12
+
+2C2
+
+GnbK
+
+1 α
+
+max
+
+nk − m
+
+1
+
+λ = GK α ,
+
+(65)
+
+where R0 ≥ x0 − x∗ and ∆kmax is the parameter for veriﬁcation 3 at iteration k of BTARDCLIPPED-SGD. Then, we have E[f (xK )−f (x∗)] ≤ ε after K iterations of BTARD-CLIPPED-SGD, where
+
+K =O
+
+α
+
+α
+
+GR0 α−1 + nbGR0 α−1
+
+ε
+
+mε
+
+(66)
+
+and xK = K1 Kk=−01.
+
+Proof. The proof is almost identical to the proof of Theorem E.8. Following the same steps and using (56) and (57) instead of (54) and (55) respectively we obtain the same sequence of inequalities up to
+the following change: instead of δk we should use 1k,v. Therefore, we have
+
+E xk+1 − x∗ 2 | xk
+
+≤
+
+xk − x∗
+
+2 − 2γ
+
+f (xk) − f (x∗)
+
++
+
+2γ2G2K
+
+2−α α
+
+−2γ xk − x∗, E gk − gk | xk
+
++
+
+2γ
+
+2C2G2K
+
+2 α
+
+1k,v
+
+.
+
+−2γ xk − x∗, E gk − gk | xk
+
+≤ 2γG xk − x∗
+
+C2
+
+K
+
+1 α
+
+1k,v
+
+,
+
+and
+
+E xk+1 − x∗ 2 | xk
+
+≤
+
+xk − x∗
+
+2 − 2γ
+
+f (xk) − f (x∗)
+
++
+
+2γ2G2K
+
+2−α α
+
++2γG
+
+1
+C2K α
+
+xk − x∗
+
+1k,v
+
++
+
+2γ2C2G2K
+
+2 α
+
+1k,v .
+
+51
+
+Taking the full expectation from the both sides of the above inequality and summing up the results for k = 0, 1, . . . , T − 1 we derive
+
+2γ T −1 [f (xk) − f (x∗)] ≤
+
+1 T −1 E
+
+xk − x∗ 2 − E
+
+xk+1 − x∗ 2
+
++
+
+2γ2G2K
+
+2−α α
+
+TE
+
+T
+
+k=0
+
+k=0
+
+2γG√C2K α1 T −1 +T E
+k=0
+
+xk − x∗
+
+1k,v
+
++ 2γ2C2TG2K α2 T −1 E[1k,v] k=0
+
+≤ x0 − x∗ 2 − E[ xK − x∗ 2] + 2γ2G2K 2−αα
+
+K
+
+√
+
+1 T −1
+
++ 2γG C2K α
+
+E [ xk − x∗ 2] E [1k,v]
+
+T k=0
+
++ 2γ2C2TG2K α2 T −1 E[1k,v]. k=0
+
+From Jensen’s inequality we have f (xT ) ≤ T1 Tk=−01 f (xk), where xT = T1 and new notation Rk = xk − x∗ , k > 0, R0 ≥ x0 − x∗ we get
+
+Tk=−01 xk. Using this
+
+0 ≤ 2γE f (xT ) − f (x∗)
+
+≤
+
+R02
+
+−
+
+E[R
+
+2 T
+
+]
+
++
+
+2γ2G2K
+
+2−α α
+
+T
+
+√
+
+1 T −1
+
++ 2γG C2K α T
+
+E
+
+[R
+
+2 k
+
+]
+
+E
+
+[
+
+1
+
+k
+
+,v
+
+]
+
+k=0
+
++ 2γ2C2TG2K α2 T −1 E[1k,v] (67) k=0
+
+implying (after changing the indices) that
+
+k−1
+
+E[Rk2 ]
+
+≤
+
+R02
+
++
+
+2γ2G2kK
+
+2−α α
+
++ 2γG
+
+1
+C2K α
+
+E
+
+[R
+
+2 l
+
+]
+
+E
+
+[1
+
+l
+
+,v
+
+]
+
+l=0
+
+k−1
+
++2γ
+
+2
+
+C2
+
+G2
+
+K
+
+2 α
+
+E[1l,v ]
+
+(68)
+
+l=0
+
+holds for all k ≥ 0. In the remaining part of the proof we derive by induction that
+
+R02
+
++
+
+2γ2G2kK
+
+2−α α
+
++ 2γG
+
+k−1
+1
+C2K α
+l=0
+
+E
+
+[R
+
+2 l
+
+]
+
+E
+
+[
+
+1
+
+l
+
+,v
+
+]
+
+k−1
+
++2γ
+
+2
+
+C2
+
+G2
+
+K
+
+2 α
+
+E[1l,v] ≤ 2R02
+
+(69)
+
+l=0
+
+for all k = 0, . . . , K. For k = 0 this inequality trivially holds. Next, assume that it holds for all
+k = 0, 1, . . . , T − 1, T ≤ K − 1. Let us show that it holds for k = T as well. From (42) and (43) we have that E[Rk2] ≤ 2R02 for all k = 0, 1, . . . , T − 1. Therefore,
+
+T −1
+
+E[RT2 ]
+
+≤
+
+R02
+
++
+
+2γ2G2T
+
+K
+
+2−α α
+
++ 2γG
+
+1
+C2K α
+
+E
+
+[R
+
+2 l
+
+]
+
+E
+
+[1
+
+l
+
+,v
+
+]
+
+l=0
+
+T −1
+
++2γ
+
+2
+
+C2
+
+G2
+
+K
+
+2 α
+
+E[1l,v ]
+
+l=0
+
+≤
+
+R02
+
++
+
+2γ2G2T
+
+K
+
+2−α α
+
++ 2γGR0
+
+T −1
+1
+2C2K α
+
+E [1l,v]
+
+l=0
+
+T −1
+
++2γ
+
+2
+
+C2
+
+G2
+
+K
+
+2 α
+
+E[1l,v ]
+
+l=0
+
+52
+
+If a Byzantine peer deviates from the protocol at iteration k, it will be detected with some probability pk during the next iteration. One can lower bound this probability as
+
+pk ≥ m · |Gk| · 1 = m(1 − δk) ≥ m .
+
+nk nk
+
+nk
+
+n
+
+That is, each individual Byzantine worker can violate the protocol no more than 1/p times on average.
+
+However, even one Byzantine peer can create a shift of the order ∆kmax at each part of the resulting vector. Therefore, all Byzantine peers can violate the protocol no more than b/p times on average
+
+implying that
+
+2−α
+
+√
+
+1
+
+2γGR 2C K α nb
+
+2γ2C
+
+G2
+
+K
+
+2 α
+
+nb
+
+[RT2 ] ≤ R02 + 2γ2G2T K α +
+
+0
+
+2
+
++
+
+2
+
+.
+
+E
+
+m
+
+m
+
+Taking
+
+γ = min
+
+√ R0 1 , √ mR0 1 6GK α 12 2C2GnbK α
+
+we ensure that
+
+2−α
+
+√
+
+1
+
+2γGR 2C K α nb
+
+2γ2C
+
+G2
+
+K
+
+2 α
+
+nb
+
+R2 R2 R2
+
+2γ2G2T K α +
+
+0
+
+2
+
+m
+
++
+
+2
+
+m
+
+≤ 30 + 30 + 30 = R02
+
+and, as a result, we get E[RT2 ] ≤ 2R02. Therefore, (69) holds for all k = 0, 1, . . . , K. Together with (67) it implies
+
+E f (xK ) − f (x∗) ≤ R02 . γK
+
+Next, from our stepsize rule (64) it follows that
+
+meaning that after
+
+E f (xK ) − f (x∗) = O
+
+G1R−0α + nbG1R−0α
+
+Kα
+
+mK α
+
+K =O
+
+α
+
+α
+
+GR0 α−1 + nbGR0 α−1
+
+ε
+
+mε
+
+iterations BTARD-CLIPPED-SGD guarantees E[f (xK ) − f (x∗)] ≤ ε.
+
+That is, when the number of attacking Byzantines is unknown the complexity bound becomes (nb/m)α/(α−1) times worse in comparison to (60).
+
+E.4.3 STRONGLY CONVEX CASE: RESTARTED-BTARD-CLIPPED-SGD
+In this section, we provide the complete statements and the full proofs of the convergence results for the restarted version of BTARD-CLIPPED-SGD (RESTARTED-BTARD-CLIPPED-SGD, Alg. 7) when the objective function f is smooth and strongly convex.
+
+Algorithm 9 RESTARTED-BTARD-CLIPPED-SGD
+Input: x0 – starting point, r – number of restarts, {γt}rt=1 – stepsizes for BTARD-CLIPPED-SGD, {Kt}rt=1 – number of iterations for BTARD-CLIPPED-SGD, {si,k,t}in,,kK,t−=10,,r0,1 – seeds for batches computations, {λk,t}Kk,tt=,r0,1 – gradient clipping parameters
+1: x0 = x0
+2: for t = 1, 2, . . . , r do 3: Run BTARD-CLIPPED-SGD (Alg. 8) for Kt iterations with stepsize γt, starting point xt−1,
+gradient clipping parameters {λk,t}Kk=−01, and seeds for batches computations {si,k,t}ni,,kK=−0,10.
+Kt
+Deﬁne xt as xt = K1t xk,t, where x0,t, x1,t, . . . , xKt,t are the iterates produced by BTARD-
+k=0
+CLIPPED-SGD. Output: xr
+
+We start with the case when the number of attacking Byzantine workers is known at each iteration. 53
+
+Theorem E.10. Let As. E.1 hold, Q is bounded, f be µ-strongly convex (see Def. E.2), x∗ be some optimum of f , and ∇f (x∗) = 0. Moreover, assume that b ≤ 0.15(n − m), m ≤ (n−2b)/2, and the
+exact number of attacking Byzantine peers is known to all good peers at each iteration. Next, assume
+that
+
+
+
+
+
+
+
+R0
+
+γ = min √
+
+1,
+
+
+
+6
+
+·
+
+2
+
+t 2
+
+GKtα
+
+12
+
+·
+
+2
+
+t 2
+
+Gn
+
+
+ Kt = max
+
+
+√
+
+t
+
+2 6G · 2 2
+
+µR0
+
+α α−1
+,
+
+mR0
+4−α
+
+ ,
+2
+
+10δ(C1Kt 2α + C2Ktα ) 
+
+∆km,atx = 2λk,t =
+
+24Gn
+
+10δ(C1
+
++
+
+C2)2
+
+t 2
+
+mµR0
+
+α  α−1
+,
+
+
+1
+λt = GKtα ,
+
+2λt , ntk − m
+(70)
+(71)
+
+µR02
+
+r = log2 ε − 1,
+
+(72)
+
+where R0 ≥ x0 − x∗ and ∆km,atx is the parameter for veriﬁcation 3 at iteration k of BTARDCLIPPED-SGD, ntk is the total number of workers at iteration k of t-th restart. Then, we have E[f (xr) − f (x∗)] ≤ ε after r restarts of BTARD-CLIPPED-SGD and the total number of executed iterations of BTARD-CLIPPED-SGD is
+
+r
+
+ G2
+
+2(αα−1 )
+
+√ nδ
+
+α α−1
+
+ α G2 2(α−1)
+
+Kt = O  µε
+
++ m
+
+ µε
+
+t=1
+
+(73)
+
+Proof. Theorem E.8 implies that BTARD-CLIPPED-SGD with
+
+
+
+ R0
+
+γ = min √
+
+1,
+
+ 6GK α 12Gn
+
+
+
+mR0
+
+
+
+4−α
+10δ(C1K 2α
+
++
+
+C2K
+
+2 α
+
+)
+
+
+
+guarantees
+
+E f (xK ) − f (x∗) ≤ R02 γK
+
+after K iterations. Therefore, after the ﬁrst restart we have
+
+E[f (x1) − f (x∗)] ≤ R02 ≤ µR02 .
+
+γ1K1
+
+4
+
+From µ-strong convexity of f and ∇f (x∗) = 0 we have
+
+µ x1 − x∗ 2 ≤ f (x1) − f (x∗) =⇒ E[ x1 − x∗ 2] ≤ R02 .
+
+2
+
+2
+
+Next, assume that we have E[f (xt) − f (x∗)] ≤ 2µtR+021 , E[ xt − x∗ 2] ≤ R2t02 for some t ≤ r − 1. Then, Theorem E.8 implies that
+
+E[f (xt+1) − f (x∗) | xt] ≤ xt − x∗ 2 . γtKt
+
+Taking the full expectation from the both sides of previous inequality we get
+
+t+1
+
+∗ E[ xt − x∗ 2]
+
+R02
+
+µR02
+
+E[f (x ) − f (x )] ≤
+
+γtKt
+
+≤ 2tγtKt ≤ 2t+2 .
+
+From µ-strong convexity of f and ∇f (x∗) = 0 we have
+
+µ t+1 ∗ 2
+
+t+1
+
+∗
+
+t+1
+
+∗2
+
+R02
+
+x 2
+
+−x
+
+≤ f (x ) − f (x ) =⇒ E[ x
+
+− x ] ≤ 2t+1 .
+
+Therefore, by mathematical induction we have that for all t = 1, . . . , r
+
+t
+
+∗
+
+µR02
+
+t
+
+∗2
+
+R02
+
+E[f (x ) − f (x )] ≤ 2t+1 , E x − x ≤ 2t .
+
+54
+
+Then, after r = log2 µRε 02 − 1 restarts of BTARD-CLIPPED-SGD we have E[f (xr) − f (x∗)] ≤ ε. The total number of iterations executed by BTARD-CLIPPED-SGD is
+
+r
+Kt
+t=1
+
+
+
+
+
+r
+
+
+
+G
+
+·
+
+2
+
+t 2
+
+= O  max
+
+t=1  µR0
+
+α α−1
+,
+
+√t Gn δ2 2
+mµR0
+
+α   α−1
+
+
+
+ α
+
+√
+
+α
+
+
+
+ G α−1
+
+rα
+
+Gn δ α−1
+
+rα 
+
+= O max
+
+· 2 2(α−1) ,
+
+· 2 2(α−1) 
+
+ µR0
+
+mµR0
+
+
+
+ α
+
+α
+
+√
+
+α
+
+α 
+
+ G α−1
+
+µR02 2(α−1)
+
+Gn δ α−1
+
+µR02 2(α−1) 
+
+= O max
+
+·
+
+,
+
+·
+
+
+
+ µR0
+
+ε
+
+mµR0
+
+ε
+
+ G2
+
+2(αα−1 )
+
+√ nδ
+
+α α−1
+
+ α G2 2(α−1)
+
+= O
+
++
+
+.
+
+µε
+
+m
+
+µε
+
+In the strongly convex case, similar observations hold as in the convex case. Next, we derive the result without assuming that bk is known to all peers at each iteration.
+Theorem E.11. Let As. E.1 hold, Q is bounded, f be µ-strongly convex (see Def. E.2), x∗ be some optimum of f , and ∇f (x∗) = 0. Moreover, assume that b ≤ 0.15(n − m), m ≤ (n−2b)/2, and δ = 0 is used to compute clipping parameter τl for CenteredClip. Next, assume that
+
+γ = min √ R0 1 ,
+
+mR0 √
+
+1 , ∆km,atx = 2λk,t = 2λt , (74)
+
+6
+
+·
+
+2
+
+t 2
+
+GKtα
+
+12
+
+·
+
+2
+
+t 2
+
+Gnb
+
+2C2Ktα
+
+ntk − m
+
+√
+
+α t α−1
+
+√
+
+α
+t α−1
+
+ 2 6G · 2 2
+
+24Gnb 2C22 2
+
+
+
+1
+
+Kt = max µR0
+
+, mµR0
+
+, λt = GKtα ,
+
+(75)
+
+
+
+
+
+µR02
+
+r = log2 ε − 1,
+
+(76)
+
+where R0 ≥ x0 − x∗ and ∆km,atx is the parameter for veriﬁcation 3 at iteration k of BTARDCLIPPED-SGD, ntk is the total number of workers at iteration k of t-th restart. Then, we have E[f (xr) − f (x∗)] ≤ ε after r restarts of BTARD-CLIPPED-SGD and the total number of executed iterations of BTARD-CLIPPED-SGD is
+
+r
+Kt = O
+t=1
+
+G2 2(αα−1 ) +
+µε
+
+α
+nb α−1
+m
+
+G2
+
+α 2(α−1)
+
+µε
+
+(77)
+
+Proof. Theorem E.9 implies that BTARD-CLIPPED-SGD with
+
+γ = min
+
+√ R0 1 , √ mR0 1 6GK α 12 2C2GnbK α
+
+guarantees
+
+E f (xK ) − f (x∗) ≤ R02 γK
+
+after K iterations. Therefore, after the ﬁrst restart we have
+
+E[f (x1) − f (x∗)] ≤ R02 ≤ µR02 .
+
+γ1K1
+
+4
+
+From µ-strong convexity of f and ∇f (x∗) = 0 we have
+
+µ x1 − x∗ 2 ≤ f (x1) − f (x∗) =⇒ E[ x1 − x∗ 2] ≤ R02 .
+
+2
+
+2
+
+55
+
+Next, assume that we have E[f (xt) − f (x∗)] ≤ 2µtR+021 , E[ xt − x∗ 2] ≤ R2t02 for some t ≤ r − 1. Then, Theorem E.9 implies that
+
+E[f (xt+1) − f (x∗) | xt] ≤ xt − x∗ 2 . γtKt
+
+Taking the full expectation from the both sides of previous inequality we get
+
+t+1
+
+∗ E[ xt − x∗ 2]
+
+R02
+
+µR02
+
+E[f (x ) − f (x )] ≤
+
+γtKt
+
+≤ 2tγtKt ≤ 2t+2 .
+
+From µ-strong convexity of f and ∇f (x∗) = 0 we have
+
+µ t+1 ∗ 2
+
+t+1
+
+∗
+
+t+1
+
+∗2
+
+R02
+
+x 2
+
+−x
+
+≤ f (x ) − f (x ) =⇒ E[ x
+
+− x ] ≤ 2t+1 .
+
+Therefore, by mathematical induction we have that for all t = 1, . . . , r
+
+t
+
+∗
+
+µR02
+
+t
+
+∗2
+
+R02
+
+E[f (x ) − f (x )] ≤ 2t+1 , E x − x ≤ 2t .
+
+Then, after r = log2 µRε 02 − 1 restarts of BTARD-CLIPPED-SGD we have E[f (xr) − f (x∗)] ≤ ε. The total number of iterations executed by BTARD-CLIPPED-SGD is
+
+r
+Kt
+t=1
+
+
+
+
+
+r
+
+
+
+G
+
+·
+
+2
+
+t 2
+
+= O  max
+
+t=1  µR0
+
+α α−1
+,
+
+√t Gn δ2 2
+mµR0
+
+α   α−1
+
+
+
+= O max
+
+G µR0
+
+α
+
+· 2 , α−1
+
+rα 2(α−1)
+
+Gnb mµR0
+
+α
+
+· 2 α−1
+
+rα 2(α−1)
+
+= O max
+
+G µR0
+
+α α−1
+·
+
+µR02 ε
+
+α 2(α−1)
+,
+
+Gnb mµR0
+
+α α−1
+·
+
+µR02 ε
+
+α 2(α−1)
+
+=O
+
+G2 2(αα−1 )
+
+α
+nb α−1
+
+G2
+
+α 2(α−1)
+
++
+
+.
+
+µε
+
+m
+
+µε
+
+56
+
+F REPUTATION SYSTEM FOR PUBLIC COLLABORATIONS
+In this section, we address Byzantine-tolerant training in a setup where new participants can join or leave collaboration midway through training. This requirement arises naturally if a given training run relies on volunteers or an open pool of paid participants (Kijsipongse et al., 2018; Ryabinin & Gusev, 2020; Atre et al., 2021; Diskin et al., 2021). In addition to all existing concerns from Section 3, this new setup allows Byzantine attackers to assume new identity each time they are blocked. Further yet, Byzantine participants can simultaneously use multiple identities in order to obtain majority in the voting procedure, which is known as Sybil attacks (Douceur, 2002; Trifa & Khemakhem, 2014; Wang & Kangasharju, 2012).
+In this analysis9, we consider a training run where Byzantine peers collectively possess δ < δmax of all compute resources (we explore the role of δmax < 1/2 later in this section). Intuitively, one can think of this setting as distributed training with n identical computers, δ · n of which are controlled by Byzantines. The “Byzantine GPUs” can be allocated between an arbitrary number of identities. For instance, one accelerator can run full BTARD-SGD protocol for one peer or drop some of the computation and use the freed “compute cycles” to run computation for another participant. Theoretically, a device can run computation for an arbitrarily large number of peers, as long as it actually computes as many gradients as one benign participant does in the same time-frame.
+To protect against this new attack type, we augment BTARD-SGD with a reputation system designed to limit the impact of pseudonymous identities with the actual underlying compute. We base this system on the following three assumptions:
+1. Unique and optimal computations: the gradients computed by peer i at step k cannot be circumvented or reused from other peers and/or previous steps.
+2. Public key infrastructure: peers have unique public/private key pairs and know each other’s public keys.
+3. Cryptographic hash: peers have access to a hash function such that ﬁnding a vector x satisfying hash(x) = y is infeasible for δ · n compute over the entire training duration.
+We associate each participant with a public record that is used to verify that peer’s legitimacy. These records can be securely stored in a Distributed Hash Table (see Appendix G). When a new peer joins the network, it begins with an empty record and is therefore “untrusted”. Untrusted peers compute gradients normally, but cannot aggregate vectors from others and cannot serve as validators. More importantly, other peers exclude untrusted gradients from aggregation, using them only for the purpose of validating those peers.
+Each time a peer computes gradients gik over publicly known batch ξik, it must write hash(gik) to its own public record and sign it with its private key. As in the original BTARD-SGD, some of those entries will be validated by other peers chosen by MPRNG. In turn, the chosen validators will either approve their entry or invoke ACCUSE to ban the peer.
+In order to become trusted, a given peer must report consecutive gradients until it accumulates T entries approved by (provably) random peers. Here, T is a hyperparameter that should be large enough for the training to recover from any previous attacks and make some progress before previously banned malicious peers can earn trust again. In practice, T may be chosen experimentally by observing the number of iterations it takes to improve the loss upon its pre-attack value in case of the most effective attacks, as reported in Section 4.
+While T may be application-dependent, we note that its minimal value is small in terms of the relative training time in all our experiments. T corresponding to the 10% of total training time is more than 3 times larger than the worst “recovery time” for both setups considered in Section 4, where almost a half of the peers are Byzantine. Moreover, Appendix I.1 suggests that recovery from the worst-case attack may happen even faster in case of a smaller share of Byzantines. In that setup (with ≈ 20% of peers being Byzantine), T corresponding to the 1% of training time is already enough.
+Once a peer becomes trusted, it must continue reporting gradient hashes to maintain trust. Even a single missing or invalidated hash breaks the chain and results in the corresponding peer being
+9Note that we only provide rigorous convergence guarantees for the case of the Byzantine attacks. However, a heuristic described in this section helps with resisting the Sybil attacks in practice.
+57
+
+banned. To maintain this invariant, peers chosen as a validators add the recalculated hashes into their own record instead of the skipped iteration.
+To protect against dilution attacks, a cooperative training run can simultaneously consider at most as many “untrusted” peers as there are trusted ones: all subsequent peers wait in a queue until one of the untrusted peers becomes either trusted or banned.
+
+Analysis. Under this formalism, a Sybil attacker will attempt to maximize the number of trusted identities it can control with a limited amount of compute. In the simplest case, an attacker has exactly one GPU that can be used to either run all computations for identity or partial computation for multiple identities.
+In the latter case, an attacker can honestly compute gradients for identity A with probability p ∈ [0, 1] and for identity B with probability 1 − p. To breaking the chain, the identity that does not compute gradients at a given step can report arbitrary (e.g. random) entries instead of hash(gik).
+Consider the expected number of “trusted” identities after enough steps for T validations by honest validators (on average, T · k·(1n−δ) steps). Identity A becomes trusted with probability pT , otherwise it is banned. Similarly, identitiy B survives with probability (1 − p)T . Thus, the expected number of trusted identities after T steps is pT + (1 − p)T .
+For T > 1, this expectation is maximal iff p ∈ {0, 1}. Thus, if a peer needs more than one validation to become trusted, the “optimal strategy” for a Sybil attacker is to fully support one identity instead of spreading the resources between multiple ones. This observation can be generalized for distributing δ · n over an m ≥ δ · n pseudonymous identities, where maximizing the expected number of trusted identities requires fully supporting any δ · n identities and disregarding the rest (for T > 1, as before).
+
+Overhead computation. When training without Byzantine participants, this modiﬁed version of BTARD-SGD requires, on average, T · nk additional gradient computations per participant at the very beginning. However, once all peers become trusted, the algorithm computes exactly the same number of gradients as regular BTARD-SGD, effectively training at n−nk efﬁciency of AR-SGD, plus the same communication overhead.
+
+Remark 1: Temporary majority. Despite the fact that spreading 1 “compute unit” across multiple identities reduces the expected number of trusted identities, it may still be useful to establish a temporary majority, albeit with a small probability. For instance, splitting one compute unit evenly among m identities (each with p=1/m) may result in both m identities temporarily gaining trust with probability:
+
+m1
+
+P (peer1 ∧ · · · ∧ peerm) = mT = m−T m
+
+(78)
+
+i=1
+
+A Sybil attacker can simply repeat this procedure on every step until it can establish a temporary majority and use this majority to harm training (e.g. ban non-malicious peers). A natural way to remedy this is to increase T to such an extent that (78) becomes negligibly small.
+
+Remark 2: Extra compute for Byzantine nodes. Unlike benign peers, Byzantine attackers do not need to honestly validate each other. When a Byzantine peer is chosen as validator, it can approve its target without actually computing the gradients. In turn, the freed compute resources can be used to support additional Byzantine identities.
+
+Thus, if a given training run has n trusted peers and chooses k validators on each step, Sybil attackers
+
+can control slightly more than δ · n of all identities by using the free compute cycles from validation
+
+to support additional peers. Thus, the proposed reputation system requires that the total computational
+
+power
+
+Bmax
+
+available
+
+to
+
+Byzantines
+
+is
+
+less
+
+than
+
+1 2
+
+by
+
+a
+
+(typically
+
+small)
+
+margin
+
+that
+
+depends
+
+on
+
+n,
+
+k, and T .
+
+Remark 3: Perpetual attacks. When training in open collaborations, one cannot ban the Byzantine peers entirely: a Byzantine attacker will always be able to assume a new identity at the cost of running
+
+58
+
+honestly for T · k·(1n−δ) gradient steps. Thus, unlike in Appendix E, we cannot make BTARD-SGD unbiased by increasing τ . However, as we demonstrated in Section 4, the biased variant of BTARDSGD with constant τ can still train real-world deep learning models with the same or virtually the same learning curves as regular SGD.
+G SECURE DISTRIBUTED HASH TABLES
+Distributed Hash Tables (DHT) are protocols that establish a decentralized key-value storage over decentralized unreliable participants (Maymounkov & Mazieres, 2002; Balakrishnan et al., 2003; Zhao et al., 2003; Rowstron & Druschel, 2001). To determine which DHT peers are responsible for a given key-value pair, each participant samples a unique binary identiﬁer (ID) sampled uniformly from the space of hash function outputs. When “storing a (key, value)” on the DHT, one ﬁnds k peers whose IDs are nearest to hash(key) and sends the data to each one of those peers. In turn, a peer that wants to read the value or a given key will also search for neighbors whose IDs are close to hash(key) and request the data from those peers. Thus, the data can be accessed as long as at least one o k chosen peers remains active, with some DHT variants introducing additional replication protocols.
+Our speciﬁc implementation is based on Kademlia (Maymounkov & Mazieres, 2002), a popular DHT variant that determines nearest neighbors based on XOR distance function or their IDs: d(x, y) = int(x ⊕ y). More importantly, Kademlia protocol organizes nodes in such a way that each individual peer only “knows” a small subset of O(log2 n) direct neighbors, however, it is possible to navigate the neighborhood graph to ﬁnd the globally nearest neighbors in O(log2 N ) network requests.
+DHT protocols were originally designed for large-scale distributed systems such as BitTorrent, IPFS and several cryptocurrencies. To maintain integrity in these applications, modern DHT protocols also employ security measures that make them resistant to Byzantine and Sybil attacks (Urdaneta et al., 2011).
+In our speciﬁc scenario, the most sensitive DHT entries are personal records that determine whether or not a given peer is trusted. We protect thee records by enforcing that every value stored in the DHT must be signed by their author’s digital signature (Rivest et al., 1978). Thus, if a malicious peer attempts to modify a record it was not supposed to, all other peers will be able to detect that and eliminate such peers from the collective.
+However, digital signature are known to be vulnerable to replay attacks: every time a non-Byzantine peer stores an given key-value pair signed with its private key, a Byzantine eavesdropper can record the signed entry and replay it in future. For ordinary DHTs, this would allow an attacker to revert any key-value pair to its previous state by replaying such pre-recorded messages.
+Our algorithm protects against replay attacks by associating each key-value pair with a third value denoted as expiration time. Given two entries for the same key, DHT nodes will now prioritize the ones with the latest expiration time and consider it valid up to that time. Furthermore, in order to store a new entry to the DHT, a peer must now sign the entire key-value-expiration tuple. Thus, if a Byzantine peer replays a pre-recorded message, it will not be able to overwrite newer DHT entries that were signed for a more recent expiration time.
+H ALBERT EXPERIMENT SETUP
+In Section 4.2, we pretrain ALBERT (Lan et al., 2019) — a self-supervised Transformer model for learning representations of language data. We deliberately choose ALBERT instead of other models like BERT (Devlin et al., 2019) due to its high communication efﬁciency, which is caused by layerwise weight sharing and embedding layer factorization. In particular, we focus on a communicationefﬁcient model, because the connection speed between the workers can become a noticeable constraint when averaging gradients of models with hundreds of millions of parameters. We train ALBERTlarge on sequences of 512 tokens from the WikiText-103 (Merity et al., 2017) dataset. The training procedure starts from a random initialization, but the subword vocabulary (Sennrich et al., 2016) is the same as created by the authors of the original ALBERT models.
+59
+
+Ours, = 10, attack at step 1000
+0.8
+
+0.94 Ours, = 10, attack at step 10000
+0.92
+
+Test accuracy
+
+0.6
+
+0.90
+
+0.4
+
+0.88
+
+0.2 0 1000 2000 3000 4000
+Ours, = 1, attack at step 1000
+0.8
+
+0.86 0.84 10000 11000 12000 13000
+0.94 Ours, = 1, attack at step 10000
+0.92
+
+Test accuracy
+
+0.6 0.4 0.2
+0
+
+No attacks
+
+0.90
+
+SRiagnndfolmippdiinregction 0.88
+
+Label flipping
+
+0.86
+
+Delayed gradients
+
+1000 2000 3000 4000 0.84 Training step
+
+10000 11000 12000 13000 Training step
+
+Figure 5: Effectiveness of attacks against BTARD-SGD for the case when 3 of 16 participants are Byzantine.
+
+This model is trained with two objectives: masked language modeling (given a sentence with several masked tokens, predict the tokens that were masked) and sentence order prediction (given two segments from the same document, determine if they were swapped). We use LAMB optimizer (You et al., 2020) with batches that contain 4,096 examples, training with a peak learning rate equal to 0,00176 and a warmup of 5,000 gradient descent steps. In addition, we use gradient clipping with a maximum norm of 1 and weight decay regularization with the weight of 0,01. We run distributed training on 16 cloud instances, each equipped with a single Tesla T4 GPU. Each training run takes 2–3 days, depending on the instance availability.
+
+I ADDITIONAL EXPERIMENTS
+I.1 EXTRA EVALUATIONS ON THE CIFAR10 CLASSIFICATION TASK
+In this section, we perform several additional experiments with BTARD-SGD used to train the ResNet-18 model to solve the CIFAR10 classiﬁcation task.
+To better explore the space of possible attack vectors, we also evaluate two alternative settings. First, we consider a situation where Byzantine peers are less numerous. For this experiment, we use the same conﬁguration as in Section 4.1, but with only 3 Byzantine peers out of 16 (just under 20%). Figure 5 demonstrates similar behavior to our original setup, but with signiﬁcantly weaker in magnitude across all attacks.
+Next, we explore a situation where Byzantine peers send incorrect gradients periodically, e.g. once per T iterations. This reduces the attack intensity, but allows them to stay undetected for longer. In this setting, we consider 7 Byzantine peers and reuse all parameters from the original setup, except for the new attack period. We consider T = 10 for both scenarios (early and late attacks). The attacks are performed at steps s + k · T, k ∈ N until the attacker is eventually banned. As expected, this setup increases the duration of each attack by a factor of T , but decreases the peak attack inﬂuence (see Figure 6).
+Finally, we evaluate the convergence and the ﬁnal test accuracy of the less computationally intensive variants of BTARD-SGD that limit the maximal number of iterations in the CenteredClip procedure
+
+60
+
+Ours, = 10, attack at step 1000
+0.8
+
+0.94 Ours, = 10, attack at step 10000
+0.92
+
+Test accuracy
+
+0.6
+
+0.90
+
+0.4
+
+0.88
+
+0.2 0 1000 2000 3000 4000
+Ours, = 1, attack at step 1000
+0.8
+
+0.86 0.84 10000 11000 12000 13000
+0.94 Ours, = 1, attack at step 10000
+0.92
+
+Test accuracy
+
+0.6 0.4 0.2
+0
+
+No attacks
+
+0.90
+
+SRiagnndfolmippdiinregction 0.88
+
+Label flipping
+
+0.86
+
+Delayed gradients
+
+1000 2000 3000 4000 0.84 Training step
+
+10000 11000 12000 13000 Training step
+
+Figure 6: Effectiveness of attacks against BTARD-SGD for the case when Byzantines send incorrect gradients once per T = 10 steps.
+
+0.8
+
+Test accuracy
+
+0.6
+
+M = 50
+
+0.4
+
+M = 10
+
+M = 5
+
+0.2
+
+M = 1
+
+0 5000 10000 15000 20000 25000 Training step
+
+Figure 7: Convergence of BTARD-SGD with τ = 1 depending on the maximal number of iterations M in the CenteredClip procedure.
+
+to M , where M varies from 1 to 50. In the setup with τ = 1, we observe that M = 50 iterations are always enough for CenteredClip to converge with = 10−6 in absence of the attacks. Figure 7 demonstrates that stopping the procedure earlier has negative effect on the ﬁnal test accuracy. The effect becomes more signiﬁcant for the smaller values of M .
+I.2 EVALUATING COMPUTATION OVERHEAD IN TERMS OF WALL TIME
+For this analysis, we consider the ALBERT-large training setup from Section 4.2. Our training “swarm” contains 16 peers with T4 GPUs and 1 GiB/s network bandwidth. On average over 1000 training steps, the full training step for this model takes up 28.56 seconds. Of this, approximately 23.96 seconds were used up for communication and the remaining 4.60 seconds were spent for gradient aggregation CENTEREDCLIP.
+Since MPRNG is running in the background, the only part of BTARD that affects the training time is Algorithm 2 (BUTTERFLYCLIP). Thus, we measure the time complexity of this algorithm with different numbers of internal iterations. During “normal” epochs where all Byzantines remained passive, the algorithm converged in 2–3 iterations for τ = 0.25 and 5–10 iterations with τ = 0.125.
+
+61
+
+Table 3: Computation overhead of BTARD in terms of wall time.
+
+No. of iterations 3 5 10 20
+
+Wall time (CPU), sec 0.362 ± 0.003 0.430 ± 0.002 0.601 ± 0.003 0.943 ± 0.002
+
+Wall time (GPU), sec 0.040 ± 0.002 0.042 ± 0.002 0.056 ± 0.005 0.085 ± 0.009
+
+We also noticed that this value has temporarily increased by 2–3 times while Byzantine peers were performing their attack.
+In Table 3, we report the average wall time of our algorithm with a different number of iterations in two hardware setups: running on a 8-core VM with 3.1Ghz Intel Xeon 6148 CPU and on a single 1080 Ti GPU. We report the average wall time and the standard deviation over 10 runs.
+Thus, even the worst case overhead (τ = 0.125, CPU) is less than the 3% of the total step time without attacks and less than the 4% when the attack is active. One important consideration here is that the overhead is constant with respect to the number of peers due to the scaling properties of All-Reduce. Thus, if we train with hundreds of peers, the 0.3–0.6 second overhead can eventually become signiﬁcant. However, it can be easily offset by moving the CENTEREDCLIP execution to GPU, which at this stage is waiting for the CENTEREDCLIP results anyway.
+
+I.3 EXPERIMENTS AT A LARGER SCALE
+In this section, we evaluate the most effective attacks against BTARD-SGD in case of a larger number of peers to ensure that our algorithm scales well.
+We still consider the ALBERT-large training setup from Section 4.2 and increase the number of peers to 64 (the largest hardware setup available to us), setting up 31 of them to be Byzantine. To balance for the increased number of peers, we divide the individual batch size of each peer by 4 and set the number of validators to be 4 as well.
+Due to the large computation costs, we only evaluate the two most effective strategies for Byzantines based on Figure 3, making only one training run for each of them. We choose the random direction attack starting at the step 1000 and the sign ﬂipping attack starting at the step 5000.
+The results are shown in the Figure 8. Similarly to our previous experiments, the Byzantine peers managed to temporarily offset the training loss. As in the case with 16 peers, the sign ﬂipping attack at the step 5000 obtains the "peak" distortion approximately 20 steps into the attack, and the random direction attack at the step 1000 has longer but less intensive effect. However, BTARD-SGD is able to quickly detect and ban the attackers, banning all 31 Byzantines in 100–150 steps and catching up with the original learning curve after approximately 150 steps (it is fair to take the original curves from Figure 3 since the aggregation results in the vanilla All-Reduce do not depend on the number of workers). We conclude that BTARD-SGD maintains its efﬁciency even at this scale.
+
+Loss
+
+Attack at step 1000 (random direction)
+
+10.0
+
+9
+
+9.9 8 7
+
+9.8
+
+6
+
+9.7
+
+5
+
+9.6
+
+4
+
+9.5
+
+3
+
+2
+
+1000 1050 1100 1150 1200 Training step
+
+Attack at step 5000 (sign flipping)
+
+5000
+
+5050
+
+5100
+
+Training step
+
+Figure 8: Effectiveness of attacks against BTARD-SGD for the case when 31 of 64 participants are Byzantine.
+
+62
+
+

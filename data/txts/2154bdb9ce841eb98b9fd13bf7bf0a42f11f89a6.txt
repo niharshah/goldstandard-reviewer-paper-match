@@ -1,0 +1,6003 @@
+Moshpit SGD: Communication-Efﬁcient Decentralized Training
+on Heterogeneous Unreliable Devices
+
+arXiv:2103.03239v4 [cs.LG] 11 Jan 2022
+
+Max Ryabinin∗ Yandex, Russia HSE University, Russia
+
+Eduard Gorbunov∗ MIPT, Russia
+HSE University, Russia Yandex, Russia
+
+Vsevolod Plokhotnyuk Yandex, Russia
+HSE University, Russia
+
+Gennady Pekhimenko University of Toronto, Canada
+Vector Institute, Canada
+
+Abstract
+Training deep neural networks on large datasets can often be accelerated by using multiple compute nodes. This approach, known as distributed training, can utilize hundreds of computers via specialized message-passing protocols such as Ring All-Reduce. However, running these protocols at scale requires reliable high-speed networking that is only available in dedicated clusters. In contrast, many realworld applications, such as federated learning and cloud-based distributed training, operate on unreliable devices with unstable network bandwidth. As a result, these applications are restricted to using parameter servers or gossip-based averaging protocols. In this work, we lift that restriction by proposing Moshpit All-Reduce — an iterative averaging protocol that exponentially converges to the global average. We demonstrate the efﬁciency of our protocol for distributed optimization with strong theoretical guarantees. The experiments show 1.3x speedup for ResNet-50 training on ImageNet compared to competitive gossip-based strategies and 1.5x speedup when training ALBERT-large on preemptible compute nodes.
+1 Introduction
+Many recent inﬂuential discoveries in deep learning were enabled by the trend of scaling model and dataset size. Over the last decade, computer vision has grown from training models with 60 million parameters [1] on 1.3 million images [2] to 15 times more parameters [3] and 200 times more training data [4]. In natural language processing, the state-of-the-art language models [5] with 175 billion parameters are trained on over 570GB of texts, and even this does not saturate the model quality [6]. Training these large models can take years even with a top-of-the-line GPU server [7]. As a result, researchers and practitioners often have to run distributed training with multiple machines [8].
+The dominant approach to distributed deep learning is data-parallel training [9], where each worker processes a fraction of the training batch and then exchanges its gradients with peers. If done naïvely, the gradient exchange step can overload the network as the number of workers increases. To combat this issue, modern distributed training algorithms take advantage of communication-efﬁcient protocols, such as all-reduce [10]. These protocols allow workers to collectively compute the global average gradient with a constant communication overhead, regardless of the total number of peers.
+∗Equal contribution. Correspondence to mryabinin0@gmail.com.
+35th Conference on Neural Information Processing Systems (NeurIPS 2021).
+
+However, this efﬁciency makes the protocols more fragile: if any single participant fails or takes too long to process its batch, all other nodes are stalled. Therefore, scaling all-reduce protocols beyond a couple of servers requires specialized infrastructure with dedicated ultra-high bandwidth networking [8]. This kind of infrastructure is notoriously expensive compared to regular GPU servers or preemptible cloud VMs (see Appendix A for details).
+Hence, it is tempting to consider distributed training on cheap unreliable instances as a cost-efﬁcient alternative. A similar scenario arises in federated learning [11], where a single model is trained on heterogeneous devices due to privacy concerns. In both scenarios, workers use a shared network, where both latency and bandwidth can vary drastically due to interference from other users [12]. Furthermore, compute nodes are also subject to failure (or preemption) caused by factors beyond the protocol’s control.
+Running large-scale distributed training in these circumstances requires fault- and latency-tolerant algorithms [14, 15]. Most of these algorithms replace all-reduce averaging with gossip: each participant periodically downloads the latest parameters from their neighbors in a sparsely connected communication graph and averages the results. The updates gradually propagate through the graph over multiple rounds of averaging. However, the communication required to perform gossip grows linearly with the number of neighbors. Hence, when scaling to hundreds of peers, decentralized SGD has to keep the communication graph sparse, slowing down the convergence.
+In this work, we propose an alternative approach. Instead of relying on a predeﬁned communication graph, participants dynamically organize themselves into groups using a fully decentralized matchmaking algorithm called Moshpit All-Reduce. This strategy allows us to use communicationefﬁcient all-reduce protocols that signiﬁcantly reduce the network load compared to gossip-based averaging, while still being able to operate in unreliable hardware and network conditions.
+Our contributions can be summarized as follows:
+• We propose Moshpit All-Reduce — a novel decentralized averaging protocol for large-scale training with unreliable communication-constrained devices. According to our analysis, this method has exponential convergence rate independent of network topology and size.
+• Armed with this averaging protocol, we develop Moshpit SGD for distributed optimization. We derive convergence rates for this algorithm and establish its equivalence to Centralized (Local) SGD in terms of iteration complexity under realistic assumptions.
+• Our experiments demonstrate that Moshpit All-Reduce is signiﬁcantly more efﬁcient under network latency in realistic conditions. In particular, we train ResNet-50 on ImageNet to 75% accuracy 1.3 times faster than existing decentralized training algorithms and pretrain ALBERT-large 1.5 times faster on preemptible cloud VMs.2
+2 Related Work
+2.1 Data parallel training
+The most popular way to accelerate neural network training with multiple devices is data-parallel training [9, 16, 17]. On each optimization step, this strategy splits the training batch among participants. Each participant then runs forward and backward passes to obtain gradients of the objective function on their part of the training batch. After that, we can aggregate the gradients from workers and perform an optimization step. There are two main strategies for this aggregation.
+Historically, the ﬁrst solution to gradient aggregation was to use Parameter Server (PS) [18]: a separate process or a dedicated server that keeps track of model parameters and optimizer statistics. After each round, the PS accumulates the gradients from each worker and updates the model parameters using SGD or any other optimizer, such as Adam [19]. Finally, the server distributes the updated model parameters to workers.
+This strategy is robust and easy to implement, but it requires the server to regularly download full model gradients from every single worker. As a result, the parameter server can quickly become a bottleneck for large-scale training [20]. Since the original PS, researchers have proposed several modiﬁcations that reduce the communication load: accumulating multiple batches [22], compression [23, 24], server sharding [25, 26]. A more detailed overview is given in Appendix B.
+2Implementation and code of experiments are at github.com/yandex-research/moshpit-sgd.
+2
+
+In turn, many practical distributed training systems have instead switched to averaging with All-
+Reduce [16, 27, 28, 17]. This name refers to a collection of protocols originally developed for HPC applications. Workers can follow these protocols to collectively compute the average3 gradient more
+efﬁciently than with a central server.
+
+2.2 Communication-efﬁcient All-Reduce
+There are several all-reduce protocols optimized for different network topologies. The simplest one is known as Butterﬂy All-Reduce [10]. Each of N participants splits its local vector into N chunks. Then, i-th worker aggregates i-th chunk of data from all peers and sends back the averaged chunk.
+
+Worker 1 Worker 2 Worker 3
+
+x Split a1
+
+1
+
+b1
+
+c1
+
+x a2
+
+2
+
+b2
+
+c2
+
+x a3
+
+3
+
+b3
+
+c3
+
+Scatter
+
+Σ Reduce
+
+All-Gather
+
+aavg
+
+c aavg
+
+bavg
+
+avg
+
+aavg
+
+Σ c bavg
+
+bavg
+
+avg
+
+Σ aavg
+
+cavg
+
+bavg
+
+cavg
+
+Figure 1: A schematic illustration of Butterﬂy All-Reduce.
+
+As long as the vector size s is greater than N , this protocol uses O s × NN−1 total bandwidth on each worker. However, it requires all-to-all communication, which is not always practical for the HPC infrastructure due to network contention [10]. As a result, real-world systems typically use Ring or Tree All-Reduce, where each worker only communicates with a small subset of its peers.
+These protocols enable highly efﬁcient and scalable averaging with O(1) or O(log N ) total communication per worker, but they also share a common drawback: they cannot tolerate node failures or network instability. If any single participant fails to execute its part or takes long to respond, this paralyzes all other workers.
+
+2.3 Distributed training in unstable conditions
+Some distributed training applications must deal with unstable network bandwidth and/or unreliable workers. This issue is most prevalent in federated learning [11, 29, 30]. When dealing with privacysensitive data distributed across multiple actors, such as hospital servers [31, 32] or mobile phones [33, 34], one must train the model using whichever hardware and network available to those actors.
+Another important motivational factor is cost: HPC-grade infrastructure can be prohibitively expensive, pushing researchers and practitioners towards commodity servers or preemptible cloud VMs that are signiﬁcantly cheaper (see Appendix A). Another solution is to use volunteer computing [35, 36] with abundant, but even less reliable, compute resources.
+Training under these conditions requires specialized strategies. At a small scale, one can deploy one or a few reliable parameter servers to aggregate the updates from workers. This strategy can tolerate individual node failures [37], but scales poorly due to the reasons discussed in Section 2.1.
+
+2.4 Decentralized training
+If there are too many participants for PS, it can be advantageous to use decentralized SGD via gossip-based averaging [38, 39, 14]. In this scenario, participants form a sparse graph: each worker periodically downloads parameters from its neighbors and mixes them with local parameters.
+In essence, gossip-based averaging removes the communication bottlenecks of PS at the cost of using different local parameters on each peer. That said, gossip-based optimization algorithms can match, and sometimes even outperform, their centralized counterparts in terms of training speed [40, 41, 42, 14, 43]. However, the convergence properties of gossip averaging and gossipbased optimization methods signiﬁcantly depend on the communication graph through the spectral properties of the mixing matrix [44, 42] or the Laplacian matrix of the network [45, 46].
+3All-Reduce works with any commutative associative operation, such as min, max, or product.
+
+3
+
+Consequently, as the number of peers increases, gossip-based averaging has to either increase the number of neighbors (hence more communication) or accept slower convergence speed. Because of this, gossip is less communication-efﬁcient than all-reduce algorithms reviewed in Section 2.2. However, gossip-based algorithms are more robust to changes, which makes them applicable to time-varying networks [47, 48, 49, 50] and federated learning [51, 52, 53].
+
+3 Moshpit SGD
+Large-scale training with unreliable participants requires a protocol that is both communicationefﬁcient and fault-tolerant. Unfortunately, existing methods have only provide one of these properties. To better address our conditions, we propose Moshpit All-Reduce — a fully decentralized averaging protocol that combines the efﬁciency of all-reduce and the fault tolerance of gossip-based averaging.
+The rest of this section is organized as follows:
+• Section 3.1 describes the protocol and proves its correctness and communication efﬁciency; • Section 3.2 provides the analysis of the protocol and proves exponential convergence rate
+for averaging and the rate matching the one of centralized Local-SGD for optimization; • Section 3.3 contains implementation details for training with heterogeneous compute nodes.
+3.1 Moshpit All-Reduce
+The core idea of Moshpit All-Reduce is that workers perform averaging in small independent groups. That way, a single failed participant would only affect his current group. In turn, the composition of each group should be chosen dynamically to converge in the least number of steps. Ideally, if there are 9 peers with local parameters θ, we can average them in 2 rounds, as demonstrated in Figure 2:
+
+Algorithm 1 Moshpit All-Reduce (for i-th peer)
+
+First round
+
+Group
+A θ1
+
+θ2
+
+θ3
+
+Group
+B
+
+θ4
+
+θ5
+
+θ6
+
+Group
+C
+
+θ7
+
+θ8
+
+θ9
+
+Second round
+
+θA
+
+θA
+
+θA
+
+Average θ
+
+in groups θ
+
+θ
+
+θ
+
+B
+
+B
+
+B
+
+θC
+
+θC
+
+θC
+
+Figure 2: Example averaging order for 9 peers in 2 rounds. On each round, peers are split into 3 groups that run All-Reduce in parallel.
+
+Input: parameters {θj}Nj=1, number of peers N , d, M , number of iterations T , peer index i θi0 := θi Ci0 := get_initial_index(i) for t ∈ 1 . . . T do
+DHT[Cit−1, t].add(addressi) Matchmaking() // wait for peers to assemble
+peerst := DHT.get([Cit−1, t]) θit, cti := AllReduce(θit−1, peerst) Cit := (Cit−1[1:], cti) // same as eq. (1) end for
+Return θiT
+
+To achieve this in a decentralized system, we use Distributed Hash Tables (DHT) — a decentralized key-value storage; Appendix B contains its more detailed description. On each averaging round:
+
+• Each worker computes its group key Ci; • Workers add their network addresses to the DHT key corresponding to Ci; • Each worker can now fetch a full list of peers that have the same Ci and run All-Reduce
+with those peers.
+
+Unfortunately, the averaging structure from Figure 2 is impossible to maintain when participants are constantly joining, leaving, and failing. However, we can achieve equivalent results without global structure using a simple rule: if two peers were in the same group in round t, they must choose different groups in round t+1.
+A natural way to enforce this rule is to take advantage of the chunk indices from Butterﬂy All-Reduce (see Figure 1). Recall that each worker accumulates a unique chunk of parameters deﬁned by an index ci. By setting Ci := ci, we can guarantee that any workers that were in the same group at a round t will have different group indices in round t+1.
+
+4
+
+This averaging scheme can be generalized to more than two dimensions in order to ﬁt a larger number
+
+of peers or reduce the group size. For a d-dimensional hypercube, nodes should ﬁnd groups of peers
+
+that they have not communicated with during d−1 previous rounds. To that end, we deﬁne Ci as
+
+tuples containing chunk indices from d−1 previous rounds (t denotes the communication round):
+
+Cit := (cti−d+1, cti−d+2, . . . , cti).
+
+(1)
+
+The above intuition can be formalized with Algorithm 1. Here, N peers form a virtual d-dimensional grid with M peers per row and average their parameters θi over T rounds. DHT[·] is a shortcut for using the DHT to add or retrieve values for a given key. The Matchmaking step corresponds to the decentralized matchmaking procedure that organizes active workers with the same index into groups, described in detail in Appendix E. In turn, AllReduce denotes running all-reduce to compute the average θ in a given group. The get_initial_index function takes the peer index i and returns d−1 integers in range [0, M ) such that the size of initial groups does not exceed M . This way, the groups formed on subsequent rounds will also have at most M participants. One possible strategy is:
+
+get_initial_index(i) = i/M d−1 mod M j∈{1, ..., d} (2)
+
+If N =M d and there are no node/network failures, Algorithm 1 is equivalent to Torus All-Reduce [54], achieving the exact average after d rounds of communication (see Appendix C.1). However, our typical use case is far from this perfect scenario; for example, some groups can have less than M members. Furthermore, a peer might fail during all-reduce, causing its groupmates to skip a round of averaging. Still, Moshpit All-Reduce is applicable even in these conditions:
+
+Theorem 3.1 (Correctness). If all workers have a non-zero probability of successfully running a
+
+communication round and the order of peerst is random, then all local vectors θit converge to the
+
+global average with probability 1:
+
+∀i, θt − 1
+
+2
+θ0 −−−→ 0.
+
+(3)
+
+iN
+
+i 2 t→∞
+
+i
+
+Proof (sketch, complete in Appendix C.2). Running all-reduce with a subset of peers preserves the
+
+invariant N1
+
+i θit
+
+=
+
+1 N
+
+i θit−1 and reduces the deviation of θit from the overall average.
+
+Complexity. The matchmaking protocol is implemented over Kademlia DHT [55], meaning that each read and write operation needs at most O(log N ) requests and O(M ) bandwidth to load peerst.
+
+After the matchmaking is over, each group runs a single all-reduce round to compute the average.
+In principle, Moshpit Averaging can use any general-purpose all-reduce protocol. We opted for a
+butterﬂy-like version (Figure 1), as it is simpler than Ring All-Reduce while still being communicationefﬁcient. The communication complexity of this algorithm is O max(s, M ) × MM−1 , where s is the size of vector θ. Thus, the total time complexity of Algorithm 1 becomes:
+
+M −1
+
+O T × log2 N + M + max(s, M ) × M
+
+.
+
+(4)
+
+This compares favorably to gossip, where network load grows linearly with the number of neighbors.
+
+3.2 Convergence analysis
+
+3.2.1 Mixing properties of Moshpit Averaging
+
+As stated in the previous section, Moshpit All-Reduce computes the exact average when N = M d, which cannot be guaranteed in practice. Therefore, additional analysis is needed to establish how quickly Moshpit Averaging approximates the actual average of N vectors stored on peers.
+
+In the following theorem, we provide such analysis for a simpliﬁed version of Moshpit Averaging.
+
+One can ﬁnd the full proof in Appendix C.3.
+
+Theorem 3.2. Consider a modiﬁcation of Moshpit All-Reduce that works as follows: at each iteration
+
+k
+
+≥
+
+1,
+
+1)
+
+peers
+
+are
+
+randomly
+
+split
+
+in
+
+r
+
+disjoint
+
+groups
+
+of
+
+sizes
+
+M
+
+k 1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+M
+
+k r
+
+in
+
+such
+
+a
+
+way
+
+that
+
+r i=1
+
+Mik
+
+=
+
+N
+
+and
+
+Mik
+
+≥
+
+1
+
+for
+
+all
+
+i
+
+=
+
+1,
+
+.
+
+.
+
+.
+
+,
+
+r
+
+and
+
+2)
+
+peers
+
+from
+
+each
+
+group
+
+compute
+
+their
+
+group
+
+average
+
+via
+
+All-Reduce.
+
+Let
+
+θ1, . . . , θN
+
+be
+
+the
+
+input
+
+vectors
+
+of
+
+this
+
+procedure
+
+and
+
+θ
+
+T 1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+θ
+
+T N
+
+be
+
+the
+
+outputs after T iterations. Also, let θ = N1
+
+N i=1
+
+θi
+
+Then,
+
+1N
+
+r−1 r T 1 N
+
+EN
+
+θiT − θ 2 = N + N 2 N
+
+θi − θ 2.
+
+(5)
+
+i=1
+
+i=1
+
+5
+
+Algorithm 2 Moshpit SGD
+
+1: Input: starting point θ0, learning rate γ > 0, communication period τ ≥ 1
+
+2: for k = 0, 1, . . . do
+
+3: for each peer i ∈ Pk+1 in parallel do
+
+4:
+
+Compute the stochastic gradient gik at the current point θik
+
+5:
+
+if k + 1 mod τ = 0 then
+
+6: θik+1 = Moshpit All-Reducej∈Pk+1 (θjk − γgjk) for i-th peer (Algorithm 1)
+
+7:
+
+else
+
+8:
+
+θik+1 = θik − γgik
+
+9:
+
+end if
+
+10: end for
+
+11: end for
+
+In particular, this result implies that even if workers are randomly split into pairs at each iteration,
+the simpliﬁed version of Moshpit Averaging makes the average distortion (the left-hand side of Equation 5) less than ε in expectation after O (log(1/ε)) iterations. That is, this algorithm ﬁnds ε-accurate average on each node with the rate that does not depend on the spectral properties of the
+communication graph like gossip and its variants (see Section 2.4 and Appendix B.1). Since Moshpit
+Averaging prevents two peers from participating in the same groups during successive iterations, the actual algorithm should ﬁnd ε-accurate averages on participating peers even faster than Equation 5
+predicts. Moreover, in Appendix C.3 we explain how this result can be generalized to the case when {Mik}Ni=1 and r depends on k or even is random. In Appendix C.4, we also provide the guarantees measuring how fast Algorithm 1 reduces the variance when averaging random vectors.
+
+3.2.2 Moshpit SGD
+
+We consider a classical distributed optimization problem
+
+1N
+
+min f (θ) =
+
+fi(θ) ,
+
+(6)
+
+θ∈Rn
+
+N
+
+i=1
+
+where N is the number of workers and worker i has access only to the function fi. We propose a new algorithm called Moshpit SGD to solve this problem (see Algorithm 2). In
+this algorithm, workers perform independent local SGD steps and periodically synchronize their parameters θik with other peers using Moshpit All-Reduce. Moreover, we deﬁne the indices of participating nodes at iteration k as Pk+1 (P0 = {1, . . . , N }) allowing peers to vanish.
+
+First of all, we list the key assumptions that we use in the convergence analysis of Moshpit SGD.
+Assumption 3.1 (Bounded variance). We assume that for all k ≥ 0 and i = 1, . . . , N stochastic gradients gik satisfy E gik | θik = ∇fi(θik) and
+
+E gik − ∇fi(θik) 2 | θik ≤ σ2.
+
+(7)
+
+This assumption is classical in the stochastic optimization literature [56, 57]. We notice that our analysis can be generalized to the settings when the stochastic gradients satisfy less restrictive assumptions such as expected smoothness [58] or have more sophisticated structure similar to [59] using the theoretical framework from [60].
+
+The following assumption controls the averaging properties and the effect of the peers’ vanishing.
+Assumption 3.2 (Averaging quality & peers’ vanishing). We assume that the vanishing of peers does not change the global average of the iterates of Moshpit SGD too much, i.e., Pk+1 ⊆ Pk and |Pk| ≥ Nmin for all k ≥ 0, |Paτ | ≤ 2|Pa(τ+1)| for all non-negative integers a ≥ 0, and there exist such θ ∈ Rn and a sequence of non-negative numbers {∆kpv}k≥0 that ∀k ≥ 0
+
+E
+
+θk+1 − θk+1, θk+1 + θk+1 − 2θ
+
+≤
+
+∆
+
+k pv
+
+,
+
+f
+
+convex;
+
+(8)
+
+E ∇f (θk), θk+1 − θk+1 + L θk+1 − θk+1 2 ≤ ∆kpv, f non-convex, L-smooth, (Def. D.1) (9)
+
+where Nk = |Pk|, θk+1 = Nk1+1 i∈Pk+1 θik+1, and θk+1 = N1k i∈Pk (θik − γgik) for k ≥ 0.
+
+6
+
+Moreover, we assume that for some δaq ≥ 0 and for all non-negative integers a ≥ 0,
+
+1 E Naτ
+
+θiaτ − θaτ 2
+
+i∈Paτ
+
+≤ γ2δa2q.
+
+(10)
+
+If Pk = Pk+1 = {1, . . . , N } for all k ≥ 0, i.e., peers do not vanish, then θk = θk and properties (8, 9) hold with ∆kpv ≡ 0 for all k ≥ 0. Moreover, according to the mixing properties of Moshpit Averaging established in Theorem 3.2, inequality 10 holds after O (log (1/γ2δa2q)) iterations of Algorithm 1. Therefore, the assumption above is natural and well-motivated.
+Under these assumptions, we derive the convergence rates both for convex and non-convex problems. The full statements and complete proofs are deferred to Appendix D.
+Theorem 3.3 (Convex case). Let f1 = . . . = fN = f , function f be µ-strongly convex (Def. D.2) and L-smooth (see Def. D.1), and Assumptions 3.1 and 3.2 hold with ∆kpv = δpv,1γµE[ θk − θ∗ 2] + γ2δp2v,2 and θ = θ∗, where θ∗ ∈ argminθ∈Rn f (θ) and δpv,1 ∈ [0, 1), δpv,2 ≥ 0. Then there exists a choice of γ such that E f (θK) − f (θ∗) ≤ ε after K iterations of Moshpit SGD, where K equals
+
+L
+
+δ
+
+2 pv
+
+,2
+
++
+
+σ
+
+2/N
+
+min
+
+L
+
+((τ
+
+−
+
+1)
+
+σ
+
+2
+
++
+
+δ
+
+2 aq
+
+)
+
+O
+
++
+
++
+
+(1−δpv,1)µ (1 − δpv,1)µε
+
+(1−δpv,1)2µ2ε , µ > 0;
+
+(11)
+
+ LR2
+
+R
+
+2 0
+
+(δ
+
+2 pv
+
+,2
+
++
+
+σ
+
+/2
+Nmin
+
+)
+
+R02
+
+
+
+L((
+
+τ
+
+−
+
+1)σ
+
+2
+
++
+
+δ
+
+2 aq
+
+)
+
+O ε 0 + ε2 + ε3/2 , µ = 0, (12)
+
+where θK = 1 K 1
+
+WK
+
+Nk
+
+wkθik, wk = (1 − γµ)−(k+1), WK =
+
+k=0 i∈Pk
+
+O(·) hides constant and log(1/ε) factors.
+
+K k=0
+
+wk ,
+
+R0
+
+=
+
+θ0 − θ∗
+
+and
+
+That is, if δpv,1 ≤ 1/2, Nmin = Ω(N ), δp2v,2 = O(σ2/Nmin), and δa2q = O((τ − 1)σ2), then Moshpit SGD has the same iteration complexity as Local-SGD in the homogeneous case [61, 62]. However, the averaging steps of Moshpit SGD are much faster than those of the parameter-server architecture when the number of peers is large. Also, unlike the state-of-the-art convergence guarantees for Decentralized Local-SGD [63], our bounds do not depend on the spectral properties of the communication graph (see Appendix B.1 for the details).
+Theorem 3.4 (Non-convex case). Let f1 = . . . = fN = f , function f be L-smooth and bounded from below by f∗, and Assumptions 3.1 and 3.2 hold with ∆kpv = δpv,1γE[ ∇f (θk) 2] + Lγ2δp2v,2, δpv,1 ∈ [0, 1/2), δpv,2 ≥ 0. Then there exists such choice of γ that E ∇f (θrKand) 2 ≤ ε2 after K iterations of Moshpit SGD, where K equals
+√ O (1−2δLp∆v,01)2ε2 1+τ 1−2δpv,1 + δp2v,2+εσ22/Nmin + (1−2δpv,1)(εδa2q +(τ −1)σ2) ,
+
+∆0 = f (θ0) − f (θ∗) and θrKand is chosen uniformly from {θ0, θ1, . . . , θK−1} deﬁned in As. 3.2.
+Again, if δpv,1 ≤ 1/3, Nmin = Ω(N ), δp2v,2 = O(σ2/Nmin), and δa2q = O((τ − 1)σ2), then the above theorem recovers the state-of-the-art results in the non-convex case for Local-SGD [64, 63].
+
+3.3 Implementation details
+Training on heterogeneous unreliable hardware also poses a number of engineering challenges. The most obvious one is that the system must be able to recover from node failures. To address this challenge, we use a fully decentralized infrastructure where all information is replicated in a Distributed Hash Table; see Appendix B.5 for details. When a new worker joins midway through training, it can download the latest model parameters and metadata from any other peer (see Appendix F). Another challenge arises when devices in a group have uneven network bandwidth. In that case, we dynamically adjust the communication load of each peer to avoid being bottlenecked. More information on this procedure can be found in Appendix G.
+
+7
+
+Mean squared error
+
+4 Experiments
+
+In this section, we conduct empirical evaluation of the proposed averaging protocol and its corresponding optimization algorithm. First, we check the theoretical properties of Moshpit All-Reduce in a controlled setup (Section 4.1). Then, we compare Moshpit SGD with other distributed methods on practical tasks of image classiﬁcation and masked language model pretraining (Sections 4.2 and 4.3).
+
+4.1 Decentralized averaging
+
+In this series of experiments, we aim to empirically verify the convergence and fault tolerance properties proven in Section 3.2. To measure this in a controlled setting, we create peers with parameters that are scalar values drawn from the standard Gaussian distribution. We study the convergence of different distributed methods with respect to the number of workers N and their individual failure rate for a single iteration of averaging p (failed peers return in the next round).
+We compare Moshpit Averaging with the following algorithms from prior work: All-Reduce (with restarts in case of node failures), Gossip, PushSum (equivalent to the method described in [15]). Also, we provide the results of averaging in random groups as a simpler version of our approach. However, the implementation of group averaging maintains approximately the same group size across all iterations: this property might be hard to achieve in a decentralized setting, and as a result, the estimate of this method’s performance should be considered highly optimistic.
+We report the average squared difference between the worker parameters and the actual average of all values; the results are averaged across 100 restarts from different random initializations. We compare the convergence for 512–1024 peers and consider failure probabilities ranging from 0 to 0.01. For Moshpit Averaging and random group averaging, we use groups of size 32, which corresponds to M = 32 and d = 2 for Algorithm 1.
+
+10 1 10 5 10 9 10 13
+0
+
+N=1024, p=0
+All-Reduce Gossip PushSum Random groups Moshpit Averaging
+
+N=1024, p=0.005
+All-Reduce Gossip PushSum Random groups Moshpit Averaging
+
+N=768, p=0.005
+All-Reduce Gossip PushSum Random groups Moshpit Averaging
+
+2
+
+4
+
+6
+
+8
+
+10 0
+
+2
+
+4
+
+6
+
+8
+
+10 0
+
+2
+
+4
+
+6
+
+8
+
+10
+
+Iterations
+
+Iterations
+
+Iterations
+
+Figure 3: Convergence of averaging algorithms in different conﬁgurations.
+
+Figure 3 displays the results of experiments for several combinations of N and p; the complete results with additional grid conﬁgurations are available in Appendix I. We make several key observations:
+
+1. When the failure rate of each peer is zero, standard All-Reduce predictably computes the average faster than all other methods. However, as soon as p reaches a value of at least 0.005, the number of retries needed for the success becomes prohibitively high.
+2. Previous decentralized averaging methods, such as Gossip or PushSum, require signiﬁcantly more iterations for convergence to the global average than Moshpit All-Reduce, likely due to the structure of their communication graphs.
+3. As discussed in Section 3.1, when the total number of peers is equal to the grid capacity and there are no failures, Moshpit All-Reduce matches the result of regular All-Reduce with the number of steps equal to the number of grid dimensions (2 in this case).
+4. Averaging in random groups can perform comparably to Moshpit Averaging when the number of peers is less than half of the grid capacity. The reason for this behavior is that when the workers do not fully occupy the grid, the group sizes are no longer guaranteed to be equal across groups and across iterations. In the worst case, there can be groups of only one peer for certain grid coordinates, which may signiﬁcantly affect the convergence. However, as the grid utilization grows, Moshpit Averaging starts to outperform random group averaging. Moreover, even if we use 512 peers, arranging them in a proper 8x8x8 grid leads to faster convergence.
+
+8
+
+75% 9.8 12.8 17.118.5 26.8 75%
+
+AR-SGD, homog.
+
+10
+
+Moshpit SGD, heterog.
+
+Top-1 validation accuracy Top-1 validation accuracy
+Training loss
+
+50%
+
+AR-SGD, homog.
+
+AD-PSGD, homog.
+
+SGP, homog.
+
+25%
+
+Moshpit SGD, homog.
+
+AD-PSGD, heterog.
+
+SGP, heterog.
+
+0%
+
+Moshpit SGD, heterog.
+
+0h 4h 8h 12h 16h 20h 24h 28h 32h Time (hours)
+
+50%
+
+AR-SGD, homog.
+
+AD-PSGD, homog.
+
+SGP, homog.
+
+25%
+
+Moshpit SGD, homog.
+
+AD-PSGD, heterog.
+
+SGP, heterog.
+
+0%
+
+Moshpit SGD, heterog.
+
+0 15 30 45 60 75 90 105 120 135 150 Epochs
+
+8
+6
+4
+2 0h 30h 60h 90h 120h 150h 180h Time (hours)
+
+Figure 4: (Left, Middle) ResNet-50 top-1 validation accuracy for ImageNet as a function of training time (left) and epochs (middle). (Right) Full training objective (MLM + SOP) of ALBERT-large on BookCorpus as a function of training time.
+
+4.2 ImageNet training
+
+Here, we evaluate the performance of Moshpit SGD in distributed training. More speciﬁcally, we train ResNet-50 [65] on the ILSVRC [2] dataset, following the training protocol of [16]. Trainers use SGD with Nesterov momentum with a batch size of 256 and 32-bit precision regardless of the GPU type4. We evaluate the following training strategies:
+• All-Reduce SGD (AR-SGD) — traditional distributed training with all-reduce gradient averaging;
+• Asynchronous Decentralized Parallel SGD (AD-PSGD) — parallel SGD that runs gossip communication in a cycle: each worker averages parameters with 2 neighbors [66]. Communication rounds are overlapped with computation;
+• Stochastic Gradient Push (SGP) — a more advanced algorithm with an exponential communication graph and push-based communication [15];
+• Moshpit SGD — similar to SGP, but with 1 round of Moshpit Averaging instead of PushSum.
+
+We report top-1 validation accuracy as a function of training time in two experimental setups:
+• Homogeneous: 16 servers with a single Tesla V100-PCIe GPU, 6 CPU cores, and 64GB RAM. • Heterogeneous: a total of 81 GPUs (V100, 1080Ti, and P40) across 64 servers and workstations.5
+All servers and workstations communicate over the network with 1Gb/s Ethernet (non-dedicated symmetric bandwidth). The machines are located in two data centers and one ofﬁce within 300 km of one another. The communication latency is 1–6ms depending on the location. To simulate shared usage, at the beginning of each communication round we inject additional latency sampled from the exponential distribution [67] with the mean of 100ms.
+For Moshpit SGD, we use a two-dimensional “grid” with 4 and 8 groups for homogeneous and heterogeneous setups respectively. For AD-PSGD, we attempt to compensate for slow convergence by training for 60 more epochs without changing the learning rate schedule. Finally, we only report AR-SGD in the ﬁrst setup, as it is unsuitable for heterogeneous hardware.
+The results in Figure 4 (Left) demonstrate that the two most efﬁcient strategies for our setting are Moshpit SGD and SGP. In the homogeneous setup, Moshpit is only slightly more efﬁcient than SGP, likely due to higher efﬁciency of all-reduce. This advantage increases to over 30% for the heterogeneous setup with 64 servers. In turn, AR-SGD demonstrates the best performance per iteration, but its training time is by far the longest due to network latency (1.5× of Moshpit SGD). Finally, AD-PSGD predictably shows the best throughput (time per epoch), but achieves lower accuracy even after training for 150 epochs. We report results for smaller setups in Appendix J.
+
+4.3 Masked Language Model training
+Finally, we evaluate Moshpit All-Reduce training performance in the wild with preemptible cloud instances. For this experiment, we perform one of the most resource-demanding tasks in modern deep learning — unsupervised pretraining of Transformers [68, 69, 70, 5]. We opt for the ALBERT model [71] to make better use of communication-constrained devices. This model has fewer trainable parameters due to layer-wise weight sharing.
+4For GPUs that cannot ﬁt this into memory, we accumulate gradients over 2 batches of 128 examples. 5We provide a detailed conﬁguration in Appendix H.
+
+9
+
+Speciﬁcally, we train ALBERT-large (18M parameters) on the BookCorpus [72] dataset, following the training setup from the original paper. We minimize the masked language modeling loss (MLM) along with the sentence order prediction loss (SOP) using the LAMB optimizer [17] with a global batch size of 4096 and sequence length 512. We measure convergence in terms of full training loss [73, 74]. Similarly to Section 4.2, we use two training setups:
+• Homogeneous: a single cloud instance with 8 Tesla V100-PCIe GPUs and 56 vCPUs; • Heterogeneous: a total of 66 preemptible GPUs, 32 of which are cloud T4, and the remaining 34
+are various devices rented on a public marketplace.
+Despite the fact that the latter setup has almost 3× more raw compute6, its hourly rent costs less than the homogeneous setup due to relying on preemptible instances7. This instance type is much cheaper than regular cloud instances, but it can be interrupted at any time. As a side-effect, the participants in heterogeneous setup are also spread across 3 continents with uneven network bandwidth, ranging from 100Mb/s to 1500Mb/s per worker. These limitations make it impractical to deploy conventional all-reduce protocols. By contrast, the fully decentralized nature of Moshpit SGD allows it to operate on unreliable nodes.
+In this setup, the participants accumulate gradients over multiple local batches and use DHT to track the global batch size. Once the swarm collectively accumulates gradients over 4096 training samples, it runs 2 rounds of Moshpit All-Reduce with M =8 and d=2. Unfortunately, training with simple parameter averaging does not converge, likely due to diverging LAMB statistics. To mitigate this issue, workers recover “pseudo-gradients” [76, 77] after averaging to update the optimizer statistics.
+Figure 4 (right) demonstrates that Moshpit SGD with a fully preemptible ﬂeet of machines trains 1.5 times faster than the traditional data-parallel setup. The ﬁnal loss achieved by two training strategies is the same within the margin of error. A closer investigation reveals that this speedup is entirely explained by the reduced iteration time. An interesting observation is that the iteration time of Moshpit SGD varies between 10–22 seconds, while AR-SGD consistently spends 25s per step. This can be explained by natural variation in the preemptible ﬂeet size: there were 30–66 active participants depending on the resource availability.
+5 Conclusion and future work
+In this work, we propose Moshpit All-Reduce, a decentralized averaging protocol intended for distributed optimization in unstable and network-constrained environments. It has favorable theoretical properties when compared to gossip-based approaches and achieves considerable speedups in distributed training for image classiﬁcation and masked language modeling.
+Our approach was primarily designed for cloud-based training and federated learning, as well as for distributed training on unreliable instances; future work might explore additional settings, such as collaborative training of neural networks. Another potential research direction is to study the interactions of Moshpit All-Reduce with other methods that improve communication efﬁciency of distributed optimization, such as gradient compression. Finally, the idea of arranging All-Reduce nodes into groups can be improved to address speciﬁc issues that may arise in practice, such as the varying number of workers and their geographical distribution.
+Acknowledgements
+We would like to thank Anastasia Koloskova, Liudmila Prokhorenkova and Anton Osokin for helpful feedback and discussions. We are also grateful to the anonymous reviewers for their suggestions on improving the paper. Finally, we would like to thank Dmitry Afanasiev, Vladimir Aliev, Anand Jayarajan and Michael Solotky for their suggestions on the technical aspects of our study. This project was supported in part by the Canada Foundation for Innovation JELF grant, NSERC Discovery grant, AWS Machine Learning Research Award, and Facebook Faculty Research Award. The paper was also partially supported by by a grant for research centers in the ﬁeld of artiﬁcial intelligence, provided by the Analytical Center for the Government of the Russian Federation in accordance with the subsidy agreement (agreement identiﬁer 000000D730321P5Q0002) and the agreement with the Moscow Institute of Physics and Technology dated November 1, 2021 No. 70-2021-00138. The computational resources for the experiments were provided by the Amazon Research Awards program and Yandex.
+6Based on ofﬁcial performance benchmarks [75]. 7Please refer to Appendix H for full experimental setups.
+10
+
+References
+[1] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hinton. Imagenet classiﬁcation with deep convolutional neural networks. In F. Pereira, C. J. C. Burges, L. Bottou, and K. Q. Weinberger, editors, Advances in Neural Information Processing Systems 25, pages 1097–1105. Curran Associates, Inc., 2012.
+[2] J. Deng, W. Dong, R. Socher, L.-J. Li, K. Li, and L. Fei-Fei. ImageNet: A Large-Scale Hierarchical Image Database. In CVPR09, 2009.
+[3] Alexander Kolesnikov, Lucas Beyer, Xiaohua Zhai, Joan Puigcerver, Jessica Yung, S. Gelly, and N. Houlsby. Big transfer (bit): General visual representation learning. In ECCV, 2020.
+[4] Chen Sun, Abhinav Shrivastava, Saurabh Singh, and Abhinav Gupta. Revisiting unreasonable effectiveness of data in deep learning era. In ICCV, 2017.
+[5] Tom B Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. arXiv preprint arXiv:2005.14165, 2020.
+[6] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B. Brown, Benjamin Chess, Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language models, 2020.
+[7] Chuan Li. Demystifying gpt-3 language model: A technical overview, 2020. "https: //lambdalabs.com/blog/demystifying-gpt-3".
+[8] Peter Mattson, Christine Cheng, Cody Coleman, Greg Diamos, Paulius Micikevicius, David Patterson, Hanlin Tang, Gu-Yeon Wei, Peter Bailis, Victor Bittorf, David Brooks, Dehao Chen, Debojyoti Dutta, Udit Gupta, Kim Hazelwood, Andrew Hock, Xinyuan Huang, Bill Jia, Daniel Kang, David Kanter, Naveen Kumar, Jeffery Liao, Guokai Ma, Deepak Narayanan, Tayo Oguntebi, Gennady Pekhimenko, Lillian Pentecost, Vijay Janapa Reddi, Taylor Robie, Tom St. John, Carole-Jean Wu, Lingjie Xu, Cliff Young, and Matei Zaharia. MLPerf Training Benchmark. In Proceedings of the 3rd Conference on Machine Learning and Systems (MLSys’20), 2020.
+[9] Leslie G Valiant. A bridging model for parallel computation. Communications of the ACM, 33(8):103–111, 1990.
+[10] Pitch Patarasuk and Xin Yuan. Bandwidth optimal all-reduce algorithms for clusters of workstations. J. Parallel Distrib. Comput., 69(2):117–124, February 2009.
+[11] Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise Aguera y Arcas. Communication-efﬁcient learning of deep networks from decentralized data. In Artiﬁcial Intelligence and Statistics, pages 1273–1282, 2017.
+[12] V. Persico, P. Marchetta, A. Botta, and A. Pescape. On network throughput variability in microsoft azure cloud. In 2015 IEEE Global Communications Conference (GLOBECOM), pages 1–6, 2015.
+[13] Valerio Persico, Pietro Marchetta, Alessio Botta, and Antonio Pescapè. Measuring network throughput in the cloud: The case of amazon ec2. Computer Networks, 93:408 – 422, 2015. Cloud Networking and Communications II.
+[14] Xiangru Lian, Ce Zhang, Huan Zhang, Cho-Jui Hsieh, Wei Zhang, and Ji Liu. Can decentralized algorithms outperform centralized algorithms? a case study for decentralized parallel stochastic gradient descent. In Advances in Neural Information Processing Systems, pages 5330–5340, 2017.
+[15] Mahmoud Assran, Nicolas Loizou, Nicolas Ballas, and Mike Rabbat. Stochastic gradient push for distributed deep learning. In Kamalika Chaudhuri and Ruslan Salakhutdinov, editors, Proceedings of the 36th International Conference on Machine Learning, volume 97 of Proceedings of Machine Learning Research, pages 344–353. PMLR, 09–15 Jun 2019.
+[16] Priya Goyal, Piotr Dollár, Ross Girshick, Pieter Noordhuis, Lukasz Wesolowski, Aapo Kyrola, Andrew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch sgd: Training imagenet in 1 hour, 2017.
+[17] Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Srinadh Bhojanapalli, Xiaodan Song, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. Large batch optimization for deep learning: Training bert in 76 minutes. In International Conference on Learning Representations, 2020.
+11
+
+[18] Mu Li. Scaling distributed machine learning with the parameter server. In Proceedings of the 2014 International Conference on Big Data Science and Computing, BigDataScience ’14, New York, NY, USA, 2014. Association for Computing Machinery.
+[19] Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In 3rd International Conference on Learning Representations, ICLR 2015, 2015.
+[20] Salem Alqahtani and Murat Demirbas. Performance analysis and comparison of distributed machine learning systems, 2019.
+[21] Joost Verbraeken, Matthijs Wolting, Jonathan Katzy, Jeroen Kloppenburg, Tim Verbelen, and Jan S. Rellermeyer. A survey on distributed machine learning. ACM Comput. Surv., 53(2), March 2020.
+[22] Martin Zinkevich, Markus Weimer, Lihong Li, and Alex Smola. Parallelized stochastic gradient descent. In J. Lafferty, C. Williams, J. Shawe-Taylor, R. Zemel, and A. Culotta, editors, Advances in Neural Information Processing Systems, volume 23, pages 2595–2603. Curran Associates, Inc., 2010.
+[23] Yujun Lin, Song Han, Huizi Mao, Yu Wang, and Bill Dally. Deep gradient compression: Reducing the communication bandwidth for distributed training. In International Conference on Learning Representations, 2018.
+[24] Anastasia Koloskova, Sebastian Stich, and Martin Jaggi. Decentralized stochastic optimization and gossip algorithms with compressed communication. In Kamalika Chaudhuri and Ruslan Salakhutdinov, editors, Proceedings of the 36th International Conference on Machine Learning, volume 97 of Proceedings of Machine Learning Research, pages 3478–3487. PMLR, 09–15 Jun 2019.
+[25] Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark Mao, Marc' aurelio Ranzato, Andrew Senior, Paul Tucker, Ke Yang, Quoc Le, and Andrew Ng. Large scale distributed deep networks. In F. Pereira, C. J. C. Burges, L. Bottou, and K. Q. Weinberger, editors, Advances in Neural Information Processing Systems, volume 25, pages 1223–1231. Curran Associates, Inc., 2012.
+[26] Yimin Jiang, Yibo Zhu, Chang Lan, Bairen Yi, Yong Cui, and Chuanxiong Guo. A uniﬁed architecture for accelerating distributed DNN training in heterogeneous gpu/cpu clusters. In 14th USENIX Symposium on Operating Systems Design and Implementation (OSDI 20), pages 463–479. USENIX Association, November 2020.
+[27] Hiroaki Mikami, Hisahiro Suganuma, Pongsakorn U-chupala, Yoshiki Tanaka, and Yuichi Kageyama. Massively distributed sgd: Imagenet/resnet-50 training in a ﬂash, 2019.
+[28] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. Megatron-lm: Training multi-billion parameter language models using gpu model parallelism. arXiv preprint arXiv:1909.08053, 2019.
+[29] Aaron Segal, Antonio Marcedone, Benjamin Kreuter, Daniel Ramage, H. Brendan McMahan, Karn Seth, K. A. Bonawitz, Sarvar Patel, and Vladimir Ivanov. Practical secure aggregation for privacy-preserving machine learning. In CCS, 2017.
+[30] K. A. Bonawitz, Hubert Eichner, Wolfgang Grieskamp, Dzmitry Huba, Alex Ingerman, Vladimir Ivanov, Chloé M Kiddon, Jakub Konecˇný, Stefano Mazzocchi, Brendan McMahan, Timon Van Overveldt, David Petrou, Daniel Ramage, and Jason Roselander. Towards federated learning at scale: System design. In SysML 2019, 2019. To appear.
+[31] Micah J. Sheller, Brandon Edwards, G. Anthony Reina, Jason Martin, Sarthak Pati, Aikaterini Kotrotsou, Mikhail Milchenko, Weilin Xu, Daniel Marcus, Rivka R. Colen, and Spyridon Bakas. Federated learning in medicine: facilitating multi-institutional collaborations without sharing patient data. Scientiﬁc Reports, 10(1):12598, Jul 2020.
+[32] Wenqi Li, Fausto Milletarì, Daguang Xu, Nicola Rieke, Jonny Hancox, Wentao Zhu, Maximilian Baust, Yan Cheng, Sébastien Ourselin, M. Jorge Cardoso, and Andrew Feng. PrivacyPreserving Federated Brain Tumour Segmentation, pages 133–141. Lecture Notes in Computer Science (including subseries Lecture Notes in Artiﬁcial Intelligence and Lecture Notes in Bioinformatics). SPRINGER, January 2019. 10th International Workshop on Machine Learning in Medical Imaging, MLMI 2019 held in conjunction with the 22nd International Conference on Medical Image Computing and Computer-Assisted Intervention, MICCAI 2019 ; Conference date: 13-10-2019 Through 13-10-2019.
+12
+
+[33] Andrew Hard, Chloé M Kiddon, Daniel Ramage, Francoise Beaufays, Hubert Eichner, Kanishka Rao, Rajiv Mathews, and Sean Augenstein. Federated learning for mobile keyboard prediction, 2018.
+[34] Timothy Yang, Galen Andrew, Hubert Eichner, Haicheng Sun, Wei Li, Nicholas Kong, Daniel Ramage, and Françoise Beaufays. Applied federated learning: Improving google keyboard query suggestions, 2018.
+[35] Ekasit Kijsipongse, Apivadee Piyatumrong, and Suriya U-ruekolan. A hybrid gpu cluster and volunteer computing platform for scalable deep learning. The Journal of Supercomputing, 04 2018.
+[36] Max Ryabinin and Anton Gusev. Towards crowdsourced training of large neural networks using decentralized mixture-of-experts. In Advances in Neural Information Processing Systems, 2020.
+[37] Aaron Harlap, Alexey Tumanov, Andrew Chung, Gregory R. Ganger, and Phillip B. Gibbons. Proteus: Agile ml elasticity through tiered reliability in dynamic resource markets. In Proceedings of the Twelfth European Conference on Computer Systems, EuroSys ’17, page 589–604, New York, NY, USA, 2017. Association for Computing Machinery.
+[38] Stephen Boyd, Arpita Ghosh, Balaji Prabhakar, and Devavrat Shah. Randomized gossip algorithms. IEEE transactions on information theory, 52(6):2508–2530, 2006.
+[39] John Nikolas Tsitsiklis. Problems in decentralized decision making and computation. Technical report, Massachusetts Inst of Tech Cambridge Lab for Information and Decision Systems, 1984.
+[40] Kevin Scaman, Francis Bach, Sébastien Bubeck, Yin Tat Lee, and Laurent Massoulié. Optimal algorithms for smooth and strongly convex distributed optimization in networks. In International Conference on Machine Learning, pages 3027–3036, 2017.
+[41] Kevin Scaman, Francis Bach, Sébastien Bubeck, Laurent Massoulié, and Yin Tat Lee. Optimal algorithms for non-smooth distributed optimization in networks. In Advances in Neural Information Processing Systems, pages 2740–2749, 2018.
+[42] Kevin Scaman, Francis Bach, Sébastien Bubeck, Yin Lee, and Laurent Massoulié. Optimal convergence rates for convex distributed optimization in networks. Journal of Machine Learning Research, 20:1–31, 2019.
+[43] Mahmoud Assran, Nicolas Loizou, Nicolas Ballas, and Mike Rabbat. Stochastic gradient push for distributed deep learning. In International Conference on Machine Learning, pages 344–353. PMLR, 2019.
+[44] Lin Xiao and Stephen Boyd. Fast linear iterations for distributed averaging. Systems & Control Letters, 53(1):65–78, 2004.
+[45] Russell Merris. Laplacian matrices of graphs: a survey. Linear algebra and its applications, 197:143–176, 1994.
+[46] César A Uribe, Soomin Lee, Alexander Gasnikov, and Angelia Nedic´. A dual approach for optimal algorithms in distributed optimization over networks. Optimization Methods and Software, pages 1–40, 2020.
+[47] Angelia Nedic´ and Alex Olshevsky. Distributed optimization over time-varying directed graphs. IEEE Transactions on Automatic Control, 60(3):601–615, 2014.
+[48] Angelia Nedic´ and Alex Olshevsky. Stochastic gradient-push for strongly convex functions on time-varying directed graphs. IEEE Transactions on Automatic Control, 61(12):3936–3947, 2016.
+[49] Angelia Nedic´, Alex Olshevsky, and Michael G Rabbat. Network topology and communicationcomputation tradeoffs in decentralized optimization. Proceedings of the IEEE, 106(5):953–976, 2018.
+[50] Alexander Rogozin and Alexander Gasnikov. Projected gradient method for decentralized optimization over time-varying networks. arXiv preprint arXiv:1911.08527, 2019.
+[51] S Sundhar Ram, A Nedic´, and Venugopal V Veeravalli. Asynchronous gossip algorithms for stochastic optimization. In Proceedings of the 48h IEEE Conference on Decision and Control (CDC) held jointly with 2009 28th Chinese Control Conference, pages 3581–3586. IEEE, 2009.
+13
+
+[52] Feng Yan, Shreyas Sundaram, SVN Vishwanathan, and Yuan Qi. Distributed autonomous online learning: Regrets and intrinsic privacy-preserving properties. IEEE Transactions on Knowledge and Data Engineering, 25(11):2483–2493, 2012.
+[53] Kun Yuan, Qing Ling, and Wotao Yin. On the convergence of decentralized gradient descent. SIAM Journal on Optimization, 26(3):1835–1854, 2016.
+[54] Paul Sack and William Gropp. Collective algorithms for multiported torus networks. ACM Trans. Parallel Comput., 1(2), February 2015.
+[55] Petar Maymounkov and David Mazieres. Kademlia: A peer-to-peer information system based on the xor metric. In International Workshop on Peer-to-Peer Systems, pages 53–65. Springer, 2002.
+[56] Arkadi Nemirovski, Anatoli Juditsky, Guanghui Lan, and Alexander Shapiro. Robust stochastic approximation approach to stochastic programming. SIAM Journal on optimization, 19(4):1574–1609, 2009.
+[57] Saeed Ghadimi and Guanghui Lan. Stochastic ﬁrst-and zeroth-order methods for nonconvex stochastic programming. SIAM Journal on Optimization, 23(4):2341–2368, 2013.
+[58] Robert Mansel Gower, Nicolas Loizou, Xun Qian, Alibek Sailanbayev, Egor Shulgin, and Peter Richtárik. Sgd: General analysis and improved rates. In International Conference on Machine Learning, pages 5200–5209. PMLR, 2019.
+[59] Sai Praneeth Karimireddy, Satyen Kale, Mehryar Mohri, Sashank Reddi, Sebastian Stich, and Ananda Theertha Suresh. Scaffold: Stochastic controlled averaging for federated learning. In International Conference on Machine Learning, pages 5132–5143. PMLR, 2020.
+[60] Eduard Gorbunov, Filip Hanzely, and Peter Richtarik. Local sgd: Uniﬁed theory and new efﬁcient methods. In Arindam Banerjee and Kenji Fukumizu, editors, Proceedings of The 24th International Conference on Artiﬁcial Intelligence and Statistics, volume 130 of Proceedings of Machine Learning Research, pages 3556–3564. PMLR, 13–15 Apr 2021.
+[61] Ahmed Khaled, Konstantin Mishchenko, and Peter Richtárik. Tighter theory for local sgd on identical and heterogeneous data. In International Conference on Artiﬁcial Intelligence and Statistics, pages 4519–4529. PMLR, 2020.
+[62] Blake Woodworth, Kumar Kshitij Patel, Sebastian Stich, Zhen Dai, Brian Bullins, Brendan Mcmahan, Ohad Shamir, and Nathan Srebro. Is local sgd better than minibatch sgd? In International Conference on Machine Learning, pages 10334–10343. PMLR, 2020.
+[63] Anastasia Koloskova, Nicolas Loizou, Sadra Boreiri, Martin Jaggi, and Sebastian Stich. A uniﬁed theory of decentralized sgd with changing topology and local updates. In International Conference on Machine Learning, pages 5381–5393. PMLR, 2020.
+[64] Xiang Li, Wenhao Yang, Shusen Wang, and Zhihua Zhang. Communication efﬁcient decentralized training with multiple local updates. arXiv preprint arXiv:1910.09126, 5, 2019.
+[65] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image recognition. 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), pages 770–778, 2015.
+[66] Xiangru Lian, Wei Zhang, Ce Zhang, and Ji Liu. Asynchronous decentralized parallel stochastic gradient descent. In Jennifer Dy and Andreas Krause, editors, Proceedings of the 35th International Conference on Machine Learning, volume 80 of Proceedings of Machine Learning Research, pages 3043–3052. PMLR, 10–15 Jul 2018.
+[67] Andrei M Sukhov, MA Astrakhantseva, AK Pervitsky, SS Boldyrev, and AA Bukatov. Generating a function for network delay. Journal of High Speed Networks, 22(4):321–333, 2016.
+[68] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep bidirectional transformers for language understanding. In NAACL-HLT, 2019.
+[69] Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer, and Veselin Stoyanov. Roberta: A robustly optimized bert pretraining approach. ArXiv, abs/1907.11692, 2019.
+[70] Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language models are unsupervised multitask learners. 2019.
+14
+
+[71] Zhen-Zhong Lan, Mingda Chen, Sebastian Goodman, Kevin Gimpel, Piyush Sharma, and Radu Soricut. Albert: A lite bert for self-supervised learning of language representations. In International Conference on Learning Representations, 2020.
+[72] Yukun Zhu, Ryan Kiros, Rich Zemel, Ruslan Salakhutdinov, Raquel Urtasun, Antonio Torralba, and Sanja Fidler. Aligning books and movies: Towards story-like visual explanations by watching movies and reading books. In Proceedings of the IEEE international conference on computer vision, pages 19–27, 2015.
+[73] Jiahuang Lin, Xin Li, and Gennady Pekhimenko. Multi-node bert-pretraining: Cost-efﬁcient approach, 2020.
+[74] William Fedus, Barret Zoph, and Noam Shazeer. Switch transformers: Scaling to trillion parameter models with simple and efﬁcient sparsity, 2021.
+[75] NVIDIA. Nvidia data center deep learning product performance. "https:// developer.nvidia.com/deep-learning-performance-training-inference", accessed at 2021.02.03.
+[76] Sashank J. Reddi, Zachary Charles, Manzil Zaheer, Zachary Garrett, Keith Rush, Jakub Konecˇný, Sanjiv Kumar, and Hugh Brendan McMahan. Adaptive federated optimization. In International Conference on Learning Representations, 2021.
+[77] Xiangyi Chen, Xiaoyun Li, and Ping Li. Toward communication efﬁcient adaptive gradient method. In Proceedings of the 2020 ACM-IMS on Foundations of Data Science Conference, FODS ’20, page 119–128, New York, NY, USA, 2020. Association for Computing Machinery.
+[78] Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. Squad: 100, 000+ questions for machine comprehension of text. In EMNLP, 2016.
+[79] David Aldous and James Allen Fill. Reversible markov chains and random walks on graphs, 2002. unﬁnished monograph, recompiled 2014, 2002.
+[80] Jinming Xu, Ye Tian, Ying Sun, and Gesualdo Scutari. Distributed algorithms for composite optimization: Uniﬁed and tight convergence analysis. arXiv preprint arXiv:2002.11534, 2020.
+[81] Alireza Fallah, Mert Gurbuzbalaban, Asu Ozdaglar, Umut Simsekli, and Lingjiong Zhu. Robust distributed accelerated stochastic gradient methods for multi-agent networks. arXiv preprint arXiv:1910.08701, 2019.
+[82] Dmitry Kovalev, Adil Salim, and Peter Richtárik. Optimal and practical algorithms for smooth and strongly convex decentralized optimization. Advances in Neural Information Processing Systems, 33, 2020.
+[83] Yossi Arjevani and Ohad Shamir. Communication complexity of distributed convex learning and optimization. Advances in neural information processing systems, 28:1756–1764, 2015.
+[84] Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and its application to data-parallel distributed training of speech dnns. In Fifteenth Annual Conference of the International Speech Communication Association, 2014.
+[85] Dan Alistarh, Demjan Grubic, Jerry Z Li, Ryota Tomioka, and Milan Vojnovic. Qsgd: communication-efﬁcient sgd via gradient quantization and encoding. In Proceedings of the 31st International Conference on Neural Information Processing Systems, pages 1707–1718, 2017.
+[86] Ananda Theertha Suresh, X Yu Felix, Sanjiv Kumar, and H Brendan McMahan. Distributed mean estimation with limited communication. In International Conference on Machine Learning, pages 3329–3337. PMLR, 2017.
+[87] Ali Ramezani-Kebrya, Fartash Faghri, Ilya Markov, Vitalii Aksenov, Dan Alistarh, and Daniel M Roy. Nuqsgd: Provably communication-efﬁcient data-parallel sgd via nonuniform quantization. Journal of Machine Learning Research, 22(114):1–43, 2021.
+[88] Fartash Faghri, Iman Tabrizian, Ilia Markov, Dan Alistarh, Daniel M Roy, and Ali RamezaniKebrya. Adaptive gradient quantization for data-parallel sgd. Advances in Neural Information Processing Systems, 33:3174–3185, 2020.
+[89] Samuel Horvath, Chen-Yu Ho, Ludovit Horvath, Atal Narayan Sahu, Marco Canini, and Peter Richtarik. Natural compression for distributed deep learning. arXiv preprint arXiv:1905.10988, 2019.
+15
+
+[90] Aleksandr Beznosikov, Samuel Horváth, Peter Richtárik, and Mher Safaryan. On biased compression for distributed learning. arXiv preprint arXiv:2002.12410, 2020.
+[91] Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran Chen, and Hai Li. Terngrad: ternary gradients to reduce communication in distributed deep learning. In Proceedings of the 31st International Conference on Neural Information Processing Systems, pages 1508–1518, 2017.
+[92] Konstantin Mishchenko, Eduard Gorbunov, Martin Takácˇ, and Peter Richtárik. Distributed learning with compressed gradient differences. arXiv preprint arXiv:1901.09269, 2019.
+[93] Samuel Horváth, Dmitry Kovalev, Konstantin Mishchenko, Sebastian Stich, and Peter Richtárik. Stochastic distributed learning with gradient quantization and variance reduction. arXiv preprint arXiv:1904.05115, 2019.
+[94] Zhize Li, Dmitry Kovalev, Xun Qian, and Peter Richtarik. Acceleration for compressed gradient descent in distributed and federated optimization. In International Conference on Machine Learning, pages 5895–5904. PMLR, 2020.
+[95] Eduard Gorbunov, Dmitry Kovalev, Dmitry Makarenko, and Peter Richtarik. Linearly converging error compensated sgd. In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, and H. Lin, editors, Advances in Neural Information Processing Systems, volume 33, pages 20889–20900. Curran Associates, Inc., 2020.
+[96] Constantin Philippenko and Aymeric Dieuleveut. Artemis: tight convergence guarantees for bidirectional compression in federated learning. arXiv preprint arXiv:2006.14591, 2020.
+[97] Zhize Li and Peter Richtárik. A uniﬁed analysis of stochastic gradient methods for nonconvex federated optimization. arXiv preprint arXiv:2006.07013, 2020.
+[98] Farzin Haddadpour, Mohammad Mahdi Kamani, Aryan Mokhtari, and Mehrdad Mahdavi. Federated learning with compression: Uniﬁed analysis and sharp guarantees. arXiv preprint arXiv:2007.01154, 2020.
+[99] Rudrajit Das, Abolfazl Hashemi, Sujay Sanghavi, and Inderjit S Dhillon. Improved convergence rates for non-convex federated learning with compression. arXiv preprint arXiv:2012.04061, 2020.
+[100] Eduard Gorbunov, Konstantin P. Burlachenko, Zhize Li, and Peter Richtarik. Marina: Faster non-convex distributed learning with compression. In Marina Meila and Tong Zhang, editors, Proceedings of the 38th International Conference on Machine Learning, volume 139 of Proceedings of Machine Learning Research, pages 3788–3798. PMLR, 18–24 Jul 2021.
+[101] Sebastian U Stich, Jean-Baptiste Cordonnier, and Martin Jaggi. Sparsiﬁed sgd with memory. In Proceedings of the 32nd International Conference on Neural Information Processing Systems, pages 4452–4463, 2018.
+[102] Sai Praneeth Karimireddy, Quentin Rebjock, Sebastian Stich, and Martin Jaggi. Error feedback ﬁxes signsgd and other gradient compression schemes. In International Conference on Machine Learning, pages 3252–3261. PMLR, 2019.
+[103] Xun Qian, Peter Richtárik, and Tong Zhang. Error compensated distributed sgd can be accelerated. arXiv preprint arXiv:2010.00091, 2020.
+[104] Amirhossein Reisizadeh, Aryan Mokhtari, Hamed Hassani, and Ramtin Pedarsani. An exact quantized decentralized gradient descent algorithm. IEEE Transactions on Signal Processing, 67(19):4934–4947, 2019.
+[105] Dmitry Kovalev, Anastasia Koloskova, Martin Jaggi, Peter Richtarik, and Sebastian Stich. A linearly convergent algorithm for decentralized optimization: Sending less bits for free! In Arindam Banerjee and Kenji Fukumizu, editors, Proceedings of The 24th International Conference on Artiﬁcial Intelligence and Statistics, volume 130 of Proceedings of Machine Learning Research, pages 4087–4095. PMLR, 13–15 Apr 2021.
+[106] Anastasia Koloskova, Tao Lin, Sebastian U Stich, and Martin Jaggi. Decentralized deep learning with arbitrary communication compression. In International Conference on Learning Representations, 2020.
+[107] Jakub Konecˇny`, H Brendan McMahan, Felix X Yu, Peter Richtárik, Ananda Theertha Suresh, and Dave Bacon. Federated learning: Strategies for improving communication efﬁciency. arXiv preprint arXiv:1610.05492, 2016.
+16
+
+[108] Peter Kairouz, H Brendan McMahan, Brendan Avent, Aurélien Bellet, Mehdi Bennis, Arjun Nitin Bhagoji, Keith Bonawitz, Zachary Charles, Graham Cormode, Rachel Cummings, et al. Advances and open problems in federated learning. arXiv preprint arXiv:1912.04977, 2019.
+[109] Sebastian Urban Stich. Local SGD converges fast and communicates little. International Conference on Learning Representations (ICLR), page arXiv:1805.09767, 2019.
+[110] Tao Lin, Sebastian Urban Stich, Kumar Kshitij Patel, and Martin Jaggi. Don’t use large mini-batches, use local SGD. ICLR, page arXiv:1808.07217, 2020.
+[111] Blake Woodworth, Kumar Kshitij Patel, and Nathan Srebro. Minibatch vs local sgd for heterogeneous distributed learning. arXiv preprint arXiv:2006.04735, 2020.
+[112] Honglin Yuan and Tengyu Ma. Federated accelerated stochastic gradient descent. Advances in Neural Information Processing Systems, 33, 2020.
+[113] Debraj Basu, Deepesh Data, Can Karakus, and Suhas Diggavi. Qsparse-local-SGD: Distributed SGD with quantization, sparsiﬁcation and local computations. In Advances in Neural Information Processing Systems, pages 14668–14679, 2019.
+[114] Honglin Yuan, Manzil Zaheer, and Sashank Reddi. Federated composite optimization. arXiv preprint arXiv:2011.08474, 2020.
+[115] Mahmoud Assran, Arda Aytekin, Hamid Reza Feyzmahdavian, Mikael Johansson, and Michael G Rabbat. Advances in asynchronous parallel and distributed optimization. Proceedings of the IEEE, 108(11):2013–2031, 2020.
+[116] Benjamin Recht, Christopher Re, Stephen Wright, and Feng Niu. Hogwild: A lock-free approach to parallelizing stochastic gradient descent. In Advances in neural information processing systems, pages 693–701, 2011.
+[117] Shen-Yi Zhao and Wu-Jun Li. Fast asynchronous parallel stochastic gradient descent: A lock-free approach with convergence guarantee. In Proceedings of the AAAI Conference on Artiﬁcial Intelligence, volume 30, 2016.
+[118] Rémi Leblond, Fabian Pedregosa, and Simon Lacoste-Julien. Asaga: asynchronous parallel saga. In Artiﬁcial Intelligence and Statistics, pages 46–54. PMLR, 2017.
+[119] Zhimin Peng, Yangyang Xu, Ming Yan, and Wotao Yin. Arock: an algorithmic framework for asynchronous parallel coordinate updates. SIAM Journal on Scientiﬁc Computing, 38(5):A2851–A2879, 2016.
+[120] Konstantin Mishchenko, Franck Iutzeler, Jérôme Malick, and Massih-Reza Amini. A delaytolerant proximal-gradient algorithm for distributed learning. In International Conference on Machine Learning, pages 3587–3595. PMLR, 2018.
+[121] Alekh Agarwal and John C Duchi. Distributed delayed stochastic optimization. In Proceedings of the 24th International Conference on Neural Information Processing Systems, pages 873– 881, 2011.
+[122] Hamid Reza Feyzmahdavian, Arda Aytekin, and Mikael Johansson. An asynchronous minibatch algorithm for regularized stochastic optimization. IEEE Transactions on Automatic Control, 61(12):3740–3754, 2016.
+[123] Yossi Arjevani, Ohad Shamir, and Nathan Srebro. A tight convergence analysis for stochastic gradient descent with delayed updates. In Algorithmic Learning Theory, pages 111–132. PMLR, 2020.
+[124] Hari Balakrishnan, M Frans Kaashoek, David Karger, Robert Morris, and Ion Stoica. Looking up data in p2p systems. Communications of the ACM, 46(2):43–48, 2003.
+[125] Seymour Kaplan. Application of programs with maximin objective functions to problems of optimal resource allocation. Operations Research, 22(4):802–807, 1974.
+[126] Erling D. Andersen and Knud D. Andersen. The mosek interior point optimizer for linear programming: An implementation of the homogeneous algorithm. In Applied Optimization, pages 197–232. Springer US, 2000.
+[127] Anand Jayarajan, Jinliang Wei, Garth Gibson, Alexandra Fedorova, and Gennady Pekhimenko. Priority-based parameter propagation for distributed dnn training. In A. Talwalkar, V. Smith, and M. Zaharia, editors, Proceedings of Machine Learning and Systems, volume 1, pages 132–145, 2019.
+17
+
+Supplementary Material
+
+A GPU instance costs
+This section provides a brief cost analysis of typical deep learning compute resources both in the cloud and on-premises. For brevity, we limit this analysis to the popular GPUs available at the time of submission. Note that the exact costs will depend on a variety of factors such as the cloud provider, the region, electricity costs, and market ﬂuctuations. Therefore, we warn the reader to consider this analysis only as a rough estimate.
+Speciﬁcally, we estimate the compute costs for the occasional usage scenario: running a single set of experiments over several weeks or conducting infrequent experiments. This scenario covers most research scientists and small organizations. The most straightforward way to provision a GPU server in such a scenario is to rent it from a cloud provider (e.g., GCP or AWS) or a public marketplace (e.g., Vast.ai or Golem).
+While the exact server speciﬁcations vary from one provider to another, there are two broad categories of GPU machines: regular and preemptible. Regular instance types typically offer 1–8 GPUs per node with tight uptime guarantees (typically 99.99%) and a high-bandwidth network (tens of Gb/s). In turn, preemptible instances provide the same resource type at a signiﬁcant discount with the condition that the machine can be terminated at any time after short notice.
+To account for individual variations, we report the average rent price over three popular cloud providers. We consider three popular instance types: two high-end instances with 8 Tesla V100 or A100 GPUs and a low-end instance with a single Tesla T4 GPU. We also describe several low-end servers and workstations available on a public marketplace. Unlike cloud VMs, these instances are hosted on non-curated hardware with less uptime guarantees (typically 95% – 99.9%), slower network and signiﬁcant variation in performance. However, marketplace instances are the cheapest in terms of cost per TFLOPS. To quantify this, we report the average over three most affordable instances that ﬁt the chosen minimum requirements.
+As a point of comparison, we also measure each system’s training performance for BERT-Large [68] ﬁne-tuning on SQuAD v1.1 [78] in PyTorch with mixed precision. We follow the ofﬁcial benchmarking protocol by [75] and reuse the ofﬁcial performance results for V100, A100, and T4 instances. The only exception is GTX 1080Ti, where we use full 32-bit precision because that device does not support efﬁcient half-precision operations.
+
+Table 1: Cloud and marketplace GPU instance pricing for short-term usage.
+
+Minimum system speciﬁcations
+
+Average cost, $/hour BERT-Large
+
+GPU
+
+CPU cores
+
+CPU type
+
+RAM, GB Regular Preemptible training samples/s
+
+Cloud instances
+
+8× V100
+
+64
+
+Intel Xeon Broadwell 480 23.47 7.13
+
+354
+
+8× A100
+
+96
+
+AMD Epyc ROME
+
+960 30.65 10.18
+
+755
+
+1× T4
+
+4 Intel Xeon Cascade Lake 16
+
+0.46
+
+0.18
+
+18
+
+Marketplace instances
+
+6× 3090
+
+32
+
+AMD Epyc Rome
+
+480 5.04
+
+4.17
+
+154
+
+4× 2080Ti
+
+16
+
+Intel Xeon Haswell
+
+240 0.96
+
+0.84
+
+83.4
+
+1× RTX 1080Ti 8
+
+Intel Xeon Haswell
+
+16
+
+0.22
+
+0.16
+
+12
+
+Table 1 shows two main tendencies. First, preemptible cloud instances are, on average, three times cheaper than their non-preemptible counterparts8. Second, the high-end HPC-grade servers that offer the highest raw performance are less cost-effective than lower-tier servers and marketplace instances. In theory, one could match the raw ﬂoating-point performance of a 8×V100 instance at a fraction of its cost using multiple lower-tier workstations, such as 4× RTX 2080Ti, with a smaller total cost.
+8The cost can be up to 11× cheaper for some instance types, e.g. Azure V100 instances in the central US region at the time of writing.
+
+18
+
+However, in practice, running distributed training with these workstations is challenging due to their unreliability and slow network connection.
+Note that this analysis does not represent the cloud costs for sustained GPU usage. If an organization plans to constantly use GPU resources over a period of multiple years, they can reduce the costs by deploying their own compute infrastructure or relying on the sustained usage discounts reaching up to 60–70%. Thus, the long-term compute costs are much harder to analyze and depend on a number of additional factors, such as local electricity prices for on-premise infrastructure. However, this scenario offers similar trade-offs: HPC-grade infrastructure offers greater interconnectivity, but requires expensive network interface cards, high-end switches and a more complex setup process.
+B Additional Related Work
+In this section, we review some of the papers relevant to our work, but omitted from the main part due to space constraints.
+B.1 Decentralized training
+In this subsection, we give additional details about the dependence of gossip-based optimization methods on the spectral properties on the communication graph through the spectral properties of the mixing matrix [44, 42] or the Laplacian matrix [45, 46] of the network. That is, gossip ﬁnds approximate average on nodes with accuracy ε after O (1 − λ2(M))−1 log(ε−1) iterations, where M is the mixing matrix and λ2(M) is the second largest eigenvalue of M when sorted by absolute value. The quantity η = 1 − λ2(M) is called the spectral gap of the mixing matrix M, and η−1 is typically a polynomial of the total number of nodes N when the maximal degree of the node is O(1). For example, for uniformly averaging M one can show that η−1 = O(N 2) for the ring topology (node degree 2), η−1 = O(N ) for the two-dimensional torus topology (node degree 2), and η−1 = O(1) for the fully connected graph (node degree N − 1); one can ﬁnd more examples in [79]. Similarly, the communication complexity of decentralized optimization methods often has multiplicative dependence on either O(η−1) (see [80] and references therein) or O(η−1/2) [42, 46, 81, 82], which is not improvable for gossip-based methods [83, 40].
+Contrary to this, Moshpit All-Reduce does not depend on a ﬁxed communication graph and the properties of its mixing matrix. However, it depends on the number of averaging groups and the total number of peers (see Theorem 3.2), which can be viewed as properties of a time-varying random communication graph. Fortunately, this dependence is often much better than in gossip: as we mentioned in the main part of the paper, even if workers are randomly split into pairs at each iteration, the simpliﬁed version of Moshpit All-Reduce makes the average distortion (the left-hand side of Equation 5) at least 2 times smaller after each round on average.
+B.2 Compressed communication
+Another popular approach to address the communication bottleneck is communication compression [84, 85, 86, 87, 88]: before sending any information (e.g., iterates, gradients, Hessians or more sophisticated data) over the network, peers compress this information by applying a possibly random transformation. As the result, peers send fewer bits for each communication round, but the total number of communication rounds needed to achieve the predeﬁned accuracy of the solution increases. However, compression can be useful in situations when the reduction in communication costs of one round is more important than the increase in the number of these rounds [89].
+There are two distinct groups of works on distributed training with compressed communication: ones that focus on unbiased compression operators (e.g., Rand-K, p-quantization) and ones studying algorithms with biased compressors (e.g., Top-K); see a detailed summary of popular compression operators in [90]). Quantized SGD (QSGD) [85] and TernGrad [91] were among the ﬁrst compression methods with convergence guarantees. Next, the convergence analysis of these methods was generalized and tightened in the (strongly) convex case in [92]. Moreover, the authors of [92] proposed a modiﬁcation of QSGD called DIANA: this algorithm is based on the quantization of gradients’ differences, which helps it achieve linear convergence in the strongly convex case when peers compute full gradients. Next, DIANA was generalized to arbitrary unbiased compression in [93], where authors also developed and analyzed the variance-reduced version of DIANA. After that, several
+19
+
+further modiﬁcations, such as Accelerated DIANA [94] and DIANA with bidirectional compression [95, 96], were proposed. Finally, we refer the reader to [97, 98, 99, 100] for state-of-the-art results for distributed methods with unbiased compression in the non-convex case.
+However, naïve application of biased compression operators can lead to signiﬁcantly worse performance in practice. For instance, as it was shown recently in [90], parallel SGD with Top-1 compression can diverge exponentially fast. Therefore, biased compressors are used jointly with so-called error-compensation [84]. The ﬁrst analysis of Error-Compensated SGD (EC-SGD) was proposed in [101, 102] which then was generalized and tightened in [90]. Next, several further improvements, such as an accelerated version of EC-SGD [103] and linearly converging EC-SGD [95], were recently proposed. However, current theory does not show any superiority of distributed methods with biased compressors to the ones with unbiased compression operators. In addition, one can combine decentralized communication with compression. Such combinations with unbiased compression operators were studied in [104, 105] and with biased operators in [24, 106]. In this paper, we do not study the interaction of different compression methods and Moshpit Averaging, leaving this promising direction to future work.
+B.3 Multiple local steps
+Alternatively, to reduce the impact of the communication bottleneck, it is possible to perform several local optimization steps on each peer between the communication rounds. This approach is based on the idea that the increased computational load of peers will decrease the number of communication rounds required to obtain the optimal parameters; it is frequently used in federated learning [107, 108]. In particular, one of the most popular methods with multiple local steps is called Local-SGD or Federated Averaging [107, 109]. The ﬁrst results on its convergence were given in [109, 110], and later they were tightened and generalized both for homogeneous [61, 62] and heterogeneous cases [61, 111]. Recently, further modiﬁcations of Local-SGD were proposed and analyzed: these modiﬁcations include acceleration [112], variance reduction [60], communication compression [113, 98, 99], decentralization [64, 63], adaptive and proximal methods [76, 114], and resistance to client drift [59]. Moshpit SGD can perform multiple local gradient steps before synchronization by design, as shown in Algorithm 2.
+B.4 Asynchronous methods
+In the previous subsections, we mostly discussed synchronous distributed methods, since they are more widespread and better studied than asynchronous ones. Mainly, this is because asynchronous methods are more difﬁcult to implement, debug and analyze under general assumptions. However, such methods can be more efﬁcient in terms of using computational resources, which leads to faster wall-clock convergence [115]. In recent years, several asynchronous stochastic methods [116, 117, 118], methods with no shared memory [119, 120], and methods with delayed updates [121, 122, 123, 95] were proposed and analyzed: one can ﬁnd more details in a recent survey [115]. Moshpit SGD belongs to this family of asynchronous approaches as well, because the averaging steps happen in smaller groups and can be interleaved with local parameter updates.
+B.5 Distributed Hash Tables
+In this work, we set out to improve distributed averaging with a dynamic matchmaking protocol. Without a central server, this protocol relies on decentralized data structures to organize peers. The main data structure we use is the Distributed Hash Table, or DHT. On a high level, DHT is a distributed fault-tolerant “dictionary” that can be accessed by every participant. Each key-value pair is stored on a subset of peers determined by the hash function of the key.
+Each participant has a unique identiﬁer (ID) sampled uniformly from the hash function output range. When storing a (key, value) pair, one must ﬁnd k peers whose IDs are nearest to hash(key) according to a chosen metric. After that, the participant requests each of those peers to store (key, value). When retrieving a value for a key, one should compute hash(key), search for peers with IDs nearest to that hash value and request the value from those peers.
+Speciﬁc DHT versions, such as Chord [124] or Kademlia [55], employ different hash types and algorithms for ﬁnding nearest peers. For instance, Kademlia DHT sorts peers based on the XOR distance function: d(x, y) = int(x ⊕ y).
+20
+
+In DHT, each participant is directly aware of only a small subset of peers. When storing or retrieving a key, the participant requests additional peers from its neighbors in a semi-greedy search, minimizing the XOR distance until it ﬁnds k nearest peers. In Kademlia, nodes form a special navigable graph structure that lets them ﬁnd nearest peers in at most O(k + log N ) requests to other peers, where N is the total number of participants. Due to their scalability and fault-tolerance, DHTs found numerous applications including BitTorrent, Ethereum, I2P and decentralized deep learning [36].
+
+C Proofs of Mixing Properties of Moshpit All-Reduce
+Notation. Throughout the following sections, we use the standard notation from the literature on stochastic optimization. That is, for any n-dimensional vectors x = (x1, . . . , xn) , y = (y1, . . . , yn) ∈ Rn we use x, y to denote the standard inner product: x, y = x1y1 + . . . + xnyn. Next, we use x to denote the 2=norm of x ( x = x, x ), E[ξ] to denote an expectation of a random variable ξ, E[ξ | η] is used for the conditional expectation of ξ given η, and P{E} denotes the probability of an event E.
+
+C.1 Computing exact average in a full grid
+As discussed in Section 3.1, Moshpit All-Reduce obtains the exact average of parameter vectors from N peers arranged in a grid with d coordinates and M positions per coordinate when N ≡ M d. That is, when the grid is full and each step averages M parameter values along a single grid coordinate without repetitions, the algorithm needs only d steps to compute the actual average across all nodes. In this section, we give a proof of this fact.
+First, let us formally deﬁne the setting and the averaging steps of Moshpit All-Reduce in this speciﬁc case. Let θi1i2...id be the parameter vector of the worker with coordinates i1, i2, . . . , id; each coordinate ik takes values from 1 to M , because the hypercube of peers is completely full (thus, due to the pigeonhole principle, there are no unoccupied coordinates). Next, arrange the coordinates of these vector according to the order of averaging iterations: namely, at iteration 1
+
+1
+
+1M
+
+θi1i2...id = M
+
+θj1i2...id ,
+
+j1 =1
+
+i1 ∈ {1, . . . , M },
+
+(13)
+
+which means that for the ﬁrst iteration, we take the average across the ﬁrst axis θ1 and replicate it across all M resulting vectors regardless of their index i1. The next averaging steps can be expressed similarly with a simple recurrence relation:
+
+t
+
+1 M t−1
+
+θi1i2...id = M
+
+θi1...it−1jtit+1...id .
+
+jt =1
+
+(14)
+
+Given this formal deﬁnition, we can now state and prove the exact averaging result:
+Theorem C.1 (Exact average in a full d-dimensional hypercube after d steps). Assume that M d peers are arranged in a d-dimensional hypercube with M positions in each dimension. Also, assume that each peer fully participates in every averaging step and M -sized groups for each averaging iteration are determined based on the hypercube coordinates. Then, if Moshpit All-Reduce is ran in the above setup for d iterations without repeating groups (i.e. averaging across each dimension exactly once), its result for each participant is the average value of θ across all M d peers.
+21
+
+Proof. We can directly obtain the expression for the average by expanding the recurrence and rearranging the sums:
+
+
+
+
+
+d
+
+1 M d−1
+
+1M 1 M
+
+θi1i2...id = M
+
+θi1...id−1jd = M
+
+ M
+
+θi1i2...jd−1jd  = . . .
+
+jd =1
+
+jd =1
+
+jd−1 =1
+
+1 M 1M
+
+M 1M
+
+= M
+
+M
+
+...
+
+M
+
+θj1 ...jd
+
+jd =1
+
+jd−1=1 j2=1
+
+j1 =1
+
+d summations
+
+1M M
+
+MM
+
+1
+
+M
+
+= Md
+
+...
+
+θj1...jd = M d
+
+θj1...jd .
+
+jd=1 jd−1=1 j2=1 j1=1
+
+j1 ,...,jd =1
+
+But this is exactly the global average of all θ, since there are M d participants and each vector is represented in the sum because of summation over all possible indices.
+
+Notice that for a given grid of peers, if some of its indices do not have corresponding parameter
+
+vectors, Equation 14 may result in different average vectors on different workers due to different
+
+numbers of peers along a coordinate for different indices. For example, running two iterations of
+
+Moshpit
+
+Averaging
+
+with
+
+d
+
+=
+
+2,
+
+M
+
+=
+
+2
+
+and
+
+three
+
+parameter
+
+vectors
+
+θ11,
+
+θ21,
+
+θ22
+
+results
+
+in
+
+θ11 +θ21 2
+
+on
+
+the
+
+ﬁrst
+
+worker
+
+and
+
+θ11 +θ21 4
+
++
+
+θ22
+
+on
+
+other
+
+workers,
+
+with
+
+neither
+
+equal
+
+to
+
+the
+
+global
+
+average.
+
+However, the variance of the averaged vectors does decrease, which is formally proven in Section C.3.
+
+C.2 Proof of Theorem 3.1
+
+Below we provide the complete proof of Theorem 3.1. For the readers’ convenience, we restate the theorem.
+
+Theorem C.2 (Theorem 3.1). If all workers have non-zero probability of successfully running a communication round in Moshpit Averaging and the order of peerst is random, then all local vectors θit converge to the global average with probability 1:
+
+N
+
+2
+
+∀i = 1, . . . , N θt − 1 θ0 −−−→ 0.
+
+(15)
+
+iN
+
+i t→∞
+
+i=1
+
+Proof of Theorem 3.1. First of all, we notice that (15) is equivalent to
+
+N
+
+2
+
+∀i = 1, . . . , N, ∀j = 1, . . . , n θt(j) − 1 θ0(j) −−−→ 0,
+
+(16)
+
+i
+
+N
+
+i
+
+t→∞
+
+i=1
+
+where θit(j) denotes j-th component of θit. Consider an arbitrary component j ∈ {1, . . . , n} and the sequence of intervals {Ij,t}t≥0 where Ij,t = conv{θ1t (j), θ2t (j), . . . , θNt (j)}. Then, {Ij,t}t≥0 is
+
+a sequence of nested intervals (Ij,t+1 ⊆ Ij,t∀t ≥ 0), since averaging in groups does not expand
+
+the
+
+convex
+
+hull
+
+of
+
+{θ
+
+t 1
+
+,
+
+θ2t
+
+,
+
+.
+
+.
+
+.
+
+,
+
+θ
+
+t N
+
+}.
+
+For convenience, we specify the bounds of the intervals:
+
+Ij,t = [aj,t, bj,t]. Using the Cantor’s intersection theorem, we conclude that
+
+∞
+Ij,t = Ij = [aj , bj ],
+t=0
+
+where θ(j) = N1
+
+n i=1
+
+θi0(j)
+
+∈
+
+[aj ,
+
+bj ].
+
+If
+
+[aj ,
+
+bj ]
+
+=
+
+{θ(j)}
+
+with
+
+probability
+
+1,
+
+then
+
+(16)
+
+holds
+
+with
+
+probability 1 as well. Suppose the opposite: there exist such j ∈ {1, . . . , n}, [a, b] and δ, ∆ > 0 that
+
+θ(j) ∈ [a, b], b − a = ∆ and
+
+∞
+
+∞
+
+P [a, b] ⊆ Ij,t = δ > 0 and ∀ε > 0 P [a − ε, b + ε] ⊆ Ij,t < δ.
+
+t=0
+
+t=0
+
+E
+
+Eε
+
+22
+
+This implies that for all ε > 0 there exists such Tε > 0 that
+
+P ∀t ≥ Tε aj,t ∈ [a − ε, a], bj,t ∈ [b, b + ε] = δε > 0.
+
+Eε
+
+Consider ε
+
+=
+
+∆ (2N +100)2N
+
+and assume that the event Eε
+
+holds.
+
+Next, we introduce new notation:
+
+Jlteft = {i ∈ {1, . . . , n} | θit(j) ∈ [a − ε, a]} and Jrtight = {i ∈ {1, . . . , n} | θit(j) ∈ [b, b + ε]}. Since
+
+Eε holds the sets Jlteft and Jrtight are non-empty for all t ≥ Tε with probability δε > 0:
+
+P ∀t ≥ Tε Jlteft = ∅ and Jrtight = ∅ = δε > 0.
+
+(17)
+
+We notice that every pair of workers i1, i2 has a non-zero probability of taking part in the averaging inside the common group at each iteration since all workers have a non-zero probability of successfully
+running a communication round and the order of peerst is random. This implies that every pair of workers i1, i2 with probability 1 take part in the averaging inside the common group inﬁnitely many times when t goes to the inﬁnity.
+
+Next, we choose some t0 ≥ Tε. Let Jlte0ft = {il,1, . . . , il,ql } and Jrti0ght = {ir,1, . . . , ir,qr }. Consider
+the event Eε,0 ⊆ Eε such that in Eε,0 peer il,1 computes an average in the group containing any peer from Jrti0ght at some iteration t1 > t0. Our observations above imply that P{Eε,0} = P{Eε} = δε > 0.
+
+Then, θitl1,1 (j) ≥ NN−1 (a−ε)+ N1 b = a−ε+ N1 (∆+ε) = a− (2N+∆100)2N + N1 ∆ + (2N+∆100)2N >
+a + 2∆N , i.e., θitl1,1 (j) ∈ (a, b] meaning that il,1 ∈ Jlte1ft. The last part of the proof shows that for any t ≥ t1, the peer il,1 will never be the part of Jlteft and after a ﬁnite number of iterations Jlteft = ∅ with probability δε > 0 when Eε,0 holds, implying the contradiction with (17).
+
+To show that, we consider the following set of peers: Jlte1ft = {i ∈ {1, . . . , n} | ∃t ≥ t1 : θit(j) ∈ [a − ε, a + 2∆N )}. Next, we consider the event Eε,1 ⊆ Eε,0 such that in Eε,1 peer il,1 computes an average in the group containing some peer il,avg,1 from Jlte1ft at some iteration t2 > t1 (and t2 is the ﬁrst such moment after t1). Again, our observations imply P{Eε,1} = P{Eε,0} = δε > 0. Then, θitl2,1 (j) = θitl2,avg,1 (j) > NN−1 (a − ε) + N1 a + 2∆N = a + 2N∆2 − N(2(NN+−110)∆0)2N > a + 4N∆2 .
+After that, we consider the event Eε,2 ⊆ Eε,1 such that in Eε,2 peer il,1 or il,avg,1 computes an average in the group containing a peer il,avg,2 = il,avg,1 from Jlte1ft at an iteration t3 > t2 (and t3 is the ﬁrst such moment after t2). Then, θitl3,1 (j), θitl3,avg,1 (j) and θitl3,avg,2 (j) are greater than NN−1 (a − ε) + N1 a + 4N∆2 = a + 4N∆3 − N(2(NN+−110)∆0)2N > a + 8N∆3 .
+
+Therefore, after at least N − 1 of such averaging iterations, with probability δε all θit(j) will be
+
+greater than a +
+
+∆ (2N )N
+
+> a while Eε holds.
+
+This contradicts (17).
+
+Therefore,
+
+∞
+
+Ij,t = {θ(j)}
+
+t=0
+
+with probability 1, which concludes the proof.
+
+C.3 Proof of Theorem 3.2
+
+In this section, we provide the complete proof of Theorem 3.2. For convenience, we restate the theorem below.
+
+Theorem C.3 (Theorem 3.2, averaging convergence rate). Consider the modiﬁcation of Moshpit
+
+All-Reduce that works as follows: at each iteration k ≥ 1 1) peers are randomly split into r disjoint
+
+groups of sizes M1k, . . . , Mrk in such a way that
+
+r i=1
+
+Mik
+
+=
+
+N
+
+and
+
+Mik
+
+≥
+
+1
+
+∀i
+
+=
+
+1, . . . , r
+
+and
+
+2) peers from each group compute their group average via All-Reduce. Let θ1, . . . , θN be the input
+
+vectors
+
+of
+
+this
+
+procedure
+
+and
+
+θ
+
+T 1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+θ
+
+T N
+
+be
+
+the
+
+outputs
+
+after
+
+T
+
+iterations.
+
+Then,
+
+1N
+
+r−1 r T 1 N
+
+EN
+
+θiT − θ 2 =
+
+N + N2
+
+· N
+
+θi − θ 2,
+
+(18)
+
+i=1
+
+i=1
+
+where θ = N1
+
+N i=1
+
+θi.
+
+23
+
+Proof. First of all, let us clarify the procedure of random splitting of peers in r groups. We assume
+
+that at iteration k of the modiﬁed algorithm we generate a random permutation πk = (π1k, . . . , πNk )
+
+of 1, . . . , N .
+
+Next, J1k
+
+=
+
+{π
+
+k 1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+π
+
+k M
+
+k
+
+}
+
+form
+
+the
+
+indices
+
+of
+
+the
+
+ﬁrst
+
+group
+
+of
+
+workers,
+
+J2k
+
+=
+
+1
+
+{πM k k+1, . . . , πM k k } are the indices of the second group, and Jrk = {πM k k+Mk+...+Mk
+
++1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+π
+
+k N
+
+}
+
+1
+
+2
+
+1
+
+2
+
+r−1
+
+are the indices of group r. In other words, we generate a random permutation and take contiguous
+
+subgroups of indices corresponding to predeﬁned group sizes Mik, starting from the ﬁrst group.
+
+By deﬁnition, we have
+
+r i=1
+
+Jik
+
+=
+
+{1, 2, . . . , N },
+
+where
+
+deﬁnes the disjoint union operator.
+
+Moreover, notice that group sizes M1k, . . . , Mrk can depend on k and even be random: for our analysis,
+
+it is sufﬁcient that the randomness deﬁning the permutation is independent from M1k, . . . , Mrk. Next,
+
+vectors
+
+θ
+
+k 1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+θ
+
+k N
+
+are
+
+obtained
+
+by
+
+the
+
+following
+
+formula:
+
+∀j = 1, . . . , N,
+
+θk = 1 j Mik
+
+θtk−1,
+
+t∈Jik
+
+where Jik is the group for which j ∈ Jik.
+
+Using this, we show that the average of vectors {θik}ni=1 remains the same throughout the iterations of Moshpit All-Reduce:
+
+1N k 1 r k 1
+
+k−1 1 r
+
+k−1 1 N k−1
+
+N θj = N Mi · M k
+
+θt
+
+= N
+
+θt
+
+= N
+
+θj .
+
+j=1
+
+i=1 i t∈Jik
+
+i=1 t∈Jik
+
+j=1
+
+Therefore, the quantity N1
+
+N j=1
+
+θjk − θ
+
+2 (average distortion) measures the quality of averaging.
+
+For this quantity, we can derive the following expression:
+
+2
+
+1N k 2
+
+1r k 1
+
+k−1
+
+N
+
+θj − θ
+
+= N
+
+Mi M k
+
+θt − θ
+
+j=1
+
+i=1 i t∈Jik
+
+
+
+
+
+1r 1
+
+k−1
+
+2
+
+k−1
+
+k−1
+
+= N
+
+Mk 
+
+θt − θ + 2
+
+θt − θ, θl − θ  .
+
+i=1 i t∈Jik
+
+t,l∈Jik ,t<l
+
+Taking the expectation Eπk [·] with respect to the randomness coming from the choice of πk we get
+
+
+
+
+
+1N Eπk  N
+j=1
+
+θjk − θ
+
+2
+
+
+r
+
+= N1
+
+1 Mk
+
+Eπk
+
+θtk−1 − θ 2 +2Eπk
+
+θtk−1 − θ, θlk−1 − θ .
+
+i=1 i
+
+t∈Jik
+
+t,l∈Jik ,t<l
+
+Since ∀j, j1, j2 ∈ {1, . . . , N }, j1 = j2 and for all i = 1, . . . , r
+
+k
+
+Mik
+
+P j ∈ Ji
+
+=, N
+
+k Mik(Mik − 1)
+
+P j1, j2 ∈ Ji =
+
+N2 ,
+
+24
+
+we have
+
+
+
+
+
+1N k 2
+
+1 r 1 N k−1
+
+2
+
+Eπk  N
+
+θj − θ  = N N
+
+θj − θ
+
+j=1
+
+i=1 j=1
+
+1 r Mik − 1
+
+k−1
+
+k−1
+
++N 2 N2
+
+θj1 − θ, θj2 − θ
+
+i=1
+
+1≤j1 <j2 ≤N
+
+r N k−1
+
+2 N −r
+
+k−1
+
+k−1
+
+= N2
+
+θj − θ + 2 N 3
+
+θj1 − θ, θj2 − θ
+
+j=1
+
+1≤j1 <j2 ≤N
+
+r N − r N k−1
+
+2 N − r N k−1
+
+2
+
+= N2 − N3
+
+θj − θ + N 3
+
+θj − θ
+
+j=1
+
+j=1
+
+N −r +2 N 3
+
+θjk1−1 − θ, θjk2−1 − θ
+
+1≤j1 <j2 ≤N
+
+2
+
+N (r − 1) + r N k−1
+
+2 N − r N k−1
+
+= N3
+
+θj − θ + N 3
+
+(θj − θ)
+
+j=1
+
+j=1
+
+r−1 r
+
+1 N k−1
+
+2
+
+=
+
+N + N2 · N
+
+θj − θ .
+
+j=1
+
+N θ−N θ 2=0
+
+Finally, we take the full expectation from the both sides of the above equation and apply the tower property E [Eπk [·]] = E [·]:
+
+
+1N EN
+j=1
+
+θjk − θ
+
+
+
+2
+
+
+=
+
+r−1 r N + N2
+
+
+
+
+
+1 N k−1
+
+2
+
+EN
+
+θj − θ  .
+
+j=1
+
+Unrolling the recurrence for k = T , we establish (18).
+
+Remark C.1. The result implies that increasing the group size α > 1 times implies almost α times faster convergence to the average.
+Remark C.2. Our analysis can be easily generalized to the case when number of groups r can depend on k and be a random variable independent from the choice of permutations and the number of groups at previous steps. In this case, (18) transforms into
+
+1N T 2 1N
+
+T 2
+
+E[rk] − 1
+
+E[rk ]
+
+EN
+
+θi − θ
+
+= N
+
+θi − θ ·
+
+N + N2 ,
+
+(19)
+
+i=1
+
+i=1
+
+k=1
+
+where rk is the number of groups at iteration k.
+
+C.4 Additional Guarantees For Moshpit Averaging
+
+In this section, we derive the result measuring the rate of variance reduction when averaging random vectors with Algorithm 1. We start with the following technical lemma:
+Lemma C.1. Let ξ ∼ Binom(M, p) have a binomial distribution with parameters M (number of trials) and p (probability of success for each trial). Then
+
+1 m1(M, p) := E min ξ , 1
+1 m2(M, p) := E min ξ2 , 1
+
+= (1 − p)M + M (1 − p)M−i − (1 − p)M , (20) i
+i=1
+
+= (1 − p)M + M (1 − p)M−i − (1 − p)M M 1 . (21)
+
+i
+
+j
+
+i=1
+
+j=i
+
+25
+
+Proof. We start with the proof of (20). By deﬁnition of the expectation, we have
+
+1 E min ξ , 1
+
+= (1 − p)M + M 1 pi(1 − p)M−i M .
+
+i
+
+i
+
+i=1
+
+For simplicity of further derivations, we introduce the following notation: m1(M, p) =
+
+E min 1ξ , 1
+
+and m2(M, p) = E min
+
+1 ξ2
+
+,
+
+1
+
+. Taking the derivative of m1(M, p) by p, we
+
+obtain
+
+M
+
+M
+
+m1(M, p) = −M (1 − p)M−1 + pi−1(1 − p)M−i
+
+i
+
+i=1
+
+− M M − i pi(1 − p)M−i−1 M
+
+i
+
+i
+
+i=1
+
+= −M (1 − p)M−1 + 1 −(1 − p)M + M pi(1 − p)M−i M
+
+p
+
+i
+
+i=0
+
+M −
+
+M 1 pi(1 − p)M−i M
+
+1−p i
+
+i
+
+i=1
+
+1 +
+1−p
+
+−(1 − p)M + M pi(1 − p)M−i M i
+i=0
+
+= −M (1 − p)M−1 + 1 1 − (1 − p)M − M m1(M, p) − (1 − p)M
+
+p
+
+1−p
+
+1 +
+
+1 − (1 − p)M
+
+1−p
+
+1
+
+(1 − p)M−1 M
+
+= p(1 − p) − p − 1 − p m1(M, p).
+
+Rearranging the terms, we get the following linear ﬁrst-order ODE
+
+M
+
+1
+
+(1 − p)M−1
+
+m1(M, p) + 1 − p m1(M, p) = p(1 − p) −
+
+. p
+
+(22)
+
+To solve it, we consider the following homogeneous ODE:
+
+M m1(M, p) + 1 − p m1(M, p) = 0.
+
+The solution of this ODE is m1(M, p) = C(1−p)M , where C ∈ R is an arbitrary real constant. Next, we go back to the initial ODE (22) and try to ﬁnd a solution of the form m1(M, p) = C(p)(1 − p)M , where C(p) : R → R is a differentiable function:
+
+C(p)(1 − p)M + M C(p)(1 − p)M =
+
+1
+
+(1 − p)M−1
+
+−
+
+1−p
+
+p(1 − p)
+
+p
+
+⇓
+
+C (p)(1 − p)M =
+
+1
+
+(1 − p)M−1
+
+−
+
+p(1 − p)
+
+p
+
+⇓
+
+1
+
+1
+
+C (p) = p(1 − p)M+1 − p(1 − p) .
+
+Since
+
+1
+
+1
+
+1
+
+x(1 − x)k+1 = x(1 − x)k + (1 − x)k+1
+
+(23)
+
+26
+
+for all x ∈ {0, 1} and all non-negative integers k, we have
+
+11
+
+1
+
+1
+
+11
+
+C (p) = p + 1 − p + (1 − p)2 + . . . + (1 − p)M+1 − p − 1 − p
+
+⇓
+
+C (p) =
+
+M
+(1 − p)−i−1,
+
+i=1
+
+hence
+
+C(p) = Cˆ + M 1 (1 − p)−i, i=1 i
+
+where Cˆ is a real constant. Putting all together, we obtain
+
+m1(M, p) = C(p)(1 − p)M = Cˆ(1 − p)M + M 1i (1 − p)M−i.
+i=1
+
+Taking m1(M, 0) = 1 into account, we conclude that Cˆ = 1 − M i=1 1i and obtain (20). Using a similar technique, we derive (21). By deﬁnition of the expectation, we have
+
+M1
+
+M
+
+m2(M, p) = (1 − p)M +
+
+pi(1 − p)M−i
+
+.
+
+i2
+
+i
+
+i=1
+
+Taking the derivative of m2(M, p) by p, we obtain
+
+M1
+
+M
+
+m2(M, p) = −M (1 − p)M−1 +
+
+pi−1(1 − p)M−i
+
+i
+
+i
+
+i=1
+
+− M M − i pi(1 − p)M−i−1 M
+
+i2
+
+i
+
+i=1
+
+= −M (1 − p)M−1 + 1 M 1 pi(1 − p)M−i M
+
+pi
+
+i
+
+i=1
+
+M −
+
+M 1 pi(1 − p)M−i M
+
+1 − p i2
+
+i
+
+i=1
+
+1 +
+
+M 1 pi(1 − p)M−i M
+
+1−p i
+
+i
+
+i=1
+
+= −M (1 − p)M−1 + 1 m1(M, p) − (1 − p)M p
+
+1 +
+
+−M m2(M, p) + M (1 − p)M + m1(M, p) − (1 − p)M
+
+1−p
+
+m1(M, p) (1 − p)M−1 M
+
+=
+
+−
+
+−
+
+m2(M, p).
+
+p(1 − p)
+
+p
+
+1−p
+
+Rearranging the terms, we get the following linear ﬁrst-order ODE
+
+M
+
+m1(M, p) (1 − p)M−1
+
+m2(M, p) + 1 − p m2(M, p) = p(1 − p) −
+
+. p
+
+(24)
+
+To solve this ODE, we consider the homogeneous ODE:
+
+M m2(M, p) + 1 − p m2(M, p) = 0.
+
+The solution of this ODE is m2(M, p) = C(1−p)M , where C ∈ R is an arbitrary real constant. Next, we go back to the initial ODE (24) and try to ﬁnd a solution of the form m2(M, p) = C(p)(1 − p)M ,
+
+27
+
+where C(p) : R → R is a differentiable function:
+
+C(p)(1 − p)M + M C(p)(1 − p)M = m1(M, p) − (1 − p)M−1
+
+1−p
+
+p(1 − p)
+
+p
+
+⇓
+
+C (p)(1 − p)M = m1(M, p) − (1 − p)M−1
+
+p(1 − p)
+
+p
+
+⇓
+
+C (p) = m1(M, p) − 1 . p(1 − p)M+1 p(1 − p)
+
+Using (23) and (20), we derive
+
+M
+
+M
+
+1i 1i (1 − p)M−i
+
+C (p) (=20) − i=1 + i=1
+
+p(1 − p) p(1 − p)M+1
+
+M
+
+1
+
+M
+
+1
+
+=−
+
++ ip(1 − p)
+
+ip(1 − p)i+1
+
+i=1
+
+i=1
+
+(23)
+
+M1 1
+
+1
+
+=−
+
++
+
+i=1 i p 1 − p
+
+M1 +
+i=1 i
+
+11
+
+1
+
+1
+
+p + 1 − p + (1 − p)2 + . . . + (1 − p)i+1
+
+M1
+
+1
+
+1
+
+M
+
+1
+
+M1
+
+= i (1 − p)2 + . . . + (1 − p)i+1 = (1 − p)i+1 j ,
+
+i=1
+
+i=1
+
+j=i
+
+hence
+
+C(p) = Cˆ +
+
+M
+
+1 (1 − p)−i
+
+M
+
+1 ,
+
+i=1 i
+
+j=i j
+
+where Cˆ is a real constant. Putting all together, we obtain
+
+m2(M, p) = C(p)(1 − p)M = Cˆ(1 − p)M + M 1i (1 − p)M−i M 1j .
+
+i=1
+
+j=i
+
+Taking m2(M, 0) = 1 into account, we conclude that Cˆ = 1 −
+
+M1 i=1 i
+
+M j=i 1j and obtain (21).
+
+Using this lemma, we derive the following result:
+
+Theorem C.4. Assume that peers participating in Moshpit Averaging have independent random
+
+vectors θ1, . . . , θN with means θ1, . . . , θN and variances bounded by σ2 before the averaging. Let
+
+θ
+
+T 1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+θ
+
+T N
+
+be
+
+the
+
+outputs
+
+of
+
+Moshpit
+
+Averaging
+
+after
+
+T
+
+iterations.
+
+Finally,
+
+we
+
+assume
+
+that
+
+each
+
+peer
+
+from the grid can be dropped out for the whole averaging process before averaging independently
+
+from other peers, i.e., N ∼ Binom(M d, p). Then, for all i = 1, . . . , N we have
+
+E θiT − Eθ θiT 2 ≤ M T −1σ2m1(M − 1, p) (m2(M − 1, p))T −1 ,
+
+(25)
+
+where functions m1(M, p) and m2(M, p) are deﬁned in (20) and (21) respectively, and Eθ [·] denotes
+
+the expectation w.r.t. the randomness from θ1, . . . , θN .
+
+Moreover, if p
+
+≥
+
+2 3
+
+and M
+
+≥
+
+11, then
+
+m1(M
+
+− 1, p)
+
+≤
+
+M2 ,
+
+m2(M
+
+− 1, p)
+
+≤
+
+3 M2
+
+and
+
+T
+
+T2
+
+2σ2
+
+E θi − Eθ θi
+
+≤ M (M/3)T −1 .
+
+(26)
+
+28
+
+Proof. First of all, we recall an equivalent formulation of Moshpit Averaging. Consider a hypercube {1, . . . , M }d. One can consider the elements of this hypercube as hyperindices and assign a unique
+hyperindex to each peer so that peers can be viewed as vertices in the hypercube. Then, during the
+k-th iteration of Moshpit All-Reduce, each worker computes the average among those peers that have
+hyperindices with the same values except the k-th index; in other words, peers compute averages along the k-th dimension of the hypercube. Next, if N = 0, we assume that θiT = Eθ θiT and (25) holds for free. Therefore, to derive (25), we assume that N > 0.
+
+More formally, we use the following notation: θCi = θi for all i = 1, . . . , N , where Ci =
+
+(
+
+ci1
+
+,
+
+ci2
+
+,
+
+.
+
+.
+
+.
+
+,
+
+c
+
+i d
+
+),
+
+cij
+
+∈
+
+{1, . . . , M } for all j
+
+=
+
+1, . . . , M , and Ci
+
+=
+
+Ck
+
+for i
+
+=
+
+k.
+
+Let C
+
+be the
+
+set of hyperindices corresponding to all peers. Next, we use θCt i to deﬁne the vector stored on i-th peer after t iterations of Moshpit Averaging. Then, for all i = 1, . . . , N we have θC0 i = θCi and for all t = 1, . . . , d
+
+θt = 1 Ci bi,t
+
+θCt−k1,
+
+k∈Ji,t
+
+where
+
+Ji,t
+
+=
+
+{k
+
+∈
+
+N
+
+|
+
+Ck
+
+=
+
+(
+
+ck1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+c
+
+k d
+
+)
+
+∈
+
+C
+
+and ckj
+
+=
+
+cij
+
+∀j
+
+=
+
+t}
+
+and
+
+bi,t
+
+=
+
+|Ji,t|.
+
+Using
+
+this,
+
+we derive the following formula for θCt i :
+
+θT ≡ θT = 1
+
+1
+
+1
+
+1
+
+...
+
+θi .
+
+i
+
+Ci bi,T
+
+bi ,T −1
+
+bi ,T −2
+
+bi ,1
+
+T
+
+i1∈Ji,T 1
+
+i2∈Ji1,T −1 2
+
+i3∈Ji2,T −1
+
+T −1 iT ∈JiT −1,1
+
+Taking the expectation w.r.t. θ1, . . . , θN , we get
+
+Eθ θiT
+
+1
+
+1
+
+1
+
+1
+
+= bi,T
+
+bi ,T −1
+
+bi ,T −2
+
+... bi ,1
+
+θiT .
+
+i1∈Ji,T 1
+
+i2∈Ji1,T −1 2
+
+i3∈Ji2,T −1
+
+T −1 iT ∈JiT −1,1
+
+Using the independence of θ1, . . . , θN , we derive
+
+Eθ θiT − Eθ θiT 2
+
+
+
+2
+
+= Eθ 
+
+...
+
+θiT − θiT 
+
+
+
+bi,T bi1,T −1 . . . biT −1,1 
+
+i1∈Ji,T i2∈Ji1,T −1
+
+iT ∈JiT −1,1
+
+Eθ θiT − θiT 2
+
+=
+
+...
+
+i1∈Ji,T i2∈Ji ,T −1
+
+iT ∈Ji
+
+,1 b2i,T b2i1,T −1 . . . b2iT −1,1
+
+1
+
+T −1
+
+σ2
+
+≤
+
+...
+
+i1∈Ji,T i2∈Ji ,T −1
+
+iT ∈Ji
+
+,1 b2i,T b2i1,T −1 . . . b2iT −1,1
+
+1
+
+T −1
+
+σ2
+
+=
+
+...
+
+i1∈Ji,T i2∈Ji ,T −1
+
+iT −1∈Ji
+
+b2i,T b2i1,T −1 . . . b2iT −2,2biT −1,1 .
+,2
+
+1
+
+T −2
+
+Next, taking the full expectation from the both sides of the previous inequality and using the tower property, we obtain
+
+E θiT − Eθ θiT
+
+
+
+
+
+2
+
+σ2
+
+≤ E
+
+...
+
+i1∈Ji,T i2∈Ji ,T −1
+
+iT −1∈Ji
+
+b2i,T b2i1,T −1 . . . b2iT −2,2biT −1,1. (27)
+,2
+
+1
+
+T −2
+
+Notice that Jik,T −k ∩ Jik+1,T −k−1 = {ik+1} for all k = 0, . . . , T − 1, where i0 = i. Moreover, for k1, k2 ∈ {0, 1, . . . , T }, k1 < k2 either Jik1 ,T −k1 ∩ Jik2 ,T −k2 = {k2} or Jik1 ,T −k1 ∩ Jik2 ,T −k2 = ∅. The ﬁrst situation is possible iff ik1 = ik1+1 = . . . ik2−1.
+Taking these observations about sets Jik,T −k into account, we consider the sets Jik,T −k = Jik,T −k \ {ik} for k = 0, 1, . . . , T − 1. These sets are pairwise disjoint and their cardinalities bik,T −k = |Jik,T −k| satisfy the following relations: bik,T −k = 1 + bik,T −k ≥ max{1, bik,T −k} =: ˆbik,T −k for k = 1, 2, . . . , T − 1. Moreover, bi,T , bi1,T −1, . . . , biT−1,1 are independent random variables from the binomial distribution Binom(M − 1, p). Finally, we notice that the number of terms in (27) is upper-bounded by M T −1, since |Ji,t| ≤ M for all i = 1, . . . , N and t = 0, . . . , T .
+
+29
+
+Putting all together, we obtain
+
+E θiT − Eθ θiT 2
+
+
+
+
+
+σ2
+
+≤ E
+
+...
+
+i1∈Ji,T i2∈Ji ,T −1
+
+iT −1∈Ji
+
+,2 ˆb2i,T ˆb2i1,T −1 . . . ˆb2iT −2,2ˆbiT −1,1 
+
+1
+
+T −2
+
+≤ M T −1σ2E
+
+1
+
+ξˆ12ξˆ22 . . . ξˆT2 −1ξˆT
+
+= M T −1σ2E 1 E 1 . . . E
+
+1
+
+1
+
+E
+
+,
+
+ξˆ12
+
+ξˆ22
+
+ξˆT2 −1
+
+ξˆT
+
+where ξˆk2 = max{1, ξ12} for k = 1, . . . , T and ξ1, . . . , ξT are i.i.d. random variables having the binomial distribution Binom(M −1, p). Then one can simplify the inequality above using Lemma C.1 and get
+
+E θiT − Eθ θiT 2 ≤ M T −1σ2m1(M − 1, p) (m2(M − 1, p))T −1 ,
+
+where functions m1(M, p) and m2(M, p) are deﬁned in (20) and (21) respectively.
+
+Next, we simplify the obtained upper bound under the assumption that M and p are not too small; speciﬁcally, M ≥ 11 and p ≥ 2/3. From (20), we have
+
+M−1 1
+
+m1(M − 1, p) = (1 − p)M−1 +
+
+(1 − p)M−1−i − (1 − p)M−1
+
+i
+
+i=1
+
+≤ (1 − p)M−1 M−1 1 . i(1 − p)i
+i=1
+
+Since we have
+
+1
+
+k(1 − p)k
+
+k
+
+1
+
+·
+
+=
+
+−−−−→
+
+≥ 3,
+
+(k + 1)(1 − p)k+1
+
+1
+
+(k + 1)(1 − p) k→∞ 1 − p
+
+(1 − p)M−1 M−1 1 = Θ (1 − p)M · 1
+
+1
+
+=Θ
+
+.
+
+i(1 − p)i
+
+M (1 − p)M
+
+M
+
+i=1
+
+Using simple algebra, one can prove that for M ≥ 11 and p ≥ 2/3 the following inequality holds:
+
+M−1 1
+
+2
+
+m1(M − 1, p) ≤ (1 − p)M−1
+
+≤.
+
+i(1 − p)i M
+
+i=1
+
+Similarly, we analyze m2(M − 1, p):
+
+M−1 1
+
+M−1 1
+
+m2(M − 1, p) = (1 − p)M−1 +
+
+(1 − p)M−1−i − (1 − p)M−1
+
+i
+
+j
+
+i=1
+
+j=i
+
+≤ (1 − p)M−1 M−1 1 M−1 1 .
+
+i(1 − p)i
+
+j
+
+i=1
+
+j=i
+
+Since
+
+M −1
+
+1
+
+1
+
+k(1−p)k
+
+j
+
+j=k
+
+M −1
+
+1
+
+1
+
+(k−1)(1−p)k−1
+
+j
+
+j=k−1
+
+M −1
+(k − 1) 1j = j=k
+
+k(1 − p)
+
+M −1
+k−1 1 + 1j
+j=k
+
+3(k − 1)2
+
+3
+
+=
+
+−−−−→ ,
+
+k(2k − 1) k→∞ 2
+
+≥ 3(k − 1) · k1 k k−1 1 + k1
+
+30
+
+we have
+
+(1 − p)M−1 M−1 1 M−1 1 = Θ
+
+i(1 − p)i
+
+j
+
+i=1
+
+j=i
+
+(1 − p)M ·
+
+1
+
+M 2(1 − p)M
+
+1 = Θ M2 .
+
+Next, one can prove with simple algebra that for M ≥ 11 and p ≥ 2/3 the following inequality holds:
+
+M−1 1 M−1 1
+
+3
+
+m2(M − 1, p) ≤ (1 − p)M−1
+
+≤.
+
+i(1 − p)i
+
+j M2
+
+i=1
+
+j=i
+
+Plugging the obtained upper bounds for m1(M − 1, p) and m2(M − 1, p) in (25), we obtain (26).
+
+D Convergence Proofs of Moshpit SGD
+In this section, we provide the complete statements of the theorems establishing the convergence of Moshpit SGD together with the full proofs. First, we introduce all necessary deﬁnitions, basic inequalities and auxiliary lemmas; then we prove the convergence in strongly convex and convex cases; lastly, we provide the proofs for the non-convex case.
+
+D.1 Deﬁnitions, Basic Facts and Auxiliary Results Below we provide several classical deﬁnitions and results which are used in our proofs.
+
+D.1.1 Standard Deﬁnitions from Optimization Theory
+
+Deﬁnition D.1 (L-smoothness). A function f : Rn → R is called L-smooth if for all x, y ∈ Rn, the
+
+following inequality holds:
+
+∇f (x) − ∇f (y) ≤ L x − y .
+
+(28)
+
+If the function f is L-smooth, then for all x, y ∈ Rn
+
+f (y) ≤ f (x) +
+
+∇f (x), y − x
+
+L +
+
+y−x
+
+2.
+
+(29)
+
+2
+
+Next, if f is additionally convex and x∗ is its minimizer, then for all x ∈ Rd
+
+∇f (x) 2 ≤ 2L (f (x) − f (x∗)) .
+
+(30)
+
+Deﬁnition D.2 (µ-strong convexity). A differentiable function f : Rn → R is called µ-strongly
+
+convex if there exists a constant µ ≥ 0 such that for all x, y ∈ Rn
+
+f (y) ≥ f (x) +
+
+∇f (x), y − x
+
+µ +
+
+y−x
+
+2.
+
+(31)
+
+2
+
+D.1.2 Basic Facts
+
+For all a, b, θ1, . . . , θN ∈ Rn and α > 0, the following inequalities hold:
+
+a + b 2 ≤ 2 a 2 + 2 b 2,
+
+(32)
+
+N
+
+2
+
+N
+
+1
+
+1
+
+θi ≤
+
+θi 2,
+
+(33)
+
+N i=1
+
+N i=1
+
+a2 αb2
+
+a, b ≤
+
++
+
+.
+
+(34)
+
+2α
+
+2
+
+D.1.3 Properties of Expectation
+
+Variance decomposition. For a random vector η ∈ Rd and any deterministic vector x ∈ Rd, the
+
+variance satisﬁes
+
+E η − Eη 2 = E η − x 2 − Eη − x 2
+
+(35)
+
+Tower property of expectation. For any random variables ξ, η ∈ Rd we have
+
+E [ξ] = E [E [ξ | η]]
+
+(36)
+
+under the assumption that E[ξ] and E [E [ξ | η]] are well-deﬁned.
+
+31
+
+D.1.4 Auxiliary Results
+
+For the readers’ convenience, we list all auxiliary results that we use in our proofs below. The ﬁrst result is classical and establishes that the gradient descent step is a contractive operator.
+Lemma D.1 (Lemma 6 from [59]). For any L-smooth and µ-strongly convex function f : Rn → R, points x, y ∈ Rn, and stepsize γ ∈ (0, 1/L], the following inequality holds:
+
+x − γ∇f (x) − y + γ∇f (y) 2 ≤ (1 − γµ) x − y 2.
+
+(37)
+
+The next two lemmas are useful for estimating typical recurrences appearing in the analysis. Lemma D.2 (Lemma I.2 from [60]). Let {rk}k≥0 satisfy
+rK ≤ a + c1γ + c2γ2 γWK
+
+for all K ≥ 0 with some constants a, c2 ≥ 0, c1 ≥ 0, where wk = (1 − γµ(1 − δpv,1))−(k+1),
+
+WK =
+
+K k=0
+
+wk ,
+
+µ
+
+>
+
+0,
+
+δpv,1
+
+∈
+
+[0, 1)
+
+and
+
+γ
+
+≤
+
+γ0
+
+for
+
+some
+
+γ0
+
+>
+
+0,
+
+γ0
+
+≤
+
+1/µ(1−δpv,1 ).
+
+Then,
+
+for
+
+all K such that
+
+ln either
+or γ0
+
+max ln
+≤
+
+2, min
+
+aµ2(1−δpv,1)2K2/c1, aµ3(1−δpv,1)3K3/c2 K
+
+≤1
+
+max 2, min aµ2(1−δpv,1)2K2/c1, aµ3(1−δpv,1)3K3/c2
+
+(1 − δpv,1)µK
+
+and
+
+γ = min
+
+ln γ0,
+
+max
+
+2, min
+
+aµ2(1−δpv,1)2K2/c1, aµ3(1−δpv,1)3K3/c2 (1 − δpv,1)µK
+
+we have that
+
+a
+
+c1
+
+c2
+
+rK = O γ0 exp (−γ0µ(1 − δpv,1)K) + (1 − δpv,1)µK + (1 − δpv,1)2µ2K2 .
+
+Lemma D.3 (Lemma I.3 from [60]). Let {rk}k≥0 satisfy rK ≤ a + c1γ + c2γ2 γK
+
+for all K ≥ 0 with some constants a, c2 ≥ 0, c1 ≥ 0 where γ ≤ γ0 for some γ0 > 0. Then for all K and
+
+γ = min γ0,
+
+a
+
+a
+
+,3
+
+c1K c2K
+
+we have that
+
+a rK = O γ0K +
+
+√
+
+ac1 + 3 a2c2 .
+
+K
+
+K 2/3
+
+Finally, the lemma below is useful for our convergence analysis in the non-convex case.
+Lemma D.4 (Lemma I.1 from [60]). For any τ random vectors ξ1, . . . , ξτ ∈ Rd such that ∀t = 2, . . . , τ the random vector ξt depends on ξ1, . . . , ξt−1 and does not depend on ξt+1, . . . , ξτ the following inequality holds
+
+
+τ
+
+2
+
+τ
+
+τ
+
+E  ξt  ≤ eτ E Et[ξt] 2 + e E ξt − Et[ξt] 2 ,
+
+(38)
+
+t=1
+
+t=1
+
+t=1
+
+where Et[·] denotes the conditional expectation E[ · | ξt−1, . . . , ξ1].
+
+32
+
+D.2 Convex Case
+
+In this section, we give the full proof of Theorem 3.3 about the convergence of Moshpit SGD for convex and strongly convex problems. The scheme of the proof follows the similar steps as in the state-of-the-art analysis of Local-SGD [61, 62, 60]. We start with the following lemma:
+Lemma D.5. Let f1 = . . . = fN = f , function f be µ-strongly convex (Def. D.2) and L-smooth (see Def. D.1), and Assumptions 3.1 and 3.2 hold with ∆kpv = δpv,1γµE[ θk − θ∗ 2] + γ2δp2v,2 and θ = θ∗, where θ∗ ∈ argminθ∈Rn f (θ) and δpv,1 ∈ [0, 1), δpv,2 ≥ 0. Then, for any k ≥ 0 the iterates produced by Moshpit SGD with γ ≤ 1/4L satisfy
+
+γE f (θk) − f (θ∗) ≤ (1 − γµ(1 − δpv,1))E θk − θ∗ 2 − E θk+1 − θ∗ 2
+
+3Lγ
+
+2 σ2
+
+2
+
++ 2 E[Vk] + γ Nmin + δpv,2 ,
+
+(39)
+
+where Vk = N1k i∈Pk θik − θk 2 and θk = N1k i∈Pk θik.
+
+Proof. Recall that Assumption 3.2 with ∆kpv = δpv,1γµE[ θk − θ∗ 2] + γ2δp2v,2 and θ = θ∗ states
+
+E θk+1 − θk+1, θk+1 + θk+1 − 2θ∗ ≤ δpv,1γµE[ θk − θ∗ 2] + γ2δp2v,2,
+
+(40)
+
+where θk+1 = N1k
+
+i∈Pk (θik − γgik). Next, the deﬁnition of θk+1 implies
+
+θk+1 = 1 Nk
+
+θk − γ i Nk
+
+gik = θk − γgk,
+
+i∈Pk
+
+i∈Pk
+
+where gk = N1k i∈Pk gik. Using this, we derive
+
+θk+1 − θ∗ 2 = = =
+
+θk+1 − θ∗ 2 + 2 θk+1 − θk+1, θk+1 − θ∗ + θk+1 − θk+1 2 θk − θ∗ − γgk 2 + θk+1 − θk+1, θk+1 + θk+1 − 2θ∗ θk − θ∗ 2 − 2γ θk − θ∗, gk + γ2 gk 2 + θk+1 − θk+1, θk+1 + θk+1 − 2θ∗ .
+
+Taking the conditional expectation E · | θk := E · | Pk, θik, i ∈ Pk from the both sides of the previous equation and using Assumption 3.1, we obtain
+
+E θk+1 − θ∗ 2 | θk = θk − θ∗ 2 − 2γ θk − θ∗, 1 Nk
+
+∇f (θik)
+
+i∈Pk
+
+ +γ2E 
+
+1
+
+gk
+
+Nk
+
+i
+
+i∈Pk
+
+2 | θk
+
++E θk+1 − θk+1, θk+1 + θk+1 − 2θ∗ | θk . (41)
+
+Next, we estimate the second and the third terms in the right-hand side of (41). First,
+
+−2γ
+
+θk − θ∗, 1 Nk
+
+∇f (θik)
+
+i∈Pk
+
+=
+(31),(29)
+≤
+(33)
+≤
+
+2γ Nk i∈Pk
+
+θ∗ − θik, ∇f (θik) + θik − θk, ∇f (θik)
+
+2γ
+
+f (θ∗) − f (θk) − µ θk − θ∗ 2
+
+Nk
+
+i
+
+2i
+
+i∈Pk
+
+2γ +
+Nk i∈Pk
+
+f (θik) − f (θk) + L2 θik − θk 2
+
+2γ f (θ∗) − f (θk) − γµ θk − θ∗ 2 + LγVk, (42)
+
+33
+
+where Vk = N1k i∈Pk θik − θk 2. Secondly, since stochastic gradients {gik}i∈Pk are computed independently, we get
+
+ γ2E 
+
+1
+
+gk
+
+Nk
+
+i
+
+i∈Pk
+
+2 | θk
+
+(=35)
+(33)
+≤
+(33),(30),(7)
+≤
+(28)
+≤
+
+2
+
+γ2 1 Nk
+
+∇f (θik)
+
+i∈Pk
+
+
+
+2
+
++γ2E  1 Nk
+
+(gik − ∇f (θik))
+
+i∈Pk
+
+| θk
+
+2
+
+2γ2 1 Nk
+
+(∇f (θik) − ∇f (θk))
+
+i∈Pk
+
++ 2γ2 ∇f (θk) 2
+
+γ2 +N2 E
+k i∈Pk
+
+gik − ∇f (θik) 2 | θk
+
+2γ2
+
+k
+
+k2
+
+Nk
+
+∇f (θi ) − ∇f (θ )
+
+i∈Pk
+
++4Lγ2 f (θk) − f (θ∗) + γ2σ2 Nk
+
+2L2γ2
+
+k
+
+k2
+
+Nk
+
+θi − θ
+
+i∈Pk
+
+2L2 γ 2 Vk
++4Lγ2 f (θk) − f (θ∗) + γ2σ2 . (43) Nmin
+Plugging (42) and (43) in (41), we obtain
+
+E θk+1 − θ∗ 2 | θk
+
+≤ (1 − γµ) θk − θ∗ 2 − 2γ (1 − 2Lγ) f (θk) − f (θ∗) γ2σ2
++Lγ (1 + 2Lγ) Vk + Nmin +E θk+1 − θk+1, θk+1 + θk+1 − 2θ∗ | θk ,
+
+and
+
+E θk+1 − θ∗ 2
+
+(40)
+≤ (1 − γµ(1 − δpv,1))E θk − θ∗ 2 − 2γ (1 − 2Lγ) E f (θk) − f (θ∗)
+
++Lγ (1 + 2Lγ) E[Vk] + γ2
+
+σ2
+
+2
+
+Nmin + δpv,2
+
+≤ (1 − γµ(1 − δpv,1))E θk − θ∗ 2 − γE f (θk) − f (θ∗)
+
+3Lγ
+
+2 σ2
+
+2
+
++ 2 E[Vk] + γ Nmin + δpv,2 ,
+
+where in the last inequality we use γ ≤ 1/4L.
+
+Next, we estimate the term E[Vk] measuring the expected dissimilarity between local iterates and their global average at iteration k.
+
+Lemma D.6. Let f1 = . . . = fN = f , function f be µ-strongly convex (Def. D.2) and L-smooth (see Def. D.1), and Assumptions 3.1 and 3.2 hold with ∆kpv = δpv,1γµE[ θk − θ∗ 2] + γ2δp2v,2 and θ = θ∗, where θ∗ ∈ argminθ∈Rn f (θ) and δpv,1 ∈ [0, 1), δpv,2 ≥ 0. Then, for any k ≥ 0 the iterates produced by Moshpit SGD with γ ≤ 1/4L satisfy
+
+E[Vk] ≤ 2γ2 4δa2q + (τ − 1)σ2 ,
+
+(44)
+
+where Vk = N1k i∈Pk θik − θk 2 and θk = N1k i∈Pk θik.
+
+34
+
+Proof. First of all, if k = aτ for some integer a ≥ 0, then (44) follows from Assumption 3.2 (eq. (10)). Therefore, we consider such k that k = aτ + t for some t ∈ (0, τ ). Then, for any i, j ∈ Pk, i = j
+
+E θik − θjk 2 | θk−1
+
+= E θik−1 − γgik−1 − θjk−1 + γgjk−1 2 | θk−1 (=35) θik−1 − γ∇f (θik−1) − θjk−1 + γ∇f (θjk−1) 2
++γ2E gik−1 − ∇f (θik−1) + gjk−1 − ∇f (θjk−1) 2 | θk−1 .
+
+Using Lemma D.1 and independence of gik−1 and gjk−1 for given θik−1, θjk−1, i = j we derive
+
+E θik − θjk 2 | θk−1
+
+(37)
+≤ (1 − γµ) θik−1 − θjk−1 2 + γ2E gik−1 − ∇f (θik−1) 2 | θk−1 +γ2E gjk−1 − ∇f (θjk−1) 2 | θk−1
+(7)
+≤ (1 − γµ) θik−1 − θjk−1 2 + 2γ2σ2,
+
+from which we get the following:
+
+Eg θik − θjk 2 ≤ (1 − γµ)Eg θik−1 − θjk−1 2 + 2γ2σ2 ≤ Eg θik−1 − θjk−1 2 + 2γ2σ2.
+
+Here, Eg[·] denotes the expectation conditioned on {Pk}(ka=+a1τ)τ−1. Unrolling the recurrence, we get
+
+Eg θik − θjk 2 ≤ Eg θiaτ − θjaτ 2 + 2(k − aτ )γ2σ2
+
+≤ Eg θiaτ − θjaτ 2 + 2(τ − 1)γ2σ2.
+
+(45)
+
+Using this, we estimate Eg[Vk]:
+
+
+
+2
+
+1 Eg[Vk] = Nk
+
+Eg  θk − 1  i Nk
+
+θk
+
+(33) 1 ≤
+
+j  Nk2
+
+Eg θik − θjk 2
+
+i∈Pk
+
+j∈Pk
+
+i,j∈Pk
+
+(45) 1 ≤ N2
+k
+
+Eg θiaτ − θjaτ 2 + 2(τ − 1)γ2σ2
+
+i,j∈Pk
+
+(32) 2 ≤ N2
+k
+
+Eg θiaτ − θaτ 2 + Eg θjaτ − θaτ 2 + 2(τ − 1)γ2σ2
+
+i,j∈Pk
+
+4 =
+Nk
+
+Eg θiaτ − θaτ 2 + 2(τ − 1)γ2σ2
+
+i∈Pk
+
+≤ 4 · Naτ Naτ Nk
+
+Eg θiaτ − θaτ 2 + 2(τ − 1)γ2σ2
+
+i∈Paτ
+
+8 ≤ Eg Naτ
+
+θiaτ − θaτ 2 + 2(τ − 1)γ2σ2,
+
+i∈Paτ
+
+where in the last inequality we use 2N(a+1)τ = 2|P(a+1)τ | ≥ |Paτ | = Naτ and |Nk| ≤ |Nk−1| following from Assumption 3.2. Finally, we take the full expectation from the previous inequality:
+
+(36)
+
+1
+
+E[Vk] ≤ 8E Naτ
+
+(10)
+θiaτ − θaτ 2 + 2(τ − 1)γ2σ2 ≤ 2γ2 4δa2q + (τ − 1)σ2 .
+
+i∈Paτ
+
+This ﬁnishes the proof.
+
+Combining Lemmas D.5 and D.6, we get the following result:
+Theorem D.1 (Theorem 3.3, convergence in the convex case). Let f1 = . . . = fN = f be µstrongly convex (Def. D.2) and L-smooth (see Def. D.1), and Assumptions 3.1 and 3.2 hold with
+
+35
+
+∆kpv = δpv,1γµE[ θk −θ∗ 2]+γ2δp2v,2 and θ = θ∗, where θ∗ ∈ argminθ∈Rn f (θ) and δpv,1 ∈ [0, 1), δpv,2 ≥ 0. Then, for any K ≥ 0, the iterates produced by Moshpit SGD with γ ≤ 1/4L satisfy
+
+E f (θK ) − f (θ∗)
+
+≤ (1 − γµ(1 − δpv,1))K R02 γ
+
+σ2
+
+2
+
+2
+
+2
+
++γ Nmin + δpv,2 + 3Lγ 4δaq + (τ − 1)σ , (46)
+
+when µ > 0, and
+
+K
+
+∗
+
+R02
+
+σ2
+
+2
+
+2
+
+2
+
+E f (θ ) − f (θ ) ≤ γK + γ Nmin + δpv,2 + 3Lγ 4δaq + (τ − 1)σ , (47)
+
+when µ = 0, where R0 = θ0−θ∗ , θK = W1K
+
+Kk=0 wkθk = W1K
+
+K wk k=0 Nk
+
+i∈Pk θik, wk = (1−
+
+γµ(1 − δpv,1))−(k+1), and WK = after
+
+Kk=0 wk. That is, Moshpit SGD achieves E[f (θK ) − f (θ∗)] ≤ ε
+
+L
+
+σ2
+
+δp2v,2
+
+L((τ − 1)σ2 + δa2q)
+
+K =O
+
++
+
++
+
++
+
+(1 − δpv,1)µ Nmin(1 − δpv,1)µε (1 − δpv,1)µε
+
+(1 − δpv,1)2µ2ε
+
+(48)
+
+iterations with
+
+
+
+
+
+
+
+ln max 2, min R02µ2(1−δpv,1)2K2 , R02µ3(1−δpv,1)3K3
+
+
+
+ 
+
+1
+
+(δp2v,2+σ2/Nmin) 3L(4δa2q +(τ −1)σ2)
+
+ 
+
+γ = min ,
+
+ 4L
+
+(1 − δpv,1)µK
+
+
+
+
+
+
+
+
+
+
+
+when µ > 0, and after
+
+ LR2
+
+R2σ2
+
+R02δp2v,2
+
+R02
+
+ L((τ − 1)σ2 + δa2q)
+
+K =O 0 + 0 +
+
++
+
+
+
+(49)
+
+ε
+
+Nminε2
+
+ε2
+
+ε3/2
+
+iterations with
+
+1 γ = min
+
+R0 , 3
+
+R02
+
+4L (δp2v,2 + σ2/Nmin)K 3L 4δa2q + (τ − 1)σ2 K
+
+when µ = 0.
+
+Proof. Plugging the result of Lemma D.6 in inequality (39) from Lemma D.5, we obtain
+
+γE f (θk) − f (θ∗)
+
+≤ (1 − γµ(1 − δpv,1))E θk − θ∗ 2 − E θk+1 − θ∗ 2
+
+32
+
+2
+
+2 σ2
+
+2
+
++3Lγ 4δaq + (τ − 1)σ + γ Nmin + δpv,2 .
+
+36
+
+Next, we sum up these inequalities for k = 0, . . . , K with weights wk = (1 − γµ(1 − δpv,1))−(k+1)
+
+and divide both sides by γWK , where WK =
+
+K k=0
+
+wk
+
+:
+
+1K wkE f (θk) − f (θ∗)
+WK k=0
+
+1K
+
+≤
+
+(1 − γµ(1 − δpv,1))wkE θk − θ∗ 2
+
+γWK k=0
+
+1K
+
+− γWK
+
+wk E
+
+k=0
+
+θk+1 − θ∗ 2
+
+σ2
+
+2
+
+2
+
+2
+
++γ Nmin + δpv,2 + 3Lγ 4δaq + (τ − 1)σ
+
+1K
+
+=
+
+wk−1E θk − θ∗ 2 − wkE θk+1 − θ∗ 2
+
+γWK k=0
+
+σ2
+
+2
+
+2
+
+2
+
++γ Nmin + δpv,2 + 3Lγ 4δaq + (τ − 1)σ
+
+w−1 θ0 − θ∗ 2 − wK E θK+1 − θ∗ 2 =
+γWK
+
+σ2
+
+2
+
+2
+
+2
+
++γ Nmin + δpv,2 + 3Lγ 4δaq + (τ − 1)σ
+
+θ0 − θ∗ 2 ≤
+γWK
+
+σ2
+
+2
+
+2
+
+2
+
++γ Nmin + δpv,2 + 3Lγ 4δaq + (τ − 1)σ .
+
+Since f is convex, we apply the Jensen’s inquality
+
+1K
+
+f
+
+wk θk
+
+WK k=0
+
+1K
+
+≤
+
+wkf (θk)
+
+WK k=0
+
+to the previous result and get
+
+K
+
+∗
+
+R02
+
+σ2
+
+2
+
+2
+
+2
+
+E f (θ ) − f (θ )
+
+≤
+
++γ γWK
+
+Nmin + δpv,2 + 3Lγ 4δaq + (τ − 1)σ
+
+,
+
+where R0 = θ0 − θ∗ and θK = W1K
+
+Kk=0 wkθk = W1K
+
+K wk k=0 Nk
+
+i∈Pk θik. If µ > 0, then
+
+WK ≥ wK ≥ (1 − γµ(1 − δpv,1))−K , implying (46). Next, wk = 1 and WK = K when µ = 0
+
+gives (47). It remains to estimate the total number of iterations K required by Moshpit SGD to ﬁnd
+
+an ε-solution, i.e., to achieve E[f (θK) − f (θ∗)] ≤ ε. Applying Lemma D.2 to (46), we get the
+
+following result: if µ > 0 and
+
+
+
+
+
+
+
+ln max 2, min R02µ2(1−δpv,1)2K2 , R02µ3(1−δpv,1)3K3
+
+
+
+ 
+
+1
+
+δp2v,2+σ2/Nmin 3L(4δa2q +(τ −1)σ2)
+
+ 
+
+γ = min ,
+
+,
+
+ 4L
+
+(1 − δpv,1)µK
+
+
+
+
+
+
+
+
+
+
+
+then E f (θK ) − f (θ∗) equals
+
+2
+
+µ
+
+δp2v,2 + / σ2 Nmin L δa2q + (τ − 1)σ2
+
+O
+
+LR0 exp − L (1 − δpv,1)K
+
++
+
++
+
+(1 − δpv,1)µK
+
+(1 − δpv,1)2µ2K2
+
+,
+
+implying (48). Similarly, we apply Lemma D.3 to (47) and get that for µ = 0 and
+
+1 γ = min
+
+R0 , 3
+
+R02
+
+,
+
+4L (δp2v,2 + σ2/Nmin)K 3L 4δa2q + (τ − 1)σ2 K
+
+37
+
+
+
+K
+
+∗
+
+LR02
+
+E f (θ ) − f (θ ) = O  +
+
+K
+
+
+
+R2(δ2 + σ2/Nmin) 3 R04L δa2q + (τ − 1)σ2
+
+0 pv,2
+
++
+
+,
+
+K
+
+K 2/3
+
+implying (49).
+
+D.3 Non-Convex Case
+
+In this section, we give the full proof of Theorem 3.4 about convergence of Moshpit SGD for general non-convex problems. The proof follows the similar steps as in the state-of-the-art analysis of Local-SGD in non-convex case [64, 63]. We start with the following lemma:
+Lemma D.7. Let f1 = . . . = fN = f , function f be L-smooth and bounded from below by f∗, and Assumptions 3.1 and 3.2 hold with ∆kpv = δpv,1γE[ ∇f (θk) 2] + Lγ2δp2v,2, δpv,1 ∈ [0, 1/2), δpv,2 ≥ 0. Then, for any K ≥ 0 the iterates produced by Moshpit SGD with γ ≤ / (1−2δpv,1) 8L satisfy
+
+(1 − 2δpv,1)γ K−1
+
+4
+
+E
+
+k=0
+
+∇f (θk) 2
+
+K −1
+≤ f (θ0) − f∗ + γL2 E[Vk]
+k=0
+
+2 σ2
+
+2
+
++KLγ Nmin + δpv,2 ,
+
+(50)
+
+where Vk = N1k i∈Pk θik − θk 2 and θk = N1k i∈Pk θik.
+
+Proof. Recall that Assumption 3.2 with ∆kpv = δpv,1γE[ ∇f (θk) 2] + Lγ2δp2v,2 states
+
+E ∇f (θk), θk+1 − θk+1 + L θk+1 − θk+1 2 ≤ δpv,1γE[ ∇f (θk) 2] + Lγ2δp2v,2, (51)
+
+where θk+1 = N1k i∈Pk (θik − γgik). As for the convex case, the deﬁnition of θk+1 implies
+
+θk+1 = 1 Nk
+
+θk − γ i Nk
+
+gik = θk − γgk,
+
+i∈Pk
+
+i∈Pk
+
+where gk = N1k i∈Pk gik. Using this and L-smoothness of f , we derive
+
+(29)
+f (θk+1) − f (θk) ≤
+(32)
+≤
+
+∇f (θk), θk+1 − θk
+
+L +
+
+θk+1 − θk
+
+2
+
+2
+
+∇f (θk), θk+1 − θk + ∇f (θk), θk+1 − θk+1
+
++L θk+1 − θk 2 + L θk+1 − θk+1 2
+
+= −γ ∇f (θk), gk + Lγ2 gk 2 + ∇f (θk), θk+1 − θk+1
+
++L θk+1 − θk+1 2,
+
+from which it follows that
+
+E f (θk+1) − f (θk) | θk
+
+≤ −γ ∇f (θk), 1 Nk
+
+∇f (θik)
+
+i∈Pk
+
++E ∇f (θk), θk+1 − θk+1 | θk
+
++E L θk+1 − θk+1 2 | θk
+
+
+
+2
+
++Lγ2E 1
+
+gk | θk ,
+
+(52)
+
+ Nk
+
+i
+
+
+
+i∈Pk
+
+38
+
+where E · | θk := E · | Pk, θik, i ∈ Pk . Next, we estimate the last three terms in the right-hand side of (52). First of all,
+
+−γ ∇f (θk), 1 Nk
+
+∇f (θik)
+
+i∈Pk
+
+= −γ ∇f (θk) 2
+
+−γ ∇f (θk), 1 Nk
+
+∇f (θik) − ∇f (θk)
+
+i∈Pk
+
+(34)
+≤
+
+−γ ∇f (θk) 2 + γ ∇f (θk) 2
+
+2
+
+2
+
+γ1 +
+2 Nk
+
+(∇f (θik) − ∇f (θk))
+
+i∈Pk
+
+(33)
+≤
+
+γ −
+
+∇f (θk)
+
+2+
+
+γ
+
+2
+
+2Nk
+
+∇f (θik) − ∇f (θk) 2
+
+i∈Pk
+
+(≤28) − γ ∇f (θk) 2 + γL2 Vk, (53)
+
+2
+
+2
+
+where Vk = N1k i∈Pk θik − θk 2. Secondly, since the stochastic gradients {gik}i∈Pk are computed independently, we derive
+
+ Lγ2E 
+
+1
+
+gk
+
+Nk
+
+i
+
+i∈Pk
+
+2 | θk
+
+(=35)
+(33)
+≤
+(33),(7)
+≤
+(28)
+≤
+
+2
+
+Lγ2 1 Nk
+
+∇f (θik)
+
+i∈Pk
+
+
+
+2
+
++Lγ2E  1 Nk
+
+(gik − ∇f (θik))
+
+i∈Pk
+
+| θk
+
+2Lγ2
+
+2
+
+1
+
+(∇f (θk) − ∇f (θk))
+
+Nk
+
+i
+
+i∈Pk
+
++2Lγ2 ∇f (θk) 2
+
+γ2L
+
++ N2
+
+E
+
+k i∈Pk
+
+gik − ∇f (θik) 2 | θk
+
+2γ2L
+
+k
+
+k2
+
+Nk
+
+∇f (θi ) − ∇f (θ )
+
+i∈Pk
+
++2Lγ2 ∇f (θk) 2 + γ2Lσ2 Nk
+
+2L3γ2
+
+k
+
+k2
+
+2
+
+k2
+
+Nk
+
+θi − θ +2Lγ ∇f (θ )
+
+i∈Pk
+
+2L3 γ 2 Vk
+
+γ2Lσ2
+
++
+
+.
+
+Nmin
+
+(54)
+
+Plugging (53) and (54) in (52), we obtain
+
+E f (θk+1) − f (θk) | θk
+
+≤ − γ (1 − 4Lγ) ∇f (θk) 2 + γL2 (1 + 4Lγ) Vk + Lγ2σ2
+
+2
+
+2
+
+Nmin
+
++E ∇f (θk), θk+1 − θk+1 + L θk+1 − θk+1 2 | θk .
+
+39
+
+Next, we take the full expectation from the both sides of the above inequality, apply the tower property (36) and take into account that γ ≤ (1−2δpv,1)/8L:
+
+E f (θk+1) − f (θk)
+
+≤ − γ (1 − 4Lγ) E ∇f (θk) 2 + γL2 (1 + 4Lγ) E[Vk] + Lγ2σ2
+
+2
+
+2
+
+Nmin
+
++E ∇f (θk), θk+1 − θk+1 + L θk+1 − θk+1 2
+
+(≤51) − γ (1 − 2δpv,1 − 4Lγ) E ∇f (θk) 2 + γL2 (1 + 4Lγ) E[Vk]
+
+2
+
+2
+
++Lγ2
+
+σ2
+
+2
+
+Nmin + δpv,2
+
+≤ − (1 − 2δpv,1)γ E ∇f (θk) 2 + γL2E[Vk] 4
+
+2 σ2
+
+2
+
++Lγ Nmin + δpv,2 .
+
+Summing up the obtained inequalities for k = 0, . . . , K − 1 and rearranging the terms, we derive
+
+(1 − 2δpv,1)γ K−1
+
+4
+
+E
+
+k=0
+
+∇f (θk) 2
+
+K −1
+
+K −1
+
+≤
+
+E f (θk) − f (θk+1) + γL2 E[Vk]
+
+k=0
+
+k=0
+
++K Lγ 2
+
+σ2
+
+2
+
+Nmin + δpv,2
+
+K −1
+= f (θ0) − E[f (θK )] + γL2 E[Vk]
+
+k=0
+
++K Lγ 2
+
+σ2
+
+2
+
+Nmin + δpv,2
+
+K−1
+≤ f (θ0) − f∗ + γL2 E[Vk]
+
+k=0
+
+2 σ2
+
+2
+
++KLγ Nmin + δpv,2 ,
+
+where f∗ is a uniform lower bound for f .
+
+The next step towards completing the proof of Theorem 3.4 gives the upper bound for that appeared in (50).
+
+K −1 k=0
+
+E[Vk
+
+]
+
+Lemma D.8. Let f1 = . . . = fN = f be L-smooth and bounded from below by f∗, and Assumptions 3.1 and 3.2 hold with ∆kpv = δpv,1γE[ ∇f (θk) 2] + Lγ2δp2v,2, δpv,1 ∈ [0, 1/2), δpv,2 ≥ 0. Then, for any K ≥ 0 the iterates produced by Moshpit SGD with γ ≤ 1/(4√eL(τ−1)) satisfy
+
+K −1
+
+K−1
+
+E[Vk] ≤ 8eγ2(τ − 1)2 E[ ∇f (θk) 2] + 4γ2K 2δa2q + e(τ − 1)σ2 , (55)
+
+k=0
+
+k=0
+
+where Vk = N1k i∈Pk θik − θk 2 and θk = N1k i∈Pk θik.
+
+40
+
+Proof. First of all, consider k such that k = aτ + t for some t ∈ [0, τ ). Let Eg[·] denote the expectation conditioned on {Pt}t(=a+aτ1)τ−1. Then
+
+1 Eg[Vk] = Nk
+
+Eg
+
+θk − θk 2
+
+(35)
+≤
+
+1
+
+i
+
+Nk
+
+Eg θik − θaτ 2
+
+i∈Pk
+
+i∈Pk
+
+
+
+k−1 2
+
+1 =
+Nk
+
+Eg  θiaτ − θaτ − γ
+
+git 
+
+i∈Pk
+
+t=aτ
+
+(32) 2 ≤
+
+aτ aτ 2 2γ2
+
+Eg θi − θ
+
++
+
+
+k−1
+
+2
+
+Eg 
+
+git  .
+
+Nk i∈Pk
+
+Nk i∈Pk
+
+t=aτ
+
+(56)
+
+Next, we estimate the second term in the right-hand side of (56) using Lemma D.4:
+
+2γ2
+
+
+k−1
+
+2
+
+git 
+
+Nk
+
+Eg 
+
+i∈Pk
+
+t=aτ
+
+(38)
+≤
+(32),(7)
+≤
+(28)
+≤
+≤
+
+2eγ2(k − aτ )
+
+k−1
+[ ∇f (θit) 2]
+
+Nk
+
+Eg
+
+i∈Pk t=aτ
+
+2eγ2 +
+
+k−1
+Eg[ git − ∇f (θit) 2]
+
+Nk i∈Pk t=aτ
+
+k−1
+4eγ2(τ − 1) Eg[ ∇f (θt) 2]
+
+t=aτ
+
++4eγ2(τ − 1) k−1 1
+
+Eg[ ∇f (θit) − ∇f (θt) 2]
+
+t=aτ Nk i∈Pk
+
++2eγ2(k − aτ )σ2
+
+k−1
+4eγ2(τ − 1) Eg[ ∇f (θt) 2]
+
+t=aτ
+
+22
+
+k−1 Nt 1
+
+t
+
+t2
+
++4eγ L (τ − 1)
+
+· Nk Nt
+
+Eg[ θi − θ ]
+
+t=aτ
+
+i∈Pt
+
++2eγ2(τ − 1)σ2
+
+k−1
+4eγ2(τ − 1) Eg[ ∇f (θt) 2]
+t=aτ
+k−1
++8eγ2L2(τ − 1) Eg[Vt] + 2eγ2(τ − 1)σ2,
+t=aτ
+
+where in the last two inequalities we use Nk = |Pk| ≤ |Pk−1| = Nk−1 for all k ≥ 1 and Naτ ≤ 2N(a+1)τ for all integer a ≥ 0. Plugging this inequality in (56) and taking the full expectation
+41
+
+from the result, we get
+
+1 [Vk] ≤ 2E
+
+k−1
+θiaτ − θaτ 2 + 4eγ2(τ − 1) E[ ∇f (θt) 2]
+
+E
+
+Nk
+
+i∈Pk
+
+t=aτ
+
+k−1
++8eγ2L2(τ − 1) E[Vt] + 2eγ2(τ − 1)σ2
+t=aτ
+
+1 ≤ 4E
+
+k−1
+θiaτ − θaτ 2 + 4eγ2(τ − 1) E[ ∇f (θt) 2]
+
+Naτ i∈Paτ
+
+t=aτ
+
+k−1
++8eγ2L2(τ − 1) E[Vt] + 2eγ2(τ − 1)σ2
+t=aτ
+
+(10)
+
+k−1
+
+k−1
+
+≤ 4eγ2(τ − 1) E[ ∇f (θt) 2] + 8eγ2L2(τ − 1) E[Vt]
+
+t=aτ
+
+t=aτ
+
++2γ2 2δa2q + e(τ − 1)σ2 ,
+
+where in the second inequality we also use Nk = |Pk| ≤ |Pk−1| = Nk−1 for all k ≥ 1 and Naτ ≤ 2N(a+1)τ for all integer a ≥ 0. Summing up the obtained inequalities for k = aτ, aτ + 1, . . . , K for some K ∈ [aτ, (a + 1)τ − 1] we derive
+
+K
+
+K k−1
+
+K k−1
+
+E[Vk] ≤ 4eγ2(τ − 1)
+
+E[ ∇f (θt) 2] + 8eγ2L2(τ − 1)
+
+E[Vt]
+
+k=aτ
+
+k=aτ t=aτ
+
+k=aτ t=aτ
+
++2γ2(K − aτ + 1) 2δa2q + e(τ − 1)σ2
+
+K
+
+K
+
+≤ 4eγ2(τ − 1)2 E[ ∇f (θk) 2] + 8eγ2L2(τ − 1)2 E[Vk]
+
+k=aτ
++2γ2(K − aτ + 1) 2δa2q + e(τ − 1)σ2
+
+k=aτ
+
+K
+
+1K
+
+≤ 4eγ2(τ − 1)2 E[ ∇f (θk) 2] +
+
+E[Vk ]
+
+2
+
+k=aτ
+
+k=aτ
+
++2γ2(K − aτ + 1) 2δa2q + e(τ − 1)σ2 ,
+
+where in the last inequality we use γ ≤ 1/(4√eL(τ−1)). Rearranging the terms, we get that for K ≥ 0
+
+K
+
+K
+
+E[Vk] ≤ 8eγ2(τ − 1)2 E[ ∇f (θk) 2] + 4γ2(K − aτ + 1) 2δa2q + e(τ − 1)σ2 ,
+
+k=aτ
+
+k=aτ
+
+where a ≥ 0 is an integer such that aτ ≤ K ≤ (a + 1)τ − 1. Summing up the obtained inequalities for K = τ − 1, 2τ − 1, . . . , τ (K−1)/τ − 1, K − 1, we derive (55).
+
+Combining Lemmas D.7 and D.8, we get the following result:
+Theorem D.2 (Theorem 3.4). Let f1 = . . . = fN = f , function f be L-smooth and bounded from below by f∗, and Assumptions 3.1 and 3.2 hold with ∆kpv = δpv,1γE[ ∇f (θk) 2] + Lγ2δp2v,2, δpv,1 ∈ [0, 1/2), δpv,2 ≥ 0. Then, for any K ≥ 0 the iterates produced by Moshpit SGD with
+
+1 − 2δpv,1 1 − 2δpv,1
+
+γ ≤ min
+
+,√
+
+8L 8 eL(τ − 1)
+
+satisfy E
+
+∇f (θrKand) 2
+
+≤ 8∆0 (1 − 2δpv,1)Kγ
+
+8Lγ +
+1 − 2δpv,1
+
+σ2
+
+2
+
+2
+
+2
+
+Nmin + δpv,2 + 4γL 2δaq + e(τ − 1)σ
+
+, (57)
+
+42
+
+where ∆0 = f (θ0) − f∗ and θrKand is chosen uniformly at random from {θ0, θ1, . . . , θK−1}. That is, Moshpit SGD achieves E ∇f (θrKand) 2 ≤ ε2 after
+
+L∆0
+
+δp2v,2 + / σ2 Nmin
+
+O (1 − 2δpv,1)2ε2 1 + (τ − 1) 1 − 2δpv,1 +
+
+ε2
+
+√(1−2δpv,1)(δa2q +(τ −1)σ2) +ε
+
+(58)
+
+iterations with
+
+1 − 2δpv,1 1 − 2δpv,1
+
+∆0
+
+∆0
+
+γ = min
+
+8L
+
+,√
+
+,
+
+8 eL(τ − 1)
+
+LK δ2
+
++ σ2/N
+
+, 3 4L2 2δ2 + e(τ − 1)σ2
+
+.
+
+pv,2
+
+min
+
+aq
+
+Proof of Theorem 3.4. Plugging the result of Lemma D.8 in the inequality (50) from Lemma D.7, we obtain
+
+(1 − 2δpv,1)γ K−1
+
+4
+
+E
+
+k=0
+
+∇f (θk) 2
+
+K −1
+≤ f (θ0) − f∗ + 8eγ3L2τ (τ − 1) E[ ∇f (θk) 2]
+
+k=0
+
++K Lγ 2
+
+σ2
+
+2
+
+Nmin + δpv,2
+
++4KL2γ3 2δa2q + e(τ − 1)σ2
+
+≤ f (θ0) − f∗ + (1 − 2δpv,1)γ K−1 E ∇f (θk) 2 8
+k=0
+
++K Lγ 2
+
+σ2
+
+2
+
+Nmin + δpv,2
+
++4KL2γ3 2δa2q + e(τ − 1)σ2 .
+
+Next,
+
+1K KE
+k=0
+
+∇f (θk) 2
+
+≤ 8∆0 (1 − 2δpv,1)Kγ
+
+8Lγ
+
+σ2
+
+2
+
+2
+
+2
+
++ 1 − 2δpv,1
+
+Nmin + δpv,2 + 4γL 2δaq + e(τ − 1)σ
+
+,
+
+where ∆0 = f (θ0) − f∗. Since θrKand is chosen uniformly at random from {θ0, θ1, . . . , θK−1},
+
+K 2 (36) 1 K
+
+k2
+
+E ∇f (θrand)
+
+= K
+
+E ∇f (θ )
+
+k=0
+
+and (57) holds. Applying Lemma D.3 to (57), we get the following result: if
+
+1 − 2δpv,1 1 − 2δpv,1
+
+∆0
+
+∆0
+
+γ = min
+
+8L
+
+,√
+
+,
+
+8 eL(τ − 1)
+
+LK δ2
+
++ σ2/N
+
+, 3 4L2 2δ2 + e(τ − 1)σ2
+
+,
+
+pv,2
+
+min
+
+aq
+
+then E ∇f (θrKand) 2 equals
+ OL∆0 1+(τ −1) 1−2δpv,1 +
+(1−2δpv,1)2K
+
+L∆0
+
+δ
+
+2 pv
+
+,2
+
++
+
+σ
+
+2/N
+
+min
+
+(1−2δpv,1)2K
+
+3
+
+L2
+
+∆
+
+2 0
+
+(
+
+δ
+
+2 aq
+
++
+
+(τ
+
+−
+
+1)
+
+σ
+
+2
+
+ )
+
++
+
+,
+
+(1 − 2δpv,1 )K 2/3
+
+which implies the desired convergence result from (58).
+
+43
+
+E Decentralized matchmaking
+In order to run group all-reduce over unreliable devices, Moshpit Averaging must be able to dynamically form groups of active devices that share the same key Ci. In theory, this matchmaking can be implemented precisely as described in Algorithm 1: each peer adds itself to a certain DHT key, waits for a said period of time, and then reads the same key to retrieve a list of its groupmates.
+However, in practice, this kind of matchmaking would be extremely fragile: if any peer arrives late (for example, due to latency), it may join the group when other peers have already ﬁnished matchmaking. As a result, some workers will treat this peer as active, while others will behave as though there is no such peer at all, breaking the consensus and rendering all peers unable to run all-reduce in a stable manner.
+To avoid this and other similar inconsistencies, Moshpit All-Reduce employs a more sophisticated matchmaking protocol with the following guarantees
+1. Peers that join the same group are guaranteed to have the same list of groupmates;
+2. The group will have the maximum possible number of peers, unless some of them fail;
+3. If some peers fail, matchmaking will still form the group out of the remaining ones.
+To achieve this, each peer ﬁrst declares itself onto the DHT (as in Algorithm 1). Then, peers attempt to form groups by calling the REQUEST_JOIN_GROUP remote procedure call. Intuitively, if peer A calls this RPC on peer B, then peer A requests to join peer B’s group, which can be either accepted or rejected by the group “leader” B, which may or may not have other “followers”.
+If a peer is accepted to a group, it commits to stay active (i.e. to await other peers) for a set period of time and perform all-reduce with the peers supplied by the group “leader”. On the other hand, a peer can be rejected if (a) the potential “leader” is already a follower in another group, (b) the group is already running all-reduce, or (c) if the “leader” failed or left during matchmaking.
+To ensure that this protocol forms groups of maximum size, each peer generates a unique “priority” based on its local timestamp9. Peers prioritize joining the group of neighbors that have the lowest “priority”. Under normal circumstances, all workers will join the group of a peer that was ﬁrst to start matchmaking according to its own local time. However, if this peer has failed or already ﬁnished matchmaking, the group will be formed around one of the remaining peers.
+Matchmaking for 64 peers can take less than 1 second if all workers are located in the same cloud region and are highly synchronized. However, this can grow to 2.9 seconds for two different cloud regions and up to 9 seconds when training with commodity hardware around the world.
+To ensure that this latency does not affect the training performance, Moshpit SGD performs matchmaking asynchronously in the background thread, while the model is accumulating gradients. All peers begin matchmaking 15 seconds before the estimated averaging round, so that in ≥ 95% of averaging iterations, the matchmaking step is already ﬁnished by the time peers need to run all-reduce.
+F Training with a dynamic number of peers
+Many practical setups with unreliable devices allow peers to join or leave at any time, which can produce undesirable side-effects. For instance, consider a participant that joins the “swarm” midway through the training process. If this participant starts with the initial model parameters, it can undo some of the progress made by other peers.
+To circumvent this issue, we require each new participant to download the latest parameters from a random up-to-date peer discovered through DHT. The same technique is used to synchronize the optimizer statistics and the learning rate schedule. This protocol is also triggered if a peer becomes desynchronized with others, e.g., after a network freeze.
+9More speciﬁcally, the priority is a tuple of (timestamp, peer_id), where peer_id is used to break ties.
+44
+
+G Load balancing via linear programming
+
+When running Moshpit Averaging on heterogeneous devices, one must regularly perform Butterﬂy All-Reduce among peers with uneven network bandwidth. In order to speed up the protocol, we can make low-throughput peers receive, average, and send smaller partitions of the averaged vector; conversely, the high-throughput peers can process greater fractions of the input vector. To compute the optimal partitioning, peers must solve an optimization problem that minimizes the total time spent on communication during all-reduce.
+
+Consider a group of M peers with network bandwidths b1, ..., bM , deﬁned for simplicity as the minimum of the upload and download speed for each peer. Our objective is to ﬁnd wi — a fraction of all input vectors to be processed by the i-th peer.
+
+In Butterﬂy All-Reduce, each peer i splits its vector into parts and sends these parts to corresponding
+peers. Since there is no need to send wi to itself, i-th peer will upload a total of 1 − wi of the vector to its peers. On the receiving side, peer i will average wi of the vector from all peers in its group. To do so, it must download M − 1 vector parts of size wi from all other peers. After that, peers distribute the averaged parts by running the same procedure in reverse (see Figure 1).
+
+Thus, the communication time for each peer is proportional to ti = (1 − wi + (M − 1)wi) · b1i
+and the total runtime of Butterﬂy All-Reduce is the maximum communication time over all peers: T = maxi ti = maxi(1 − wi + (M − 1)wi) · b1i . Formally, we minimize T with respect to wi with
+two constraints on the fraction weights:
+
+1
+
+min
+
+max(1 − wi+(M − 1)wi) ·
+
+w
+
+i
+
+bi
+
+M
+
+subject to
+
+wi = 1
+
+i=1
+
+wi ≥ 0
+
+∀i = 1, . . . , M
+
+Because the functions being maximized and the constraints are linear in wi, this problem can be
+reduced to linear programming [125]. Namely, we can minimize a surrogate variable ξ such that ∀i, ξ ≥ (1 − wi + (M − 1) · wi) · b1i . The resulting linear program is formulated as follows:
+
+min
+w,ξ
+subject to
+
+ξ
+M
+wi = 1
+i=1
+wi ≥ 0 1
+ξ ≥ (1−wi + (M − 1)wi) · bi
+
+∀i = 1, . . . , M ∀i = 1, . . . , M
+
+We solve this problem using the interior point method [126] implemented as part of the SciPy package (scipy.optimize.linprog). Note that depending on the conditions given by participant bandwidth, optimal weights of speciﬁc peers might be equal to 0 in some cases. In essence, this allows our method to smoothly interpolate between data parallelism [9], parameter server [18] and sharded parameter server [25] in manner similar to BytePS [26].
+
+H Detailed experimental setup
+In this section, we provide the detailed hardware conﬁguration of servers used for each of our distributed training experiments.
+H.1 ImageNet training
+Both homogeneous and heterogeneous training setups for ImageNet are provisioned in our on-premise infrastructure across multiple data centers and an ofﬁce space (for the heterogeneous setup only).
+
+45
+
+Homogeneous. For the homogeneous setup, we use 16 identical instances with the following speciﬁcations:
+• GPU: V100-PCIe, • CPU: 6 vCPUs (Xeon E5-2650v4), • RAM: 64GB.
+Heterogeneous. In turn, the heterogeneous setup contains multiple instance types listed in Table 2:
+
+Table 2: Heterogeneous setup for ImageNet training.
+
+Instances GPUs GPU type Cores RAM, GB CPU type
+
+4
+
+1 V100-PCIe 6
+
+64
+
+E5-2650v4
+
+17
+
+2 GTX 1080Ti 8
+
+64
+
+E5-2650v4
+
+7
+
+1 GTX 1080Ti 4
+
+32
+
+E5-2650v4
+
+16
+
+1
+
+P40
+
+4
+
+32
+
+E5-2667v2
+
+20
+
+1 M40-24GB 4
+
+32
+
+E5-2667v2
+
+H.2 ALBERT training
+Homogeneous. For the homogeneous setup, we use a single virtual machine with the following speciﬁcations:
+• GPU: 8× V100-PCIe, • CPU: 48 vCPUs (Xeon E5-2650v4), • RAM: 488GB.
+At the time of writing, the cloud rent cost for this instance is $24.48 per hour.
+Heterogeneous. Our heterogeneous setup is composed of two parts: AWS EC2 Spot instances and crowdsourced machines from the Vast.ai marketplace. For spot instances, we picked the smallest suitable instance size available from the cloud provider and further limited their bandwidth to 1Gb/s10. As for marketplace instances, we report the hardware speciﬁcations for each worker gathered 1 hour after the start of ALBERT training.
+Since both cloud and marketplace instances are preemptible, the actual cost of the server ﬂeet will vary based on the current price. For simplicity, we report the maximum hourly price we ended up paying for this instance (enforced via maximum bid). Finally, some marketplace instances have missing speciﬁcations, such as unknown CPU type. This is likely caused by non-standard virtualization conﬁgured by the device owner. The resulting ﬂeet conﬁguration, shown in Table 3, costs up to $15.43/hour, depending on the number of active instances.
+I Additional averaging experiments
+In this section, we evaluate the averaging precision with the same methodology as in 4.1, but for multiple different worker conﬁgurations.
+Table 4 provides the complete results of our experiments that were used to make conclusions in the main experimental section: instead of reporting the mean squared error for different iterations, we provide the number of rounds that was required to achieve the error of 10−9 and 10−4.
+In Figure 5, plots 1–5 explore several combinations of grid sizes and failure rates, whereas plot 6 (bottom right) demonstrates a setup with the same number of peers (106) arranged into several different grid sizes and its relation to convergence. Note that M =32 outperforms the alternatives only for the speciﬁc failure rate of 0.001.
+10We use tc qdisc Linux utility to artiﬁcially limit the network throughput, similarly to [127]
+46
+
+Table 3: Heterogeneous setup for ALBERT training.
+
+GPU Cores RAM, GB
+
+CPU type
+
+Download, Mb/s Upload, Mb/s Cost, $/hour
+
+Preemptible g4dn.xlarge instances (32×)
+
+T4
+
+4
+
+16
+
+Xeon Platinum 8259CL
+
+1000
+
+1000
+
+0.1578
+
+Marketplace instances
+
+GTX 1070Ti 6
+
+16
+
+E5-2640
+
+425
+
+GTX 1070Ti 6
+
+16
+
+i3-6100T
+
+121
+
+GTX 1080Ti 4
+
+20
+
+i3-6096P
+
+817
+
+GTX 1080Ti 20 129
+
+E5-2630v4
+
+660
+
+GTX 1080Ti 1
+
+16
+
+i7-7700K
+
+245
+
+GTX 1080Ti 48
+
+97
+
+Xeon Platinum 8124
+
+583
+
+GTX 1080Ti 10
+
+16
+
+Unknown
+
+n/a
+
+GTX 1080Ti 4
+
+16
+
+Xeon Gold 6149
+
+98
+
+GTX 1080Ti 4
+
+16
+
+Xeon Gold 6149
+
+99
+
+GTX 1080Ti 4
+
+16
+
+Xeon Gold 6149
+
+99
+
+GTX 1080Ti 4
+
+16
+
+Xeon Gold 6149
+
+99
+
+RTX 2070S 24
+
+32
+
+E5-2620v2
+
+199
+
+RTX 2070S 32
+
+97
+
+E5-2650
+
+162
+
+RTX 2080 6
+
+16
+
+E5-2620v3
+
+271
+
+RTX 2080 24
+
+32
+
+E5-2630v3
+
+199
+
+RTX 2080S 4
+
+32
+
+E5-2697v4
+
+101
+
+RTX 2080S 4
+
+32
+
+E5-2697v4
+
+93
+
+RTX 2080S 4
+
+32
+
+E5-2697v4
+
+94
+
+RTX 2080S 4
+
+32
+
+E5-2697v4
+
+94
+
+RTX 2080S 4
+
+32
+
+E5-2697v4
+
+100
+
+RTX 2080Ti 4
+
+16 Ryzen Threadripper 3960x
+
+279
+
+RTX 2080Ti 8
+
+129
+
+E5-2670v3
+
+616
+
+RTX 2080Ti 6
+
+32
+
+E5-2620v3
+
+217
+
+RTX 2080Ti 8
+
+16
+
+E5-2697v2
+
+100
+
+RTX 2080Ti 8
+
+21
+
+E5-2697v2
+
+145
+
+RTX 2080Ti 12
+
+32
+
+Unknown
+
+111
+
+RTX 2080Ti 12
+
+64
+
+E5-2690v3
+
+205
+
+RTX 3080 16
+
+16
+
+i7-10700K
+
+69
+
+RTX 3090 14
+
+32
+
+E5-2695v3
+
+93
+
+RTX 3090 16
+
+32
+
+Ryzen 9 3950X
+
+338
+
+Titan RTX 4
+
+32
+
+Xeon W-3223
+
+321
+
+Titan RTX 4
+
+32
+
+Xeon Gold 6149
+
+99
+
+Titan V 8
+
+32
+
+i7-7700K
+
+97
+
+V100-FHHL 8
+
+60
+
+Xeon Gold 6148
+
+544
+
+255
+
+0.036
+
+36
+
+0.06
+
+308
+
+0.101
+
+475
+
+0.182
+
+210
+
+0.302
+
+539
+
+0.217
+
+n/a
+
+0.15
+
+100
+
+0.2
+
+98
+
+0.2
+
+99
+
+0.2
+
+99
+
+0.2
+
+25
+
+0.199
+
+64
+
+0.285
+
+287
+
+0.25
+
+25
+
+0.302
+
+99
+
+0.292
+
+99
+
+0.292
+
+98
+
+0.292
+
+98
+
+0.292
+
+99
+
+0.292
+
+271
+
+0.35
+
+672
+
+0.201
+
+61
+
+0.22
+
+58
+
+0.3
+
+49
+
+0.243
+
+92
+
+0.326
+
+61
+
+0.549
+
+49
+
+0.462
+
+37
+
+0.498
+
+38
+
+0.511
+
+115
+
+1
+
+100
+
+0.702
+
+50
+
+0.282
+
+584
+
+0.39
+
+Total hourly cost (as listed):
+
+15.43
+
+J Additional image classiﬁcation experiments
+Aside from the two evaluation scenarios provided in 4.2, we also measure the performance of Moshpit-SGD in a non-distributed setup, i.e. on a single server with multiple GPUs. We conduct this experiment on the same 8× V100 machine that was used in the homogeneous setup for training ALBERT (see Appendix H.2).
+As Figure 6 demonstrates, Moshpit SGD is slower than AR-SGD by approximately 25%. This result is expected, since our implementation of Moshpit All-Reduce is more general and communicates over a TCP connection, whereas AR-SGD uses direct peer-to-peer GPU communication over PCIe. On average, this incurs a slowdown of 27% in terms of training time.
+
+47
+
+Table 4: Averaging performance of different algorithms. Values denote the number of iterations required to achieve the error of 10−9 (10−4 in parentheses), the best result is in bold.
+
+N
+512 512 512 512
+768 768 768 768
+900 900 900 900
+1024 1024 1024 1024
+
+p
+0 0.001 0.005 0.01
+0 0.001 0.005 0.01
+0 0.001 0.005 0.01
+0 0.001 0.005 0.01
+
+All-Reduce
+1.0 (1.0) 1.6 (1.6) 10.9 (10.9) 41.7 (41.7)
+1.0 (1.0) 1.8 (1.8) 28.7 (28.7) 50.0 (50.0)
+1.0 (1.0) 1.8 (1.8) 50.0 (50.0) 50.0 (50.0)
+1.0 (1.0) 2.0 (2.0) 42.6 (42.6) 50.0 (50.0)
+
+Gossip
+50.0 (50.0) 50.0 (50.0) 50.0 (50.0) 50.0 (50.0)
+50.0 (50.0) 50.0 (50.0) 50.0 (50.0) 50.0 (50.0)
+50.0 (50.0) 50.0 (50.0) 50.0 (50.0) 50.0 (50.0)
+50.0 (50.0) 50.0 (50.0) 50.0 (50.0) 50.0 (50.0)
+
+PushSum
+47.6 (15.6) 47.6 (15.6) 47.8 (15.6) 47.8 (15.6)
+43.2 (13.8) 43.2 (13.8) 43.2 (14.1) 43.9 (14.2)
+45.0 (14.7) 45.0 (14.7) 45.2 (14.7) 45.6 (14.9)
+49.0 (16.2) 49.0 (16.3) 49.5 (16.3) 49.5 (16.3)
+
+Random groups
+6.1 (3.0) 6.3 (3.0) 6.3 (3.0) 6.6 (3.0)
+6.2 (3.0) 6.5 (3.0) 6.6 (3.0) 7.0 (3.0)
+6.4 (3.0) 6.3 (3.0) 6.7 (3.0) 7.0 (3.1)
+6.2 (3.0) 6.5 (3.0) 6.7 (3.0) 6.9 (3.1)
+
+Moshpit
+8.2 (3.5) 8.1 (3.7) 8.7 (3.9) 9.1 (3.9)
+6.0 (3.0) 6.2 (3.0) 6.6 (3.0) 6.8 (3.0)
+5.0 (2.8) 5.5 (3.0) 5.9 (3.0) 6.4 (3.1)
+2.0 (2.0) 3.4 (2.2) 5.4 (2.9) 5.9 (3.0)
+
+Mean squared error
+
+Grid 8x8
+
+Grid 8x8x8
+
+Grid 8x8x8x8
+
+10 1
+
+N=50, p=0 N=50, p=0.005
+
+10 1
+
+N=470, p=0 N=470, p=0.001
+
+10 1
+
+N=3700, p=0 N=3700, p=0.001
+
+10 3
+
+N=50, p=0.01 N=50, p=0.02
+
+10 3
+
+N=470, p=0.0025 N=470, p=0.0075
+
+10 3
+
+N=3700, p=0.005 N=3700, p=0.01
+
+10 5
+
+10 5
+
+N=470, p=0.01
+
+10 5
+
+10 7
+
+10 7
+
+10 7
+
+10 9
+
+10 9
+
+10 9
+
+10 11
+
+10 11
+
+10 11
+
+10 13
+
+10 13
+
+10 13
+
+10 15
+
+10 15
+
+10 15
+
+Mean squared error
+
+0
+10 1 10 3 10 5 10 7 10 9 10 11 10 13 10 15
+
+5
+
+10
+
+15
+
+20
+
+25
+
+0
+
+5
+
+10 15 20 25 30
+
+0
+
+5
+
+10 15 20 25 30
+
+Grid 32x32x32
+
+Grid 256x256
+
+Varying grid size
+
+N=29 000, p=0 N=29 000, p=0.001
+
+10 1
+
+N=29 000, p=0.002 N=29 000, p=0.004
+
+10 3
+
+10 5
+
+N=29 000, p=0 N=29 000, p=0.001
+
+10 1
+
+N=29 000, p=0.002 N=29 000, p=0.004
+
+10 3
+
+10 5
+
+Grid 1024^2, N=10^6, p=0.001 Grid 32^4, N=10^6, p=0.001 Grid 4^10, N=10^6, p=0.001
+
+10 7
+
+10 7
+
+10 9
+
+10 9
+
+10 11
+
+10 11
+
+10 13
+
+10 13
+
+10 15
+
+10 15
+
+0
+
+5
+
+10
+
+15
+
+20
+
+25
+
+0
+
+5
+
+10
+
+15
+
+20
+
+25
+
+0
+
+20
+
+40
+
+60
+
+80
+
+Moshpit All-Reduce steps
+
+Moshpit All-Reduce steps
+
+Moshpit All-Reduce steps
+
+Figure 5: Averaging error of Moshpit All-Reduce as a function of the iteration number for different
+
+conﬁgurations and failure rates.
+
+48
+
+75%
+
+42.8
+
+53.2
+
+75%
+
+Top-1 validation accuracy
+
+50%
+
+50%
+
+25%
+
+AR-SGD, local
+
+0%
+
+Moshpit SGD, local
+
+0h 8h 16h 24h 32h 40h 48h 56h 64h Training time (hours)
+
+25%
+
+AR-SGD, local Moshpit SGD, local 0%
+
+0
+
+15
+
+30
+
+45
+
+60
+
+75
+
+90
+
+Training epochs
+
+Figure 6: ResNet-50 top-1 validation accuracy on ImageNet when training on a single node with 8× V100-PCIe GPUs. (Left) Convergence in terms of training time, (Right) Convergence in terms of training epochs
+
+49
+
+

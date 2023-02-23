@@ -1,0 +1,559 @@
+A STUDY OF TRANSDUCER BASED END-TO-END ASR WITH ESPNET: ARCHITECTURE, AUXILIARY LOSS AND DECODING STRATEGIES
+Florian Boyer1,2, Yusuke Shinohara3, Takaaki Ishii3, Hirofumi Inaguma4, Shinji Watanabe5,6
+1 Airudit, Speech Lab., 2 LaBRI, Bordeaux INP, CNRS, UMR 5800, 3 Yahoo Japan Corporation, 4 Kyoto University, 5 Carnegie Mellon University, 6 Johns Hopkins University
+
+arXiv:2201.05420v1 [eess.AS] 14 Jan 2022
+
+ABSTRACT
+In this study, we present recent developments of models trained with the RNN-T loss in ESPnet. It involves the use of various architectures such as recently proposed Conformer, multi-task learning with different auxiliary criteria and multiple decoding strategies, including our own proposition. Through experiments and benchmarks, we show that our proposed systems can be competitive against other state-of-art systems on well-known datasets such as LibriSpeech and AISHELL-1. Additionally, we demonstrate that these models are promising against other already implemented systems in ESPnet in regards to both performance and decoding speed, enabling the possibility to have powerful systems for a streaming task. With these additions, we hope to expand the usefulness of the ESPnet toolkit for the research community and also give tools for the ASR industry to deploy our systems in realistic and production environments. Index Terms: end-to-end speech recognition, RNN-T loss, auxiliary task, decoding strategies
+1. INTRODUCTION
+In recent years, end-to-end models based on either CTC [1], attention encoder-decoder [2], or RNN-Transducer [3] have gained a lot of attention from the speech recognition community, surpassing traditional hybrid ASR systems on various speech recognition tasks. Among them, transducer1 was found successful in both research and industry environments for its competitive results and its natural ability for streaming [4, 5].
+Following this trend, many open-source speech recognition toolkits now support this model and provide various architectures and features for training and decoding, with an emphasis on different aspects. Tencent’s Pika for example improves the training procedure by introducing Minimum Bayes Risk training and explores composition with architectures such as Causal convolution and TDNN [6]. RETURNN on the other hand focuses on variant topologies for RNN-T such as RNA [7] and makes corresponding training tools available [8]. NVIDIA’s NeMo [9] includes state-of-art architectures alongside QuartzNet [10] and also provides streaming examples in order to enable production-level ASR. In the same vein, TensorﬂowASR [11] capitalizes on the recent advances in the ﬁeld and offers new state-of-art architectures such as Transformer [12] and Conformer [13] and also extensively works on streaming techniques. Finally, recently proposed SpeechBrain [14] acts as an all-in-one toolkit for speech processing and proposes generic tools to train and decode transducer models but also provides many networks, in particular Quaternion [15].
+All of them provide strong tools to reach state-of-art performance or improve decoding speed. However, some important as-
+1We refer to ”transducer” from here due to the different architecture.
+
+pects of transducer models are not addressed, such as the unrestricted label expansion during training and decoding [3, 16, 17], where an unknown number of labels can be emitted at each timestep. This speciﬁc behavior removes vectorization capability and can greatly impact decoding speed and performance [18, 19]. Additionally, none of them provide tools to improve the generalization ability of the transducer models via auxiliary learning [20, 21, 22], which could also help restricting the search space during training without applying strong constraints such as monotonic alignements [17].
+In this work, we present an extension of ESPnet [23], developed to accelerate the research related to this particular model. The extension not only supports composition with architectures such as TDNN, Transformer or Conformer, but also many training and decoding tools. Table 1 summarizes the features in the ESPnet toolkit against the mentioned open-source toolkits. To address the described issues, we focus on introducing and investigating two newly proposed features in the toolkit which are missing from other toolkits: 1) multi-task learning with several auxiliary tasks to improve performance and also reduce the number of expansions at each timestep during training and 2) various beam search strategies, including our own proposition called N-step Constrained Beam Search, to control the expansion behavior during decoding and also enable different optimizations such as vectorization. In addition, we will release all conﬁgurations, recipes and pre-trained models to the community through ESPnet so that everyone can reproduce our experiments and accelerate the research related to transducer models.
+
+2. TRANSDUCER
+
+The transducer architecture proposed by Graves [3] consists of an
+encoder, a decoder and a joint network. The encoder, analogous to
+an acoustic model, encodes a sequence of acoustic features vectors x of length T into a high representation hetnc, where t ≤ T :
+
+hetnc = Encoder(x1:T )
+
+(1)
+
+The decoder, acting as a language model, produces a high representation hduec of length U given its previous emitted label sequence
+
+y1:u−1 :
+
+hduec = Decoder(y1:u−1)
+
+(2)
+
+The joint network combines each representations hetnc and hduec to compute output logits hjto,iunt via a network composed of feed-forward
+
+layers and a non-linear function:
+
+hjto,iunt = Joint(hetnc, hduec)
+
+(3)
+
+Finally, by applying a Softmax function to the output logits, we can produce the distribution of current target probabilities:
+
+P (yt,u|x1:T , y1:u−1) = Softmax(hjto,iunt)
+
+(4)
+
+Table 1. Comparison with other open-source toolkits supporting transducer models, where ” ” represents the ongoing status and ”(x)”
+
+denotes the number of supported techniques for a category.
+
+NeMo
+
+pika RETURNN Speechbrain TensorﬂowASR ESPnet
+
+RNN
+
+Transformer
+
+Conformer
+
+Quaternion
+
+QuartzNet
+
+TDNN encoder
+
+Causal-conv1d decoder
+
+Support CPU training?
+
+Support discriminative training criterions?
+
+(1)
+
+(2)
+
+(1)
+
+(1)
+
+(1)
+
+Support free-form architecture?
+
+Support layer-by-layer parametrization?
+
+Support auxiliary tasks?
+
+Support various beam search decoding strategies?
+
+(3*)
+
+(4)
+
+Support streaming (online decoding)?
+
+* Borrowed from ESPnet. See mention in BeamRNNTInfer class
+
+Given A, the set of all possible alignments a between input x1:T and output y1:U with blank labels (∅) included, the loss function of the model can be computed as the following negative log likelihood:
+
+Ltrans = −log P (a|x1:T )
+
+(5)
+
+a∈A
+
+Ltrans can be minimized using the forward-backward algorithm proposed in [3].
+
+3. FRAMEWORK
+
+Fig. 1. Transducer architecture with auxiliary tasks. In black, the original structure. In red, the new losses, connexions and intermediate networks.
+
+The transducer architecture in ESPnet follows the same encoderdecoder architecture described in [23] used for joint CTC-Attention. Here, each part of the architecture, excluding the joint network, is separated into two sub-parts. Thus, Eq. 1 is replaced by Eq. 6 for the encoder and Eq. 7 is used instead of Eq. 2 for the decoder.
+hptre = EncPre(x1:T ) (6) hetnc = EncBody(hptre) hdyeuc−1 = DecPre(yu−1) (7) hduec = DecBody(yu−1) EncPre(·) can be either a 2-layer CNN [12] or a VGG-like max pooling [24]. DecPre(·) can be either an embedding layer or a linear layer. Following recent advances in ESPnet, various architectures are made available for EncBody(·) and DecBody(·) such as: RNN and variants [23], Transformer [25], Transformer with lightweight and dynamic convolution [26], or Conformer [27]. Additionally, we introduce what we call free-form architecture deﬁnition. Here, every components and parameters of the transducer model architecture can be deﬁned and tuned individually. Compared to other models in ESPnet, this also allows us to freely combine previously presented neural networks together or with additional ones (e.g.: Linear, TDNN and Causal-Conv1d [6]) to form a new architecture for EncBody(·) and DecBody(·).
+4. AUGMENTED TRAINING
+Alongside the standard training procedure, we propose an augmented procedure based on various auxiliary tasks. This section describes the ones made available in the ESPnet toolkit.
+4.1. Multi-task learning
+The new transducer structure is augmented by four classiﬁer layers used to train auxiliary tasks alongside the standard transducer criterion. The proposed architecture is depicted in Fig. 1, where a single
+
+encoder layer is used to compute Laux-trans and Lsymm-KL (See explanations in Sec. 4.3 and 4.4). The ﬁve losses can be simultaneously trained and jointly optimize the total loss function Ltot deﬁned as:
+
+Ltot = λtrans Ltrans + λCTC LCTC + λaux-trans Laux-trans
+
+(8)
+
++ λsymm-KLLsymm-KL + λLM LLM
+
+where Ltrans is the main transducer loss, LCTC the CTC loss, Laux-trans the auxiliary transducer loss, Lsymm-KL the symmetric KLdivergence and LLM the LM loss. λx deﬁnes their respective contribution to the overall loss. Additionally, each loss can be independently selected or omitted depending on the task.
+
+4.2. CTC loss (LCTC)
+Similarly to monotonic RNN-T [17] limiting the number of emitted labels at each timestep to strictly one, we explore the use of another (soft) regularization for transducer model through the auxiliary CTC [28]. In addition to the previously found successful encoder preinitialization with the CTC model [29], here, we jointly train the transducer loss and the CTC loss in the same manner as joint CTCAttention [30] in ESPnet.
+
+4.3. Auxiliary transducer loss (Laux-trans)
+
+To address encoder underﬁtting due to major role given by the de-
+
+coder in a transducer model, we incorporate the auxiliary transducer
+
+loss proposed by Liu et al. [22] to increase the gradients signals.
+
+Following their proposed method, one or multiple encoder repre-
+
+sentations
+
+h
+
+enc-auxl t
+
+,
+
+from
+
+intermediate
+
+layers
+
+l
+
+∈
+
+L,
+
+are
+
+passed
+
+to
+
+an auxiliary RNN-T criterion, where an additional MLP network is used in place of the linear layer in the joint network:
+
+hjto,iunt-auxl
+
+=
+
+JointAux(
+
+MLP
+
+(h
+
+enc-auxl t
+
+)
+
+,
+
+h
+
+dec u
+
+)
+
+(9)
+
+Contrary to the original proposition we choose, based on early experiments, to use an independent joint network we train exclusively for the auxiliary task. However, we do not update the shared decoder parameters and joint parameters if the gradients are back propagated from the auxiliary RNN-T loss.
+
+4.4. Symmetric KL-divergence (Lsymm-KL)
+
+We also consider the use an auxiliary symmetric KL-divergence criterion proposed in [22] to penalize inconsistent gradients during supervision with auxiliary transducer loss.
+
+1T L1U
+
+Lsymm-KL = T
+
+I (l)[ U
+
+t=1 l=1 u=1
+
+1
+
+joint joint-aux (10)
+
+2 (DKL(Softmax(ht,u ), Softmax(ht,u l ))+
+
+DKL(Softmax(hjto,iunt-auxl ), Softmax(hjto,iunt))],
+
+where L deﬁnes the set of encoder layers and I(l) is a binary indicator to denote whether a layer is used for the auxiliary task.
+
+4.5. LM loss (LLM)
+
+Finally, we explore the use of an auxiliary criterion in order to improve and to regularize the decoder network playing a major role in predicting yu. Because the decoder is analogous to a language model, we deﬁne auxiliary criterion as a language model criterion, where the ﬁnal computed loss is based on cross-entropy loss with label smoothing [31]. This addition was also proposed in [28] and also used to optimize the decoder independently.
+
+5. DECODING
+We support four beam search decoding strategies for transducer to allow more ﬂexibility in regards to performance-speed trade-off and the target task. The ﬁrst one, our default algorithm (Sec. 5.1), expands the label sequence in a unrestricted manner, the second one (Sec. 5.2) acts label-synchronously and the last two strategies (Sec. 5.3 and Sec. 5.4) runs along time axis. For three of them, we enable hypotheses caching and batching to reduce the computation time. Shallow fusion with a RNN-based or Transformer-based LM and multi-level LM [32] is also supported.
+
+5.1. Default beam search
+The default decoding strategy for transducer in ESPnet is based on the beam search algorithm proposed by Graves in [3]. The procedure runs alongs both axis {1, ..., T } and {1, ..., U } and can be expanded in an unrestricted manner. The algorithm is performed using two sets of hypotheses A and B, respectively the set of hypotheses for times t and t + 1, where B contains ∅ hypothesis at t = 0. At each timestep t, hypotheses from B are ﬁrst moved to A. The best hypothesis from A is extracted and expanded with either a blank transition or non-blank transition. Hypotheses ending with a blank transition are stocked in B whereas the others are moved to A, where each hypothesis’ score is updated with the corresponding blank or non-blank transition score. Through a while loop, the procedure is repeated until B contains at least Nbs hypotheses more probable than
+
+the most probable in A. When the condition is met, B is pruned to Nbs hypotheses and passed to the next timestep. At the end of the procedure when t = T , the N-best hypotheses in B are returned sorted by descending score.
+Based on initial experiments, the preﬁx search part was removed. We found out that it does not necessary insure that the search space won’t be redundant without additional duplication check and, in the end, most probable hypotheses are still retained. Thus, removing that part allows us to reduce the computational cost without trading off much of the search accuracy.
+5.2. Alignment-length synchronous decoding (ALSD)
+Algorithm 1: Alignment-length synchronous decoding [19] Input: he1n:cT , Umax, Nbs and Nbest B = {∅, 1, stated0ec}; F = {} for i = 1 ... T + Umax do A = {} for (y, δi−1(y), statedue−c 1) ∈ B do u = |y| t=i-u+1 if t > T then continue
+hduec, stateduec = Decoder(y, statedue−c 1) ppr = Softmax(Joint(hetnc, hduec)) δi(y) = δi−1(y) ∗ ppr(∅) A = A ∪ {(y, δi(y), statedue−c 1)} if t == T then
+F = F ∪ {(y, δi(y))}
+for k ∈ Y do δi(y + k) = δi−1(y) ∗ ppr(k) A = A ∪ {(y + k, δi(y + k), stateduec)}
+B = PruneAndRecombineHyps(A)[:Nbs]
+Return: SortedByScore(F )[:Nbest]
+Alignment-length synchronous decoding is the procedure proposed by Saon et al. [19] which runs along axis {1, ..., U } and uses Umax parameter, an estimate of the maximum output sequence length, where Umax < T . The procedure keeps track of 2 set of hypotheses A and B at alignment step i and i − 1. At step i, for each hypothesis of B, the number of frames covered by the output sequence y is computed by subtracting its length from i + 1, then the hypothesis is added to A with its score (δx) updated by adding the blank transition score. If the last frame is reached, the hypothesis is also put into the set of ﬁnal hypotheses F . After that, each y of A are expanded with every output label minus blank, and each new hypothesis is added to A with its corresponding score and decoder network state updated. Finally, a pruning is applied for the set A and duplicate hypotheses are merged altogether with their respective score added. The set of unique hypotheses, reduced to the beam size (Nbs), become the set B for the next alignment step. At the end of the procedure, the N-best (Nbest) hypotheses in F are returned sorted by descending score. The complete procedure is given in Algo. 1.
+5.3. Time-synchronous decoding (TSD)
+Time-synchronous decoding is a procedure also proposed by Saon et al. [19]. It runs along axis {1, ..., T } and uses a parameter max sym exp to control the number of hypotheses expansion at each timestep. Algorithm 2 shows the complete procedure and can
+
+Algorithm 2: Time synchronous decoding [19] Input: he1n:cT , max sym exp, Nbs and Nbest B = {∅, 1, stated0ec} for t = 1 ... T do A = {}; C = B for v = 1 ... max sym exp do D = {} for (y, δt−1,u−1(y), statedue−c 1) ∈ C do hduec, stateduec = Decoder(y, statedue−c 1) ppr = Softmax(Joint(hetnc, hduec)) if y ∈/ A then δt,u−1(y) = δt−1,u−1(y) ∗ ppr(∅) A = A ∪ {(y, δt,u−1(y), statedue−c 1)} else δt−1,u(y) = δt−1,u−1(y) ∗ ppr(k)
+if v < max sym exp then for k ∈ Y do δt−1,u(y + k) = δt−1,u−1(y) ∗ ppr(k) D = D∪{(y+k, δt−1,u(y+k), stateduec)}
+C = PruneHyps(D, Nbs)
+B=A
+Return: SortedByScore(B)[:Nbest]
+be described as follow. Here, the procedure keep track of 4 set of hypotheses, where A and B store hypotheses for times t and t − 1 and C and D store hypotheses for expansion steps v − 1 and v. At each timestep, in case of a blank transition, hypotheses from C are added to A with blank score added to their score if y ∈ A, otherwise scores ((δx) are summed. For a non-blank transition, hypotheses from C are expanded with every output label minus blank and added to set D with their score updated. After that, hypotheses from D are pruned to deﬁne a new set C limited to Nbs hypotheses. The procedure is then repeated max sym exp times. When v reaches max sym exp, hypotheses from A are stored in B and the procedure is repeated for each timestep. At the end of the procedure, the N-best (Nbest) hypotheses in B are returned sorted by a descending score.
+5.4. N-step constrained beam search (NSC)
+We also include an improved version of the One-Step Constrained (OSC) beam search proposed by Kim et al. [33], which originally constrains the default beam search to a single label emission plus blank label at each timestep. Although the authors demonstrate the efﬁciency of the algorithm for different speech recognition tasks and investigate the number of emitted labels at each timestep during the expansion search for the presented tasks, we found the initial constraint too strong, resulting in two weakness:
+1. For low-resources tasks, the number of needed label emissions at each timestep should be higher than 1 as shown Table 2. Here, the investigation on expansion search was conducted on two smaller corpora, VIVOS (15 hours) and Voxforge (20 hours), and a signiﬁcant number of more than one expansions was observed in comparison to the initial investigation (+4.24% for Voxforge and +7.28% for VIVOS).
+2. If no equivalent constraint is applied during training (e.g.: [17]), adding a blank transition score after each expansion may result in the deletion of reasonable hypotheses during
+
+Algorithm 3: N-step constrained beam search.
+Input: henc, Nstep, auto-Nstep, α, Nbs and Nbest hdbeactch, statedbeactch = BatchDecoder(∅, Duplicate(stated0ec, Nbs)) B = {∅, 1, hdbeactch0 , statedbeactch0 } for t = 1 ... T do
+A = SortedByLength(B); B = {} for (yi, δ(yi)) ∈ A do
+δ(yi) += yˆ δ(yˆ) ∗ δ(yi|yˆ, t) where yˆ ∈ pref (yi) ∩ A and |yi| − |yˆ| < α
+S = {}; V = {} for n = 1 ... Nstep do
+hdAec = {hdye1c, ..., hdyeNc } ∈ A bs
+ppr = Softmax(Joint(het nc, hdAec)) for (yi, δ(yi), hdyeic, statedyeic) ∈ A do
+δ(yi) = δ(yi) ∗ ppr(∅) S = S ∪ {(yi, δ(yi), hdyeic, statedyeic)} for k ∈ Y do
+δ(yi + k) = δ(yi) ∗ ppr(k) V = V ∪{(yi+k, δ(yi+k), hdyeic, statedyeic)}
+V = SubstractSet(SortedByScore(V ), B)[:Nbs] ybatch = {y1, ..., yNbs } ∈ V statedbeactch = {statedye1c, ..., statedyeNc } ∈ V
+bs
+hdbeactch, statedbeactch = BatchDecoder(ybatch, statedbeactch) if n < Nstep − 1 then
+for (yi, hdyeic, statedyeic) ∈ V do hdyeic = hdbeactchi statedyeic = statedbeactchi
+A=V else
+ppr = Softmax(Joint(het nc, hdbeactch)) for (yi, δ(yi), hdyeic, statedyeic) ∈ V do
+if Nstep = 1 and auto-Nstep = 1 then δ(yi) = δ(yi) ∗ ppr(∅)
+hdyeic = hdbeactchi statedyeic = statedbeactchi
+B = SortedByScore(S + V )[:Nbs]
+return: SortedByScore(B)[:Nbest]
+the pruning process and sorting phase.
+In order to address these issues, we propose a novel N-Step Constrained beam search (NSC) algorithm. The algorithm is similar to the TSD (Sec. 5.3) and extends the original OSC algorithm to N expansion steps (plus blank) through an additional loop controlled by a parameter Nstep. To overcome the second issue, we add a new condition for the ﬁnal expansion step in NSC. If Nstep = 1 and auto-Nstep > 1, then we allow incomplete hypotheses to be passed to the next time step without adding the blank score transition. The parameter auto-Nstep is obtained by a counting method, built upon default beam search (See Sec. 5.1), which computes the expected number of needed expansions. The complete procedure is given by Algorithm 3, where lines highlighted in red refer to our addition to the original OSC algorithm, and the parameters Nbs and Nbest deﬁne respectively the beam size and the N best hypotheses.
+With the exception of default beam search, all strategies propose to resolve the unrestricted expansion in transducer model by
+
+Table 2. Number of expansions (%) during expansion search.
+
+VIVOS Voxforge TIMIT [33]
+
+Num. exp % exp. % exp.
+
+% exp.
+
+1
+
+89.62 93.18
+
+97.73
+
+2
+
+9.52
+
+6.48
+
+2.24
+
+3
+
+0.86
+
+0.34
+
+0.03
+
+controlling the search space either time-synchronously (TSD, OSC NSC) or label-synchronously (ALSD). While the latter was found promising in regards to its decoding speed, it cannot be used for streaming [19]. For the strategies running along time axis, OSC and TSD shown some drawbacks compared to our proposed algorithm, which can be summarized as follow: 1) OSC rely on a too strong constraint resulting in performance degradation for some tasks such as low resources and 2) TSD, while adding more control to alleviate previous issue, fell short against our own due to the blank transition score addition on some edge cases (see Sec. 6.2.)
+
+6. EXPERIMENTS
+Our experiments are formulated as follow. First, we investigate the proposed training augmentation through several experiments. Second, we compare the decoding strategies in regards to both error rate and real-time factor. Finally, we present a comparison against other models in ESPnet and state-of-art systems on different datasets. For the ﬁrst two sections, we use the Voxforge italian dataset [34] (∼ 20 hours), which has the advantages of being free and experiments are easily reproducible without a consequent need in terms of resources. For the last section, we use LibriSpeech [35] and AISHELL-1 [36]. For the different conﬁgurations and the pre-trained models used in our experiments , we refer the reader to the ESPnet toolkit where all needed resources will be made available.
+
+6.1. Architecture and training augmentation
+To assess the effectiveness of the auxiliary tasks, we conduct several experiments with a RNN-T model on the Voxforge dataset. In order to perform our primary experiments, we ﬁrst need to rank our auxiliary tasks, based on the observed average CER/WER gain, and select an optimal weight for each task. Thus, we performed an empirical study where we test every possible weights for each task (i.e.: 0 < λx < 1.0 in Eq. 8) under two training conditions: 1) with a single auxiliary task and 2) with every combination of auxiliary tasks. From here, our ﬁnal ranking is as follows: 1) LCTC with λCTC = 0.5, 2) LLM with λLM = {0.4, 0.5}, 3) Laux-trans with λaux-trans = 0.3 coupled to Lsymm-KL with λsymm-KL = 0.2, and ﬁnally Laux-trans alone with the same weight. While we observed an average gain in terms of CER and WER with LCTC and LLM, Laux-trans, paired or not with Lsymm-KL, was found beneﬁcial only with speciﬁc weights and encoder layer(s) connected.
+For our ﬁrst primary analysis, we perform an ablation study on the RNN-T system using all auxiliary task to understand how each task contributes to the overall task. The results of our study are reported in Table 3, where task are removed by descending order based on the initial ranking. Overall, most auxiliary tasks contribute to the main task with the exception of Laux-trans adding errors at character level to improve WER and Lsymm-KL slightly improving the WER only. Most improvement come from the addition of LCTC and LLM, with a CER/WER decrease on the dev and test set of respectively -0.6%/-0.5% and -0.6%/-0.3% for the ﬁrst, and -0.5%/-1.6% and 0.2%/-1.1% for the latter. While the auxiliary CTC addition mostly
+
+Table 3. Ablation results on the dev and test sets of Voxforge. CER and WER (in %) are reported with the default beam search.
+
+Model
+
+CER WER CER WER
+
+Attention RNN [25] Conformer [27]
+Transducer (ours) Augmented RNN-T – Lsymm-KL – Laux-trans – LLM – LCTC
+
+12.9 8.7
+12.2 12.2 12.1 ↓ 12.5 ↑ 13.1 ↑
+
+n.a n.a
+41.7 42.0 ↑ 42.3 ↑ 43.9 ↑ 44.4 ↑
+
+12.6 8.2
+11.5 11.5 11.4 ↓ 11.6 ↑ 12.2 ↑
+
+n.a n.a
+40.4 40.5 ↑ 41.0 ↑ 42.1 ↑ 42.4 ↑
+
+Table 4. Comparaison of auxiliary tasks against transfer learning (p.t.) and decoding with ext. LM. CER and WER (in %) are reported on Voxforge dev and test set with the default beam search.
+
+Model
+
+CER WER CER WER
+
+RNN-T RNN-T + LCTC RNN-T + LLM RNN-T + LCTC + LLM
+
+13.1 44.4 12.2 42.4 12.6 43.9 11.6 42.1 13.0 42.9 12.1 41.6 12.2 42.3 11.4 41.0
+
+RNN-T w/ p.t. CTC
+
+12.3 44.5 11.2 42.3
+
+RNN-T + ext. LM RNN-T w/ p.t. LM
+
+12.8 42.3 12.0 40.9 12.8 43.0 12.3 42.0
+
+RNN-T + LCTC + ext. LM
+
+12.4 42.2 11.5 40.6
+
+RNN-T w/ p.t. LM + LCTC
+
+12.7 44.2 12.0 43.3
+
+RNN-T w/ p.t. CTC + ext. LM 12.1 42.4 11.0 40.9
+
+RNN-T w/ p.t. CTC + LLM
+
+11.8 42.1 10.9 40.5
+
+decreases the number of errors at character level by enforcing monotonicity, adding LM criterion further improves decoder prediction resulting in a signiﬁcative gain in terms of the WER.
+Next, we compare our two best performing auxiliary tasks, LCTC and LLM, against other techniques incorporating CTC and LM tasks: 1) transfer learning with a pre-trained CTC model for the encoder part [29] and a pre-trained language model [37] for the decoder part, and 2) decoding with an external language model. The table 4 summarizes our experiments, where ”ext. LM” refers to the external LM and ”p.t. X” to the transfer of pre-trained weights from a model X. Relying on a pre-trained CTC model for encoder initialization results in a lower CER and an higher WER compared to training a transducer model with LCTC. For the LM task, training a vanilla RNN-T and using an external LM for decoding brings the most improvement (avg. -0.15% CER and -0.9% WER) at the cost of a signiﬁcant increase in terms of decoding time (almost doubled). Using transfer learning or LLM to regularize the decoder part during training brings almost the same performance, with a slightly better performance in terms of CER (-0.2%) for the ﬁrst and a WER improvement (-0.25%) for the latter. From our observation, transfer learning for either part of the model makes the model starts with more emphase on the conditional independence between predictions in comparison to training the model with an auxiliary task.
+From here, we extend our investigation with a comparison between different pairs of techniques. Most pairs seems to work well together and further decrease both CER and WER compared to training with a single technique. Notably, we found out that preinitializing the encoder with a CTC model and adding an auxiliary
+
+Fig. 2. CER against RTF for the decoding strategies. (1) denotes the baseline model and (2) the model trained with auxiliary tasks.
+LM task during training to focus on the decoder part decrease significantly the number of errors at character level compared to training with LCTC and LLM. That setup also outperforms our model trained with all auxiliary tasks in terms of CER (avg. -0.4%) but brings more errors at a word level (+0.25% WER). Additionally, we observed a serious performance degradation for both CER and WER when initializing the decoder with a pre-trained LM and training the model with LCTC. Finally, using an external LM during decoding further improves CER and WER under all conditions.
+6.2. Investigation on decoding strategies
+Figure 2 compares the decoding strategies, introduced in section 5, with different parameter values in terms of CER vs RTF, averaged on 5 runs. We use the vanilla RNN-T and the RNN-T trained with all auxiliary tasks, and a beam of size 5 under all conditions. Three different values are evaluated for each algorithm: [25, 50, 100] for Umax in ALSD, [2, 3, 4] for max sym exp in TSD and [1, 2, 3] for Nstep in NSC. All experiments were performed using a CPU Intel i7-6950X limited to one thread (the default setting in ESPnet).
+With the baseline model, ALSD outperforms all other algorithms in terms of the decoding speed, with a maximum RTF of 0.1, comparable to the best RTF observed for frame-synchronous strategies. For the latter, TSD and NSC, reducing each time by one the value for the parameter controlling number of emitted labels, respectively max sym exp and Nstep, results in an average 25% RTF reduction but increase the CER. Because TSD suffers from the same issue as OSC (See 5.4), its performance is signiﬁcantly impacted when max sym exp = 2, resulting in an CER increase of 80% while NSC with Nstep = 1 is increased by 36%. Reducing Umax for ALSD also signiﬁcantly impacts the CER (+29% with Umax = 25). Using auxiliary tasks reduces the number of emitted labels by timestep, mainly due to the auxiliary CTC. Compared to the report in Table 2, we denote the following: 96.32% of 1expansion, 3.5% of 2-expansion and 0.18% of 3-expansion. The overall RTF is only slightly reduced but it results in a lower CER increase for the frame-synchronous strategies, notably: 37% and 9.5% for respectively TSD with max sym exp = 2 and NSC with Nstep = 1. For ALSD, the impact on CER and RTF is similar but the strategy with Umax = 25 is now outperformed in terms of CER by NSC with Nstep = 1 (16.1% vs 12.6% CER). In regards to the CER/RTF trade-off, NSC with these parameters seems promising in comparison to our default algorithm.
+6.3. Performance comparison
+We evaluate ESPnet’s transducer models on AISHELL-1 [36] and LibriSpeech [35] to compare their performance with other models
+
+Table 5. CERs (%) on the dev/test sets of AISHELL-1.
+
+Model
+
+Dev Test
+
+Attention
+
+RNN [25]
+
+6.8 8.0
+
+Conformer [27]
+
+4.4 4.7
+
+Transducer
+
+RNN-T [38]
+
+10.1 11.8
+
+Conformer-T [39] n/a 5.4
+
+Transducer (ours)
+
+RNN-T
+
+6.3 7.2
+
+RNN-T + Aux
+
+6.2 6.9
+
+Conformer-T
+
+4.5 5.0
+
+Conformer-T + Aux 4.3 4.7
+
+Table 6. WERs (%) on the dev/test sets of LibriSpeech.
+
+Model
+
+Dev clean other
+
+Test clean other
+
+Other Open-Source Toolkits
+
+NeMo (QuartzNet) [10]
+
+n/a
+
+n/a
+
+2.69 7.25
+
+SpeechBrain (Transformer) [14] n/a
+
+n/a
+
+2.46 5.86
+
+RETURNN (Transducer) [40] 2.17
+
+5.28
+
+2.23
+
+5.74
+
+ESPnet (Conformer) [27]
+
+1.9
+
+4.9
+
+2.1
+
+4.9
+
+Transducer (ours)
+
+RNN-T
+
+4.0
+
+11.2
+
+4.2
+
+11.4
+
+RNN-T + Aux
+
+3.8
+
+10.8
+
+4.0
+
+10.9
+
+Conformer-T + Aux
+
+2.7
+
+6.7
+
+2.9
+
+6.8
+
++ LM shallow fusion
+
+2.4
+
+5.9
+
+2.6
+
+6.1
+
+in the literature. Speciﬁcally, RNN-T and Conformer-T models without and with auxiliary tasks are evaluated, where LCTC is used for AISHELL-1, and LCTC and LLM are used for LibriSpeech. The default beam search is used with a beam size of 10 for both datasets. Table 5 presents the results on AISHELL-1. Our RNN-T and Conformer-T models achieved CERs of 7.2% and 5.0% respectively on the test set, which are both signiﬁcantly better than the performance of RNN-T/Conformer-T models in the literature [38][39]. With the help of the auxiliary task, the RNN-T and Conformer-T models reached CERs of 6.9% and 4.7%, respectively. The latter is on par with the state-of-the-art performance achieved by the attention-based Conformer model [27]. Table 6 summarizes the results on LibriSpeech. The use of the auxiliary tasks again helped to reduce the WERs of our RNN-T model on the test sets. An even better performance of 2.9%/6.8% was obtained by switching from RNN-T to Conformer-T. Finally by using shallow-fusion and an external LM trained on the default training material for LibriSpeech’s LM, the Conformer-T achieved 2.6%/6.1%, which is comparable to the performance of other open-source toolkits.
+7. CONCLUSION
+This paper introduced an extension of the ESPnet speech recognition toolkit dedicated to the transducer models. Through an experimental evaluation of the models and some main proposed features, we demonstrated that our models can achieve state-of-art results on AISHELL-1 dataset and also exhibit promising performance in regards to real-time decoding and others models in ESPnet. Future work will focus on improving the model trained on Librispeech and adding features currently in development, namely: training with MBR and streaming. Further analysis of our proposed Transducer against non-autoregressive models [41, 42] is also considered.
+
+8. REFERENCES
+[1] A. Graves, S. Fernandez, F. Gomez, and J. Schidhuber, “Connectionist temporal classiﬁcation: Labelling unsegmented sequence data with recurrent neural networks,” in Proceedings of the International Conference on Machine Learning, 2006, pp. 369–376.
+[2] D. Bahdanau, J. Chorowski, D. Serdyuk, P. Brakel, and Y. Bengio, “End-to-end attention-based large vocabulary speech recognition,” arxiv:1508.04395 (arXiv preprint), 2015.
+[3] A. Graves, “Sequence transduction with recurrent neural networks,” arXiv:1211.3711 (arXiv preprint), 2012.
+[4] Y. He, T. Sainath, R. Prabhavalkar, and al., “Streaming endto-end speech recognition for mobile devices,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2019, pp. 6381–6385.
+[5] Q. Zhang, H. Lu, H. Sak, A. Tripathi, E. McDermott, S. Koo, and S. Kumar, “Transformer transducer: A streamable speech recognition model with transformer encoders and rnn-t loss,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2020, pp. 7829–7833.
+[6] C. Weng, C. Yu, J. Cui, C. Zhang, and D. Yu, “Minimum Bayes Risk training of RNN-transducer for end-to-end speech recognition,” in Proceedings of the Conference of the International Speech Communication Association, 2020, pp. 966–970.
+[7] H. Sak, M. Shannon, K. Rao, and F. Beaufays, “Recurrent neural aligner: An encoder-decoder neural network model for sequence-to-sequence mapping,” in Proceedings of the Conference of the International Speech Communication Association, 2017, pp. 1298–1302.
+[8] A. Zeyer, T. Alhouli, and H. Ney, “RETURNN as a generic ﬂexible neural toolkit with application to translation and speech recognition,” in Proceedings of the Annual Meeting of the Association for Computational Linguistics, 2018.
+[9] O. Kuchaiev, J. Li, H. Nguyen, O. Hrinchuk, R. Leary, B. Ginsburg, S. Kriman, S. Beliaev, V. Lavrukhin, J. Cook, P. Castonguay, M. Popova, J. Huang, and J. M. Cohen, “NeMo: A toolkit for building AI applications using neural modules,” arxiv:1909.09577 (arXv preprint), 2019.
+[10] S. Kriman, S. Beliaev, B. Ginsburg, J. Huang, O. Kuchaiev, V. Lavrukhin, R. Leary, J. Li, and Y. Zhang, “QuartzNet: Deep automatic speech recognition with 1D time-channel separable convolutions,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2020, pp. 6124–6128.
+[11] H. L. Nguyen, “TensorFlowASR,” GitHub repository, 2020.
+[12] L. Dong, S. Xu, and B. Xu, “Speech-transformer: A norecurrence sequence-to-sequence model for speech recognition,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2018, pp. 5884–5888.
+[13] A. Gulati, J. Qin, C.-C. Chen, N. Parmar, Y. Zhang, J. Yu, W. Han, S. Wang, Z. Zhang, Y. Wy, and R. Pang, “Conformer: Convolution-augmented transformer for speech recognition,” in Proceedings of the Conference of the International Speech Communication Association, 2020.
+[14] M. Ravanelli, T. Parcollet, A. Rouhe, P. Plantinga, E. Rastorgueva, L. Lugosch, N. Dawalatabad, C. Ju-Chieh, A. Heba, F. Grondin, W. Aris, C.-F. Liao, S. Cornell, S.-L. Yeh, H. Na,
+
+Y. Gao, S.-W. Fu, C. Subakan, R. D. Mori, and Y. Bengio, “Speechbrain,” GitHub repository, 2021.
+[15] T. Parcollet, Y. Zhang, M. Morchid, C. Trabelsi, G. Linares, R. D. Mori, and Y. Bengio, “Quaternion convolutional neural networks for end-to-end automatic speech recognition,” in Proceedings of the Conference of the International Speech Communication Association, 2018.
+[16] J. Mahadeokar, Y. Shangguan, D. Le, G. Keren, H. Su, T. Le, C.-F. Yeh, C. Fuegen, and M. Seltzer, “Alignment restricted streaming recurrent neural network transducer,” in Proceedings of the Spoken Language Technology Workshop, 2021, pp. 52– 59.
+[17] A. Tripathi, H. Lu, H. Sak, and H. Soltau, “Monotonic recurrent neural network transducer and decoding strategies,” in Proceedings of the IEEE Automatic Speech Recognition and Understanding Workshop, 2019, pp. 944–948.
+[18] M. Jain, K. Schubert, J. Mahadeokar, C.-F. Yeh, K. Kamgaonkar, A. Sriram, C. Fuegen, and M. Seltzer, “RNN-T for latency controlled ASR with improved beam ssearch,” arXiv:1911.01629 (arXiv preprint), 2019.
+[19] G. Saon, Z. Tu¨ske, and K. Audhkhasi, “Alignment-length synchronous decoding for RNN transducer,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2020, pp. 7804–7808.
+[20] M. Jadeberg, V. Mnih, W. M. Czarnecki, T. Schaul, J. Z. Leibo, D. Silver, and K. Kavukcuoglu, “Reinforcement learning with unsupervised auxiliary tasks,” arXiv:1611.05397 (arXiv preprint), 2019.
+[21] S. Toshniwal, H. Tang, L. Lu, and K. Livescu, “Multitask learning with low-level auxiliary tasks for encoder-decoder based speech recognition,” in Proceedings of the Conference of the International Speech Communication Association, 2017, pp. 3532–3536.
+[22] C. Liu, F. Zhang, D. Le, S. Kim, Y. Saraf, and G. Zweig, “Improving RNN transducer based ASR with auxiliary tasks,” arxiv:2011.03109 (arXiv preprint), 2020.
+[23] S. Watanabe, T. Hori, S. Karita, T. Hayashi, J. Nishitoba, Y. Unni, and A. Renduchintala, “ESPnet: End-to-end speech processing toolkit,” in Proceedings of the Conference of the International Speech Communication Association, 2018, pp. 2207–2211.
+[24] L. Lu, X. Zhang, and S. Renals, “On training the recurrent neural network encoder-decoder for large vocabulary end-to-end speech recognition,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2016, pp. 5060–5064.
+[25] S. Karita, N. Chen, T. Hayashi, T. Hori, H. Inaguma, Z. Jiang, M. Someki, N. E. Y. Soplin, R. Yamamoto, X. Wang, S. Watanabe, T. Yoshimura, and W. Zhang, “A comparative study on transformer vs RNN in speech applications,” in Proceedings of the IEEE Automatic Speech Recognition and Understanding Workshop, 2019, pp. 449–456.
+[26] Y. Fujita, A. S. Subramanian, M. Omachi, and S. Watanabe, “Attention-based ASR with lightweight and dynamic convolutions,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2020, pp. 7034–7038.
+
+[27] G. Pengcheng, F. Boyer, C. Xuankai, T. Hayashi, Y. Higuchi, H. Inaguma, N. Kamo, L. Chenda, D. Garcia-Romero, J. Shi, J. Shi, S. Watanabe, K. Wei, W. Zhang, and Y. Zhang, “Recent developments on ESPnet toolkit boosted by conformer,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2021.
+[28] J.-J. Jeon and E. Kim, “Multitask learning and joint optimization for transformer-RNN-transducer speech recognition,” arxiv:2011.00771 (arXv preprint), 2020.
+[29] K. Rao, H. Sak, and R. Prabhavalkar, “Exploring architectures, data and units for streaming end-to-end speech recognition with RNN transducer,” in Proceedings of the IEEE Automatic Speech Recognition and Understanding Workshop, 2017, pp. 193–199.
+[30] S. Kim, T. Hori, and S. Watanabe, “Joint CTC-attention based end-to-end speech recognition using multi-task learning,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2017, pp. 4835–4839.
+[31] C. Szegedy, V. Vanhoucke, S. Ioffe, J. Shlens, and Z. Wojna, “Re-thinking the inception architecture for computer vision,” in Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition, 2016, pp. 2818–2826.
+[32] T. Hori, S. Watanabe, and J. Hershey, “Multi-level language modeling and decoding for open vocabulary end-to-end speech recognition,” in Proceedings of the IEEE Automatic Speech Recognition and Understanding Workshop, 2017, pp. 287–293.
+[33] J. Kim and L. Yoonhan, “Accelerating RNN transducer inference via one-step constrained beam search,” arxiv:2011.01576 (arXv preprint), 2020.
+[34] Voxforge.org, “Voxforge (italian),” http:// www.voxforge.org/ , Last version: 10/25/2019.
+[35] V. Panayotov, G. Chen, D. Povey, and S. Khudanpur, “LibriSpeech: An ASR corpus based on public domain audio books,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2015, pp. 5206– 5210.
+[36] H. Bu, J. Du, X. Na, B. Wu, and H. Zheng, “Aishell-1: An open-source Mandarin speech corpus and a speech recognition baseline,” in Proceedings of Oriental Committee for the Coordination and standardisation of Speech Databases and Assessment techniques, 2017, pp. 1–5.
+[37] H. Hu, R. Zhao, J. Li, L. Lu, and Y. Gong, “Exploring pretraining with alignments for RNN-transducer based end-to-end speech recognition,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2020, pp. 7079–7083.
+[38] Z. Tian, J. Yi, J. Tao, Y. Bai, and Z. Wen, “Self-attention transducers for end-to-end speech recognition,” in Proceedings of the Conference of the International Speech Communication Association, 2019, pp. 4395–4399.
+[39] M. Huang, J. Zhang, M. Cai, Y. Zhang, J. Yao, Y. You, Y. He, and Z. Ma, “Improving RNN-transducer with normalized jointer network,” arxiv:2011.01576 (arXiv preprint), 2020.
+[40] A. Zeyer, A. Merboldt, W. Michel, R. Schlu¨ter, and H. Ney, “Librispeech transducer model with internal language model prior correction,” in Proceedings of the Conference of the International Speech Communication Association, 2021, pp. 2052– 2056.
+
+[41] Y. Higuchi, S. Watanabe, N. Chen, T. Ogawa, and T. Kobayashi, “Mask CTC: Non-autoregressive end-to-end ASR with CTC and mask predict,” in Proceedings of the Conference of the International Speech Communication Association, 2020, pp. 3655–3659.
+[42] Y. Higuchi, H. Inaguma, S. Watanabe, T. Ogawa, and T. Kobayashi, “Improved mask-CTC for non-autoregressive end-to-end ASR,” in Proceedings of the IEEE International Conference on Acoustics, Speech & Signal Processing, 2021, pp. 8363–8367.
+
+

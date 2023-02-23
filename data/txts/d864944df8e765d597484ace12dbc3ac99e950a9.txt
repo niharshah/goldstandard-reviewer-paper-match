@@ -1,0 +1,2575 @@
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+arXiv:2102.10264v2 [cs.LG] 13 Jul 2021
+
+Saurabh Garg 1 Joshua Zhanson 2 Emilio Parisotto 1 Adarsh Prasad 1 J. Zico Kolter 2 Zachary C. Lipton 1 Sivaraman Balakrishnan 3 Ruslan Salakhutdinov 1 Pradeep Ravikumar 1
+
+Abstract
+Modern policy gradient algorithms such as Proximal Policy Optimization (PPO) rely on an arsenal of heuristics, including loss clipping and gradient clipping, to ensure successful learning. These heuristics are reminiscent of techniques from robust statistics, commonly used for estimation in outlier-rich (“heavy-tailed”) regimes. In this paper, we present a detailed empirical study to characterize the heavy-tailed nature of the gradients of the PPO surrogate reward function. We demonstrate that the gradients, especially for the actor network, exhibit pronounced heavy-tailedness and that it increases as the agent’s policy diverges from the behavioral policy (i.e., as the agent goes further off policy). Further examination implicates the likelihood ratios and advantages in the surrogate reward as the main sources of the observed heavy-tailedness. We then highlight issues arising due to the heavy-tailed nature of the gradients. In this light, we study the effects of the standard PPO clipping heuristics, demonstrating that these tricks primarily serve to offset heavytailedness in gradients. Thus motivated, we propose incorporating GMOM, a high-dimensional robust estimator, into PPO as a substitute for three clipping tricks. Despite requiring less hyperparameter tuning, our method matches the performance of PPO (with all heuristics enabled) on a battery of MuJoCo continuous control tasks.
+1. Introduction
+As Deep Reinforcement Learning (DRL) methods have made strides on such diverse tasks as game playing and continuous control (Berner et al., 2019; Silver et al., 2017;
+1Machine Learning Department, Carnegie Mellon University 2Computer Science Department, Carnegie Mellon University 3Department of Statistics and Data Science, Carnegie Mellon University. Correspondence to: Saurabh Garg <sgarg2@andrew.cmu.edu>.
+Proceedings of the 38 th International Conference on Machine Learning, PMLR 139, 2021. Copyright 2021 by the author(s).
+
+Mnih et al., 2015), policy gradient methods (Williams, 1992; Sutton et al., 2000; Mnih et al., 2016) have risen as a popular alternative to dynamic programming approaches. Since Mnih et al. (2016)’s breakthrough results demonstrated the applicability of policy gradients in DRL, a number of popular variants have emerged (Schulman et al., 2017; Espeholt et al., 2018). Proximal Policy Optimization (PPO) (Schulman et al., 2017)—one of the most popular policy gradient methods—introduced the clipped importance sampling update, an effective heuristic for off-policy learning. However, while their stated motivation for clipping draws upon trustregion enforcement, the updates in practice tend to deviate from such trust regions (Ilyas et al., 2018) and exhibit sensitivity to implementation details such as random seeds and hyperparameter choices (Engstrom et al., 2019). This brittleness characterizes not just PPO, but policy gradient methods more generally (Ilyas et al., 2018; Henderson et al., 2017; 2018; Islam et al., 2017), raising a broader concern about our understanding of these methods.
+In this work, we take a step towards understanding the workings of PPO, the most prominent and widely used deep policy gradient method. Noting that the heuristics implemented in PPO are evocative of estimation techniques from robust statistics in outlier-rich and heavy-tailed settings, we conjecture that the heavy-tailed distribution of gradients is the main obstacle addressed by these heuristics. We perform a rigorous empirical study to conﬁrm the existence of heavy-tailedness in PPO gradients and to investigate its causes and consequences.
+Our ﬁrst contribution is to analyze the role played by each component of the PPO objective in the heavy-tailedness of the gradients. We observe that as training proceeds, gradients of both the actor and the critic loss grow more heavytailed. Our ﬁndings show that during on-policy gradient steps the advantage estimates are the primary contributors to the heavy-tailed nature of the gradients. Moreover, as offpolicyness increases during training (i.e. as the behavioral and actor policy diverge), the likelihood ratios that appear in the surrogate objective exacerbate the heavy-tailedness.
+Second, we highlight the consequences of the heavytailedness of PPO’s gradients. Empirically, we ﬁnd that heavy-tailedness in likelihood ratios induced during off-
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+policy training can be a signiﬁcant factor causing optimization instability leading to low average rewards. Moreover, we also show that removing heavy-tailedness in advantage estimates can enable agents to achieve superior performance. Subsequently, we demonstrate that the clipping heuristics present in standard PPO implementations (i.e., gradient clipping, actor objective clipping, and value loss clipping) signiﬁcantly counteract the heavy-tailedness induced by offpolicy training.
+Finally, motivated by this analysis, we present an algorithm that uses Geometric Median-of-Means (GMOM), a highdimensional robust aggregation method adapted from the statistics literature. Without using any of the objective clipping or gradient clipping heuristics implemented in PPO, the GMOM algorithm nearly matches PPO’s performance on MuJoCo (Todorov et al., 2012) tasks, which strengthens our conjecture that heavy-tailedness is a critical concern facing policy gradient methods, and that the beneﬁts of PPO’s clipping heuristics come primarily from addressing this problem.
+
+2. Preliminaries
+
+We deﬁne a Markov Decision Process (MDP) as a tuple
+
+(S, A, R, γ, P ), where S represents the set of environments
+
+states, A represents the set of agent actions, R : S ×A → R
+
+is the reward function, γ is the discount factor, and P :
+
+S×A×S → R is the state transition probability distribution.
+
+The goal in reinforcement learning is to learn a policy π :
+
+S × A → R+ such that the expected cumulative discounted
+
+reward (known as returns) is maximized. Formally, π∗ : =
+
+argmaxπ Eat∼π(·|st),st+1∼P (·|st,at) [
+
+∞ t=0
+
+γ
+
+t
+
+R(st
+
+,
+
+at
+
+)].
+
+Policy gradient methods directly parameterize the policy (also known as actor network), i.e., they deﬁne a policy πθ, parameterized by θ. Since directly optimizing the cumulative rewards can be challenging, modern policy gradient algorithms typically optimize a surrogate reward function which includes a likelihood ratio in order to re-use stale (offpolicy) trajectories via importance sampling. For example, Schulman et al. (2015a) iteratively optimize:
+
+max E(st,at)∼πθ
+
+θt
+
+t−1
+
+πθt (at|st) Aπ (st, at) πθt−1 (at|st) θt−1
+
+, (1)
+
+where Aπθt = Qθt (st, at) − Vθt (st). Here, the Q-function Qθt (s, a) is the expected discounted reward after taking an action a at state s and following πθt afterwards and Vθt (s) is the value estimate (implemented with a critic network).
+However, the surrogate is indicative of the true reward function only when πθt and πθt−1 are close in distribution. Different policy gradient methods (Schulman et al., 2015a; 2017; Kakade, 2002) attempt to enforce the closeness in different ways. In Natural Policy Gradients (Kakade, 2002)
+
+and Trust Region Policy Optimization (TRPO) (Schulman et al., 2015a), authors utilize a conservative policy iteration with an explicit divergence constraint which provides provable lower bounds guarantees on the improvements of the parameterized policy. On the other hand, PPO (Schulman et al., 2017) implements a clipping heuristic on the likelihood ratio to avoid excessively large policy updates. Speciﬁcally, PPO optimizes the following objective:
+
+max E(s ,a )∼π
+
+min ρtAˆπ (st, at) ,
+
+θt
+
+tt
+
+θt−1
+
+θt−1
+
+clip(ρt, 1 − , 1 + )Aˆπθt−1 (st, at)
+
+, (2)
+
+where ρt : = ππθtθ−t (1a(ta,ts,ts)t) and clip(x, 1 − , 1 + ) clips x to stay between 1 + and 1 − . We refer to ρt as likelihoodratios. Due to a minimum with the unclipped surrogate
+reward, the PPO objective acts as a pessimistic bound on the
+true surrogate reward. As in standard PPO implementation,
+we use Generalized Advantage Estimation (GAE) (Schul-
+man et al., 2015b). Instead of ﬁtting the value network via regression to target values (denoted by Vtrg), via
+
+min Es ∼π
+
+(Vθ (st) − Vtrg(st))2 ,
+
+(3)
+
+θt
+
+t θt−1
+
+t
+
+standard implementations ﬁt the value network with a PPOlike objective:
+
+min Es ∼π max (Vθ (st) − Vtrg(st))2 , (clip (Vθ (st),
+
+θt
+
+t θt−1
+
+t
+
+t
+
+Vθt−1 (st) − ε, Vθt−1 (st) + ε − Vtrg(st) 2 , (4)
+
+where is the same value used to clip probability ratios in PPO’s loss function (Eq. 2). PPO uses the following training procedure: At any iteration t, the agent creates a clone of the current policy πθt which interacts with the environment to collect rollouts B (i.e., state-action pairs {(si, ai)}Ni=1). Then the algorithm optimizes the policy πθ and value function Vθ for a ﬁxed K gradient steps on the sampled data B. Since at every iteration the ﬁrst gradient step is taken on the same policy from which the data was sampled, we refer to these gradient updates as on-policy steps. And as for the remaining K − 1 steps, the sampling policy differs from the current agent, we refer to these updates as off-policy steps.
+Throughout the paper, we consider a stripped-down variant of PPO (denoted PPO-NOCLIP) that consists of policy gradient with importance weighting, but has been simpliﬁed as follows: (i) no likelihood-ratio clipping (Eq. 1), i.e., no objective function clipping ; (ii) value network optimized via regression to target values (Eq. 3) without value function clipping; and (iii) no gradient clipping. Overall PPONOCLIP uses the objective summarized in App. A. One may argue that since PPO-NOCLIP removes the clipping heuristic from PPO, the unconstrained maximization of Eq. 1 may
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+lead to excessively large policy updates. In App. E, we empirically justify the use of Eq. 1 by showing that with the small learning rate used in our experiments (tuned hyperparameters in Table 1), PPO-NOCLIP maintains a KL-based trust region like PPO throughout the training.
+2.1. Framework for estimating Heavy-Tailedness
+We now formalize our setup for studying the distribution of gradients. Throughout the paper, we use the following deﬁnition of the heavy-tailed property:
+Deﬁnition 1 (Resnick (2007)). A non-negative random variable w is called heavy-tailed if its tail probability Fw(t) : =P (w ≥ t) is asymptotically equivalent to t−α∗ as t → ∞ for some positive number α∗. Here α∗ (known as the tail index of w) determines the heavy-tailedness.
+For a heavy-tailed distribution with index α∗, its α-th moment exists only if α < α∗, i.e., E[wα] < ∞ iff α < α∗. A value of α∗ = 1.0 corresponds to a Cauchy distribution and α∗ = ∞ (i.e., all moments exist) corresponds to a Gaussian distribution. Intuitively, as α∗ decreases, the central peak of the distribution gets higher, the valley before the central peak gets deeper, and the tails get heavier. In other words, the lower the tail-index, the more heavy-tailed the distribution. However, in the ﬁnite sample setting, estimating the tail index is notoriously challenging (Simsekli et al., 2019; Danielsson et al., 2016; Hill, 1975).
+In this study, we explore three estimators as heuristic measures to understand heavy tails and non-Gaussianity of gradients (refer to App. B for details): (i) Alpha-index estimator which measures alpha-index for symmetric αstable distributions; (ii) Anderson-Darling test (Anderson & Darling, 1954) on random projections of stochastic Gradient Noise (GN) to perform Gaussianity testing (Panigrahi et al., 2019). To our knowledge, the deep learning literature has only explored these two estimators for analyzing the heavy-tailed nature of gradients. Finally, in our work, we propose using (iii) Kurtosis. To quantify the heavy-tailedness relative to a normal distribution, we measure kurtosis (fourth standardized moment) of the gradient norms. Given samples {Xi}Ni=1, the kurtosis κ is given by: κ = N i=1(Xi−X¯ )4/N where X¯ is the empirical mean of
+( ) N i=1(Xi−X¯ )2/N 2 the samples. With a slight breach of notation, we use kurtosis to denote κ1/4. In App. B, we show behavior of kurtosis on ﬁnite samples from Gaussian and Pareto distributions. It is well known that for a Pareto distribution with shape α ≥ 4, the lower the tail-index (shape parameter α) the higher the kurtosis. For α < 4, since the fourth moment is non-existent, kurtosis is inﬁnity. While for Gaussian distribution, the kurtosis value is approximately 1.31. In App. B, we discuss limitations of α-index estimator and AndersonDarling test when used as heuristics to understand heavy
+
+tails. Hence, in the main paper, we include results with Kurtosis and relegate results with the other estimators.
+3. Heavy-Tailedness in Policy-Gradients: A Case Study on PPO
+We now examine the distribution of gradients in PPO. To start, we examine the behavior of gradients at only on-policy steps. We ﬁx the policy at the beginning of every training iteration and just consider the gradients for the ﬁrst step (see App. D for details). As the training proceeds, the gradients clearly become more heavy-tailed (Fig. 1(a)). To thoroughly understand this behavior and the contributing factors, we separately analyze the contributions from different components in the loss function. We also separate out the contributions coming from actor and critic networks.
+To decouple the behavior of na¨ıve policy gradients from PPO optimizations, we consider a variant of PPO which we call PPO-NOCLIP as described in Section 2. Recall that in a nutshell PPO-NOCLIP implements policy gradient with just importance sampling. In what follows, we perform a ﬁne-grained analysis of PPO at on-policy iterations.
+3.1. Heavy-tailedness in on-policy training
+Given the trend of increasing heavy-tailedness in onpolicy gradients, we ﬁrst separately analyze the contributions of the actor and critic networks. On both these component network gradients, we observe similar trends, with the heavy-tailedness in the actor gradients being marginally higher than the critic network (Fig. 1). Note that during on-policy steps, since the likelihood-ratios are just 1, the gradient of actor network is given by ∇θ log (πθ(at, st)) Aˆπ0 (st, at) and the gradient of the critic network is given by ∇θVθAˆπ0 (st, at) where π0 is the behavioral policy. To explain the rising heavy-tailed behavior, we separately plot the advantages Aˆπ0 and the advantage divided gradients (i.e, ∇ log(πθ(at|st)) and ∇θVθ). Strikingly, we observe that while the advantage divided gradients are not heavy-tailed for both value and policy network, the heavy-tailedness in advantage estimates increases as training proceeds. This elucidates that during on-policy updates, outliers in advantage estimates are the only source of heavytailedness in actor and critic networks.
+To understand the reasons behind the observed behavior of advantages, we plot value estimates as computed by the critic network and the discounted returns used to calculate advantages (Fig. 9 in App. F) We don’t observe any discernible heavy-tailedness trends in value estimates and a slight increase in returns. However, remarkably, we notice a very similar course of an increase in heavy-tailedness with negative advantages (whereas positive advantages remained light-tailed) as training proceeds. In App. F.3, we also pro-
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+Kurtosis Kurtosis Kurtosis
+
+2.1
+
+PPO
+
+2.0
+
+A2C
+
+1.9
+
+1.8
+
+2.1
+
+actor
+
+2.0
+
+Aπ0
+
+1.9
+
+actor/Aπ0
+
+1.8
+
+2.1
+
+critic
+
+2.0
+
+Aπ0
+
+1.9
+
+critic/Aπ0
+
+1.8
+
+1.7
+
+1.7
+
+1.7
+
+1.6
+
+1.6
+
+1.6
+
+1.5
+
+1.5
+
+1.5
+
+1.4
+
+1.4
+
+1.4
+
+1.3 0
+
+100
+
+200
+
+300
+
+400
+
+On-policy steps
+
+1.3
+
+500
+
+0
+
+100
+
+200
+
+300
+
+400
+
+On-policy steps
+
+1.3
+
+500
+
+0
+
+100
+
+200
+
+300
+
+400
+
+500
+
+On-policy steps
+
+(a)
+
+(b)
+
+(c)
+
+Figure 1. Heavy-tailedness in PPO during on-policy iterations. All plots show mean kurtosis aggregated over 8 MuJoCo environments. For other estimators, see App. G. For individual environments with error bars, see App. I. Increases in Kurtosis implies an increase in heavy-tailedness. Dotted line represents the Kurtosis value for a Gaussian distribution. (a) Kurtosis vs on-policy iterations for A2C and PPO. Evidently, as training proceeds, the gradients become more heavy-tailed for both the methods. (b) Kurtosis vs on-policy iterations for actor networks in PPO. (c) Kurtosis vs on-policy iterations for critic networks in PPO. Both critic and actor gradients become more heavy-tailed as the agent is trained. Note that as the gradients become more heavy-tailed, we observe a corresponding increase of heavy-tailedness in the advantage estimates (Aˆπ0 ). However, “actor/Aˆπ0 ” and “critic/Aˆπ0 ” (i.e., actor or critic gradient norm divided by advantage) remain light-tailed throughout the training. In App. F, we perform ablation tests to highlight the reason for heavy-tailed behavior of advantages.
+
+vide evidence to this observation by showing the trends of increasing heavy-tailed behavior with the histograms of log(|Aπθ |) grouped by their sign as training proceeds for one MuJoCo environment (HalfCheetah-v2). This observation highlights that, at least in MuJoCo control environments, there is a positive bias of the learned value estimate for actions with negative advantages. In addition, our experiments also suggest that the outliers in advantages (primarily, in negative advantages) are the root cause of observed heavytailed behavior in the actor and critic gradients.
+We also analyze the gradients of A2C (Mnih et al., 2016)— an on-policy RL algorithm—and observe similar trends (Fig. 1(a)), but at a relatively smaller degree of heavytailedness. Although they start at a similar magnitude, the heavy-tailed nature escalates at a higher rate in PPO1. This observation may lead us to ask: What is the cause of heightened heavy-tailedness in PPO (when compared with A2C)? Next, we demonstrate that off-policy training can exacerbate the heavy-tailed behavior.
+3.2. Offpolicyness escalte heavytailness in gradients
+To analyze the gradients at off-policy steps, we perform the following experiment: At various stages of training (i.e., at initialization, 50% of maximum reward, and maximum reward), we ﬁx the actor and the critic network at each gradient step during off-policy training and analyze the collected gradients (see App. D for details). First, in the early stages of training, as the off-policyness increases, the heavy-tailedness in gradients (both actor and critic) increases. However, unlike with on-policy steps, actor gradi-
+1In Appendix F.2, we show a corresponding trend in the heavytailedness of advantage estimates.
+
+ents are the major contributing factor to the overall heavytailedness of the gradient distribution. In other words, the increase in heavy-tailedness of actor gradients due to offpolicy training is substantially greater than for critic gradients (Fig. 2). Moreover, the increase lessens in later stages of training as the agent approaches its peak performance.
+Now we turn our attention to explaining the possible causes for such a profound increase. The strong increase in heavytailedness of the actor gradients during off-policy training coincides with a increase of heavy-tailedness in the distribution of likelihood ratios ρ, given by πθ(at, st)/π0(at, st). The corresponding increase in heavy-tailedness in ratios can be explained theoretically. In continuous control RL tasks, the actor network often implements the policy with a Gaussian distribution, where the policy parameters estimate the mean and the (diagonal) covariance. With a simple example, we highlight the heavy-tailed behavior of such likelihoodratios of Gaussian density function. This example highlights how even a minor increase in the standard deviation of the distribution of the current policy (as compared to behavior policy) can induce heavy-tails.
+Example 1 (Wang et al., 2018). Assume π1(x) = N x; 0, σ12 and π2(x) = N x; 0, σ22 . Let ρ = π1(x)/π2(x) at a sample x ∼ π2. If σ1 ≤ σ2, then likelihood ratio ρ is bounded and its distribution is not heavy-tailed. However, when σ1 > σ2, then w has a heavy-tailed distribution with the tail-index (Deﬁnition 1) α∗ = σ12/(σ12 − σ22).
+During off-policy training, to understand the heavytailedness of actor gradients beyond the contributions from likelihood ratios, we inspect the actor gradients normalized
+
+Kurtosis Kurtosis Kurtosis
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+2.1 2.0 1.9 1.8 1.7 1.6 1.5 1.4 1.3
+0
+
+Initialization
+actor critic ratios actor/ratio
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Off-policy steps
+
+2.1 2.0 1.9 1.8 1.7 1.6 1.5 1.4 1.3
+0
+
+50 % of Max Reward
+
+actor critic ratios actor/ratio
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Off-policy steps
+
+2.1 2.0 1.9 1.8 1.7 1.6 1.5 1.4 1.3
+0
+
+Max Reward
+actor critic ratios actor/ratio
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Off-policy steps
+
+Figure 2. Heavy-tailedness in PPO-NOCLIP during off-policy steps at various stages of training iterations in MuJoCo environments. All plots show mean kurtosis aggregated over 8 Mujoco environments. Plots for other estimators can be found in App. G. We also show trends with these estimators (with error bars) on individual environments in App I. Increases in Kurtosis implies an increase in heavy-tailedness. Dotted line represents the Kurtosis value for a Gaussian distribution. Note that the analysis is done with gradients taken on a ﬁxed batch of data within a single iteration. As off-policyness increases, the actor gradients get substantially heavy-tailed. This trend is corroborated by the increase of heavy-tailedness in ratios. Moreover, consistently we observe that the heavy-tailedness in “actor/ratios” stays constant. While initially during training, the heavy-tailedness in the ratio’s increases substantially, during later stages the increase tapers off. The overall increase across training iterations is due to the induced heavy-tailedness in the advantage estimates (cf. Sec. 3.1).
+
+by likelihood-ratios, i.e.,
+∇θπθ(at, st)/π0(at, st) Aˆπ (st, at) = πθ(at, st)/π0(at, st) 0 ∇θ log (πθ(at, st)) Aˆπ0 (st, at) .
+Note that this gradient expression is similar to on-policy actor gradients. Since we observe an increasing trend in heavytailedness of the actor gradients even during on-policy training, one might ask: does these gradients’ heavy-tailedness increase during off-policy gradient updates?
+Recall that in PPO, we ﬁx the value function at the beginning of off-policy training and pre-compute advantage estimates that will later be used throughout the training. Since the advantages were the primary factor dictating the increase during on-policy training, ideally, we should not observe any increase in the heavy-tailed behavior. Conﬁrming this hypothesis, we show that the heavy-tailedness in this quantity indeed stays constant during the off-policy training (Fig. 2), i.e., ∇θ log (πθ(at, st)) Aπ0 (st, at) doesn’t cause the increased heavy-tailed nature as long as π0 is ﬁxed.
+Our ﬁndings from off-policy analysis strongly suggest that when the behavioral policy is held ﬁxed, heavy-tailedness in the importance ratios is the fundamental cause. In addition, in Sec. 3.1, we showed that when importance-ratio’s are 1 (i.e., the data on which the gradient step is taken is onpolicy), advantages induce heavy-tailedness. With these two observations, we conclude that the scalars (either the likelihood-ratios or the advantage estimates) in the objective are the primary causes of the underlying heavy-tailedness in the gradients.
+
+4. How do Heavy-Tailed Policy-Gradients affect Training?
+In the previous section, we investigated into the root cause of the heavy-tailed behaviour. That apparent heavy-tailed nature of PPO’s gradients may lead us to ask: how do heavytailed gradients affect agents’ performance? In this section, we show that heavy-tailed gradients harm the performance of the underlying agent. Subsequently, we investigate into PPO heuristics and demonstrate how these heuristics alleviate for the heavy-tailed nature of the gradient distribution.
+4.1. Effect of heavy-tailedness in advantages
+Analysis in Sec. 3.1 shows that multiplicative advantage estimate in the PPO loss is a signiﬁcant contributing factor to the observed heavy-tailedness. Motivated by this, we now study the impacts of clipping advantages on the underlying agent. In particular, we clip negative advantages which are the primary contributors to the induced heavy-tailedness.
+Depending on the observed heavy-tailedness, we tune a perenvironment clipping threshold for advantages to maximize the performance of the agent trained with PPO. Intuitively, we expect that clipping should improve optimization and hence should lead to an improved performance. Corroborating this intuition, we observe signiﬁcant improvements (Fig. 3 (c)). We also plot the trend of heavy-tailedness in clipped advantage estimates during training. As we clip negative advantages below the obtained threshold, we observe that the induced heavy-tailedness stays constant throughout training (Fig. 3 (a)). Our experiment unearths an intriguing ﬁnding. Since the advantage estimates signiﬁcantly contribute to the observed heavy-tailed behavior, we show that
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+Kurtosis Kurtosis Normalized Rewards
+
+2.1 2.0 1.9 1.8 1.7 1.6 1.5 1.4 1.3
+0
+
+Aπ0 Aπ0 -clip
+
+100
+
+200
+
+300
+
+400
+
+500
+
+On-policy steps
+
+(a)
+
+Initialization
+
+2.4
+
+10 epochs
+
+2.2 20 epochs 30 epochs
+
+2.0
+
+1.8
+
+1.6
+
+1.4
+
+1.2
+
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+1.0
+
+Fraction of off-policy steps
+
+(b)
+
+1.2
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2 PPO-Adv Clip PPO-NoClip (20)
+
+0.0 PPO-NoClip (10) PPO-NoClip (30)
+
+Walker2d-v2
+
+Hopper-v2 HalfCheetah-v2
+
+(c)
+
+Figure 3. (a) Heavy-tailedness in PPO advantages with per-environment tuned advantage clipping threshold and (b) Heavytailedness in PPO-NOCLIP likelihood-ratios as the degree of off-policyness is varied in MuJoCo environments. All plots show mean kurtosis aggregated over 8 Mujoco environments. With clipping advantages at appropriate thresholds (tuned per environment), we observe that the heavy-tailedness in advantages remains almost constant with training. For (b), we plot kurtosis vs the fraction of off-policy steps (i.e. number of steps taken normalized by the total number of gradients steps in one epoch). As the number of off-policy epochs increase, the heavy-tailedness in ratios increases substantially. (c) Normalized rewards for PPO-AdvClip and for PPO-NOCLIP as the degree of off-policyness is varied (number of off-policy steps in parenthesis). Normalized w.r.t. the max reward obtained with PPO (with all heuristics enabled) and performance of a random agent. Evidently, as off-policy training increases, the max reward achieved drops. With advantage clipping (tuned per environment), we observe improved performance of the agent. (See App J for reward curves on individual environments.)
+
+clipping outlier advantages stabilizes the training and improves agents’ performance on 5 out of 8 MuJoCo tasks (per environment rewards in App J). While tuning a clipping threshold per environment may not be practical, the primary purpose of this study is to illustrate that heavy-tailedness in advantages can actually hurt the optimization process, and clipping advantages leads to improvements in the performance of agent.
+4.2. Effect of heavy-tailedness in likelihood-ratios
+In Sec. 3.2, we demonstrated the heavy-tailed behavior of gradients during off-policy training which increases with off-policy gradient steps in PPO-NOCLIP. Moreover, we observe a corresponding increase in the heavy-tailedness of likelihood ratios. Motivated by this connection, we train agents with increased off-policy gradient steps to understand the effect of the off-policy induced heavy-tailedness on the performance of the agent. With PPO-NOCLIP, we train agents for 20 and 30 ofﬂine epochs (instead of 10 in Table 1)2 and analyze its performance.
+First, as expected, we observe an increase in heavytailedness in the likelihood ratios with escalated ofﬂine training (Fig. 3(b)). Moreover, the heavy-tailedness in advantages remains unaffected with an increase in the number of ofﬂine epochs (Fig. 20 in App. J) conﬁrming that the
+2Note that even with 20 and 30 ofﬂine epochs the agent maintains a KL based trust-region throughout training (Fig. 19 in App. J). Beyond 30 ofﬂine steps, successive policies often diverge— failing to maintain a KL based trust region.
+
+observed behavior is primarily due to heightened heavytailedness in likelihood ratios. We conjecture that induced heavy-tailedness can make the optimization process harder. Corroborating this hypothesis, we observe that as the number of ofﬂine epochs increases, the performance of agent trained with PPO-NOCLIP deteriorates, and the training becomes unstable (Fig. 3 (c)). Findings from this experiment clearly highlight issues due to induced heavy-tailedness in likelihood ratios during off-policy training. While ofﬂine training enables sample efﬁcient training, restricting the number of off-policy epochs allows effective tackling of optimization issues induced due to the heavy-tailed nature which are beyond just trust-region enforcement.
+4.3. Explaining roles of various PPO objective optimizations
+Motivated from our results from the previous sections, we now take a deeper look at how the core idea of likelihoodratio clipping and auxiliary optimizations implemented in PPO and understand how they affect the heavy-tailedness during training. First, we make a key observation. Note that the PPO-clipping heuristics don’t get triggered for the ﬁrst gradient step taken (when a new batch of data is sampled). But rather these heuristics may alter the loss only when behavior policy is different from the policy that is being optimized. Hence, in order to understand the effects of clipping heuristics, we perform the following analysis on the off-policy gradients of the PPO-NOCLIP: At each update step on the agent trained with PPO-NOCLIP, we compute the gradients while progressively including optimizations from the standard PPO objective.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+Kurtosis Kurtosis
+
+2.1
+
+actor
+
+2.0
+
+actor-clip
+
+1.9
+
+actor-gradclip
+
+1.8
+
+1.7
+
+1.6
+
+1.5
+
+1.4
+
+1.3 0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Off-policy steps
+
+2.1 2.0 1.9 1.8 1.7 1.6 1.5 1.4 1.3
+0
+
+critic critic-clip critic-gradclip
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Off-policy steps
+
+Figure 4. Heavy-tailedness in PPO-NOCLIP with PPOheuristics applied progressively during off-policy steps, with kurtosis aggregated across 8 MuJoCo environments. For other estimators, see App. G. Dotted line represents the Kurtosis value for a Gaussian distribution. “-clip” denotes loss clipping on corresponding networks. “-gradclip” denotes both gradient clipping and loss clipping. Increases in Kurtosis implies an increase in heavy-tailedness. As training progresses during off-policy steps, the increased heavy-tailedness in actor and critic gradients is mitigated by PPO-heuristics.
+
+Our results demonstrate that both the likelihood-ratio clipping and value-function clipping in loss during training offset the enormous heavy-tailedness induced due to off-policy training (Fig. 4). Recall that by clipping the likelihood ratios and the value function, the PPO objective is discarding samples (i.e., replacing them with zero when) used for gradient aggregation. Since heavy-tailedness in the distribution of likelihood ratios is the central contributing factor during offpolicy training, by truncating likelihood-ratios ρt which lie outside (1 − , 1 + ) interval, PPO is primarily mitigating heavy-tailedness in actor gradients. Similarly, by rejecting samples from the value function loss which lie outside an
+boundary of a ﬁxed target estimate, the heuristics alleviate the slight heavy-tailed nature induced with off-policy training in the critic network.
+While PPO heuristics alleviate the heavy-tailedness induced with off-policy training, these heuristics don’t alter heavytailed nature of advantage estimates. Since none of these heuristics directly target the outliers present in the advantage estimates, we believe that our ﬁndings can guide a development of fundamentally stable RL algorithms by targeting the outliers present in the advantage estimates (the primary cause of increasing heavy-tailedness throughout training).
+5. Mitigating Heavy-Tailedness with Robust Gradient Estimation
+Motivated by our analysis showing that the gradients in PPO-NOCLIP exhibit heavy-tailedness that increases during off-policy training, we propose an alternate method of gradient aggregation—using the gradient estimation framework from Prasad et al. (2018)—that is better suited to the heavy-tailed estimation paradigm than the sample mean. To support our hypothesis that addressing the primary beneﬁt
+
+Algorithm 1 BLOCK-GMOM
+input : Samples S = {x1, . . . , xn}, number of blocks b, Model optimizer OG, b block optimizers OB, network fθ, loss
+1: Partition S into b blocks B1, . . . Bb of equal size. 2: for i in 1 . . . b do 3: µˆi = OB(i) xj∈Bi ∇θ (fθ, xj )/ |Bi| 4: end for 5: µˆGMOM = OG (WEISZFELD(µˆ1, . . . , µˆb)). output : Gradient estimate µˆGMOM
+
+of PPO’s various clipping heuristics lies in mitigating this heavy-tailedness, we aim to show that equipped with our robust estimator, PPO-NOCLIP can achieve comparable results to state-of-the-art PPO implementations, even with the clipping heuristics turned off.
+
+We now consider robustifying PPO-NOCLIP (policy gra-
+
+dient with just importance sampling). Informally, for gra-
+
+dient distributions which do not enjoy Gaussian-like con-
+
+centration, the empirical-expectation-based estimates of the
+
+gradient do not necessarily point in the right descent di-
+
+rection, leading to bad solutions. To this end, we lever-
+
+age a robust mean aggregation technique called Geometric
+
+Median-Of-Means (GMOM) due to Minsker et al. (2015).
+
+We ﬁrst split the samples into non-overlapping sub-samples
+
+and estimate the sample mean of each. The GMOM es-
+
+timator is then given by the geometric median-of-means
+
+of the sub-samples. Formally, let {x1, . . . , xn} ∈ R
+
+be n i.i.d. random variables sampled from a distribu-
+
+tion D. Then the GMOM estimator for estimating the
+
+mean can be described as follows: Partition the n sam-
+
+ples into b blocks B1, . . . , Bb, each of size n/b . Com-
+
+pute sample means in each block, i.e., {µˆ1, . . . , µb}, where
+
+µˆi = xj∈Bi xj / |Bi|. Then the GMOM estimator µˆGMOM
+
+is given by the geometric median of {µˆ1, . . . , µb} deﬁned as
+
+follows: µˆGMOM = argminµ
+
+b i=1
+
+||µ
+
+−
+
+µˆi
+
+||2
+
+.
+
+We
+
+present
+
+GMOM algorithm along with the Weiszfeld’s algorithm used
+
+for computing the approximate geometric median in App. C.
+
+GMOM has been shown to have several favorable properties when used for statistical estimation in heavy-tailed settings. Intuitively, GMOM reduces the effect of outliers on a mean estimate by taking a intermediate mean of blocks of samples and then computing the geometric median of those block means. The robustness comes from the additional geometric median step where a small number of samples with large norms would not affect a GMOM estimate as much as they would a sample mean. Formally, given n samples from a heavy-tailed distribution, the GMOM estimate concentrates better around the true mean than the sample mean which satisﬁes the following:
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+Normalized Rewards
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+PPO-NoClip
+
+Robust-PPO-NoClip
+
+0.0
+
+etah-vA2nt-v2 noid-v2 er2d-v2 cher-v2 ulumt-Pvo2le-v1 pper-v2
+
+Che
+
+Huma Walk Rea dPend Car Ho
+
+Half
+
+rte
+
+Inve
+
+Figure 5. Normalized rewards for ROBUST-PPO-NOCLIP and PPO-NOCLIP. Normalized w.r.t. the max reward obtained with PPO (with all heuristics enabled) and performance of a random agent. (See App H for reward curves on individual environment.)
+
+Theorem 1 (Minsker et al. (2015)). Suppose we are given n samples {xi}ni=1 from a distribution with mean µ and covariance Σ. Assume δ > 0. Choose the number of
+blocks b = 1 + 3.5 log(1/δ) . Then, with probability
+
+at least 1 − δ, ||µGMOM − µ||2
+
+trace(Σ)nlog(1/δ) and
+
+1 n
+
+n i=1
+
+xi
+
+−
+
+µ
+
+2
+
+tracneδ(Σ) .
+
+When applying stochastic gradient descent or its variants in deep learning, one typically backpropagates the mean loss, avoiding computing per-sample gradients. However, computing GMOM requires per-sample gradients. Consequently, we propose a simple (but novel) variant of GMOM called BLOCK-GMOM which avoids the extra sample-size dependent computational penalty of calculating samplewise gradients. Notice that by Theorem 1, the number of blocks required to compute GMOM is independent of the sample size to obtain the guarantee with high probability. To achieve this, instead of calculating sample-wise gradients, we compute block-wise gradients by backpropagating on sample-mean aggregated loss for each block. Moreover, such an implementation not only increases efﬁciency but also allows incorporating adaptive optimizers for individual blocks. Algorithm 1 presents the overall BLOCK-GMOM.
+
+5.1. Results on MuJoCo environment
+We perform experiments on 8 MuJoCo (Todorov et al., 2012) control tasks. To use BLOCK-GMOM aggregation with PPO-NOCLIP, we extract actor-network and critic-network gradients at each step and separately run the Algorithm 1 on both the networks. For our experiments, we use SGD as OB and Adam as OG and refer to this variant of PPO-NOCLIP as ROBUST-PPO-NOCLIP. We compare the performances of PPO, PPO-NOCLIP, and ROBUST-PPO-NOCLIP, using
+
+hyperparameters that are tuned individually for each method but held ﬁxed across all tasks (Table 1).
+For 7 tasks, we observe signiﬁcant improvements with ROBUST-PPO-NOCLIP over PPO-NOCLIP and performance close to that achieved by PPO (with all clipping heuristics enabled) (Fig. 5). Although we do not observe improvements over PPO, we believe that this result corroborates our conjecture that PPO heuristics primarily aim to offset the heavy-tailedness induced with training.
+6. Related Work
+Studying the behavior of SGD, Simsekli et al. (2019) questioned the Gaussianity of SGD noise, highlighting its heavytailed nature. Subsequently, there has been a growing interest in understanding the nature of SGD noise in different deep learning tasks with a speciﬁc focus on its inﬂuence on generalization performance versus induced optimization difﬁculties (S¸ ims¸ekli et al., 2020; Zhang et al., 2019b; Panigrahi et al., 2019). In particular, Zhang et al. (2019b) studied the nature of stochastic gradients in natural language processing (e.g., BERT-pretraining) and highlighted the effectiveness of adaptive methods (e.g. Adam and gradient clipping). Some recent work has also made progress towards understanding the effectiveness of gradient clipping in convergence (Zhang et al., 2019b;a; S¸ ims¸ekli et al., 2020) in presence of heavy-tailed noise. On the other hand, Simsekli et al. (2019) highlighted the beneﬁts of heavy-tailed noise in achieving wider minima with better generalization, by analyzing SGD as an SDE driven by Levy motion (whose increments are α−stable heavy-tailed noise).
+On the RL side, Bubeck et al. (2013) studied the stochastic multi-armed bandit problem when the reward distribution is heavy-tailed. The authors designed a robust version of the classical Upper Conﬁdence Bound algorithm by replacing the empirical average of observed rewards with robust estimates obtained via the univariate median-of-means estimator (Nemirovski & Yudin, 1983) on the observed sequence of rewards. Medina & Yang (2016) extended this approach to the problem of linear bandits under heavy-tailed noise. There is also a long line of work in deep RL which focuses on reducing the variance of stochastic policy gradients (Gu et al., 2016; Wu et al., 2018; Metelli et al., 2018; Cheng et al., 2020; Metelli et al., 2020). On the ﬂip side, Chung et al. (2020) highlighted the beneﬁcial impacts of stochasticity of policy gradients on the optimization process. In simple MDPs, authors showed that larger higher moments with ﬁxed variance leads to improved exploration. This aligns with the conjecture of Simsekli et al. (2019) in the context of supervised learning that heavy-tailedness in gradients can improve generalization. Chung et al. (2020) thus pointed out the importance of a careful analysis of stochasticity in gradients to better understand policy gradient algorithms.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+We consider our work a stepping stone towards analyzing stochastic gradients beyond just their variance. We hypothesize that in deep RL where the optimization process is known to be brittle (Henderson et al., 2018; 2017; Engstrom et al., 2019; Ilyas et al., 2018), perhaps due to the ﬂexibility of the neural representation, heavy-tailedness can cause heightened instability rather than help in efﬁcient exploration. This perspective aligns with one line of work (Zhang et al., 2019b) where authors demonstrate that heavy-tailedness can cause instability in the learning process in deep models. Indeed with ablation experiments in Sec. 4, we show that increasing heavy-tailedness in likelihood ratios hurts the agent performance, and mitigating heavy-tailedness in advantage estimates improves the agent performance.
+7. Conclusion
+In this paper, we empirically characterized PPO’s gradients, demonstrating that they become more heavy-tailed as training proceeds. Our detailed analysis showed that at on-policy steps, the heavy-tailed nature of the gradients is primarily attributable to the multiplicative advantage estimates. On the other hand, we observed that during off-policy training, the heavy-tailedness of the likelihood ratios of the surrogate reward function exacerbates the observed heavy-tailedness.
+Subsequently, we examined issues due to heavy-tailed nature of gradients. We demonstrated that PPO’s clipping heuristics primarily serve to offset the heavy-tailedness induced by off-policy training. With this motivation, we showed that a robust estimation technique could effectively replace all three of PPO’s clipping heuristics: likelihoodratio clipping, value loss clipping, and gradient clipping.
+In future work, we plan to conduct similar analysis on gradients for other RL algorithms such as deep Q-learning. Moreover, we believe that our ﬁndings on heavy-tailed nature of advantage estimates can signiﬁcantly impact algorithm development for policy gradient algorithms.
+Acknowledgements
+We acknowledge the support of Lockheed Martin, DARPA via HR00112020006, and NSF via IIS-1909816, OAC1934584.
+References
+Anderson, T. W. and Darling, D. A. A test of goodness of ﬁt. Journal of the American statistical association, 49 (268):765–769, 1954.
+Berner, C., Brockman, G., Chan, B., Cheung, V., Dkebiak, P., Dennison, C., Farhi, D., Fischer, Q., Hashme, S.,
+
+Hesse, C., et al. Dota 2 with large scale deep reinforcement learning. arXiv preprint arXiv:1912.06680, 2019.
+Bubeck, S., Cesa-Bianchi, N., and Lugosi, G. Bandits with heavy tail. IEEE Transactions on Information Theory, 59 (11):7711–7717, 2013.
+Cheng, C.-A., Yan, X., and Boots, B. Trajectory-wise control variates for variance reduction in policy gradient methods. In Conference on Robot Learning, pp. 1379– 1394. PMLR, 2020.
+Chung, W., Thomas, V., Machado, M. C., and Roux, N. L. Beyond variance reduction: Understanding the true impact of baselines on policy optimization. arXiv preprint arXiv:2008.13773, 2020.
+Danielsson, J., Ergun, L. M., de Haan, L., and de Vries, C. G. Tail index estimation: Quantile driven threshold selection. Available at SSRN 2717478, 2016.
+Engstrom, L., Ilyas, A., Santurkar, S., Tsipras, D., Janoos, F., Rudolph, L., and Madry, A. Implementation matters in deep rl: A case study on ppo and trpo. In International Conference on Learning Representations, 2019.
+Espeholt, L., Soyer, H., Munos, R., Simonyan, K., Mnih, V., Ward, T., Doron, Y., Firoiu, V., Harley, T., Dunning, I., et al. Impala: Scalable distributed deep-rl with importance weighted actor-learner architectures. arXiv preprint arXiv:1802.01561, 2018.
+Gu, S., Lillicrap, T., Ghahramani, Z., Turner, R. E., and Levine, S. Q-prop: Sample-efﬁcient policy gradient with an off-policy critic. arXiv preprint arXiv:1611.02247, 2016.
+Henderson, P., Islam, R., Bachman, P., Pineau, J., Precup, D., and Meger, D. Deep reinforcement learning that matters. arXiv preprint arXiv:1709.06560, 2017.
+Henderson, P., Romoff, J., and Pineau, J. Where did my optimum go?: An empirical analysis of gradient descent optimization in policy gradient methods. arXiv preprint arXiv:1810.02525, 2018.
+Hill, B. M. A simple general approach to inference about the tail of a distribution. The annals of statistics, pp. 1163–1174, 1975.
+Ilyas, A., Engstrom, L., Santurkar, S., Tsipras, D., Janoos, F., Rudolph, L., and Madry, A. A closer look at deep policy gradients. arXiv preprint arXiv:1811.02553, 2018.
+Islam, R., Henderson, P., Gomrokchi, M., and Precup, D. Reproducibility of benchmarked deep reinforcement learning tasks for continuous control. arXiv preprint arXiv:1708.04133, 2017.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+Kakade, S. M. A natural policy gradient. In Advances in neural information processing systems, pp. 1531–1538, 2002.
+Medina, A. M. and Yang, S. No-regret algorithms for heavytailed linear bandits. In International Conference on Machine Learning, pp. 1642–1650, 2016.
+Metelli, A. M., Papini, M., Faccio, F., and Restelli, M. Policy optimization via importance sampling. arXiv preprint arXiv:1809.06098, 2018.
+Metelli, A. M., Papini, M., Montali, N., and Restelli, M. Importance sampling techniques for policy optimization. Journal of Machine Learning Research, 21(141):1–75, 2020.
+Minsker, S. et al. Geometric median and robust estimation in banach spaces. Bernoulli, 21(4):2308–2335, 2015.
+Mnih, V., Kavukcuoglu, K., Silver, D., Rusu, A. A., Veness, J., Bellemare, M. G., Graves, A., Riedmiller, M., Fidjeland, A. K., Ostrovski, G., et al. Human-level control through deep reinforcement learning. nature, 518(7540): 529–533, 2015.
+Mnih, V., Badia, A. P., Mirza, M., Graves, A., Lillicrap, T., Harley, T., Silver, D., and Kavukcuoglu, K. Asynchronous methods for deep reinforcement learning. In International conference on machine learning, pp. 1928– 1937, 2016.
+Mohammadi, M., Mohammadpour, A., and Ogata, H. On estimating the tail index and the spectral measure of multivariate α-stable distributions. Metrika, 78(5):549–561, 2015.
+Nemirovski, A. and Yudin, D. Problem Complexity and Method Efﬁciency in Optimization. A Wiley-Interscience publication. Wiley, 1983.
+Panigrahi, A., Somani, R., Goyal, N., and Netrapalli, P. Nongaussianity of stochastic gradient noise. arXiv preprint arXiv:1910.09626, 2019.
+Prasad, A., Suggala, A. S., Balakrishnan, S., and Ravikumar, P. Robust estimation via robust gradient estimation. arXiv preprint arXiv:1802.06485, 2018.
+Resnick, S. I. Heavy-tail phenomena: probabilistic and statistical modeling. Springer Science & Business Media, 2007.
+
+Schulman, J., Moritz, P., Levine, S., Jordan, M., and Abbeel, P. High-dimensional continuous control using generalized advantage estimation. arXiv preprint arXiv:1506.02438, 2015b.
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A., and Klimov, O. Proximal policy optimization algorithms. arXiv preprint arXiv:1707.06347, 2017.
+Silver, D., Schrittwieser, J., Simonyan, K., Antonoglou, I., Huang, A., Guez, A., Hubert, T., Baker, L., Lai, M., Bolton, A., et al. Mastering the game of go without human knowledge. nature, 550(7676):354–359, 2017.
+Simsekli, U., Sagun, L., and Gurbuzbalaban, M. A tailindex analysis of stochastic gradient noise in deep neural networks. arXiv preprint arXiv:1901.06053, 2019.
+S¸ ims¸ekli, U., Zhu, L., Teh, Y. W., and Gu¨rbu¨zbalaban, M. Fractional underdamped langevin dynamics: Retargeting sgd with momentum under heavy-tailed gradient noise. arXiv preprint arXiv:2002.05685, 2020.
+Sutton, R. S., McAllester, D. A., Singh, S. P., and Mansour, Y. Policy gradient methods for reinforcement learning with function approximation. In Advances in neural information processing systems, pp. 1057–1063, 2000.
+Todorov, E., Erez, T., and Tassa, Y. Mujoco: A physics engine for model-based control. In 2012 IEEE/RSJ International Conference on Intelligent Robots and Systems, pp. 5026–5033. IEEE, 2012.
+Wang, D., Liu, H., and Liu, Q. Variational inference with tail-adaptive f-divergence. In Advances in Neural Information Processing Systems, pp. 5737–5747, 2018.
+Williams, R. J. Simple statistical gradient-following algorithms for connectionist reinforcement learning. Mach. Learn., 8(3–4):229–256, May 1992. ISSN 0885-6125. doi: 10.1007/BF00992696. URL https://doi.org/ 10.1007/BF00992696.
+Wu, C., Rajeswaran, A., Duan, Y., Kumar, V., Bayen, A. M., Kakade, S., Mordatch, I., and Abbeel, P. Variance reduction for policy gradient with action-dependent factorized baselines. arXiv preprint arXiv:1803.07246, 2018.
+Xie, Z., Sato, I., and Sugiyama, M. A diffusion theory for deep learning dynamics: Stochastic gradient descent exponentially favors ﬂat minima. In International Conference on Learning Representations, 2021. URL https: //openreview.net/forum?id=wXgk_iCiYGo.
+
+Schulman, J., Levine, S., Abbeel, P., Jordan, M., and Moritz, P. Trust region policy optimization. In International conference on machine learning, pp. 1889–1897, 2015a.
+
+Zhang, J., He, T., Sra, S., and Jadbabaie, A. Why gradient clipping accelerates training: A theoretical justiﬁcation for adaptivity. arXiv preprint arXiv:1905.11881, 2019a.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+Zhang, J., Karimireddy, S. P., Veit, A., Kim, S., Reddi, S. J., Kumar, S., and Sra, S. Why adam beats sgd for attention models. arXiv preprint arXiv:1912.03194, 2019b.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+A. Detailed backgroud
+
+We deﬁne a Markov Decision Process (MDP) as a tuple (S, A, R, γ, P ), where S represent the set of environments states, A represent the set of agent actions, R : S × A → R is the reward function, γ is the discount factor, and P : S × A × S → R is the state transition probability distribution. The goal in reinforcement learning is to learn a policy πθ : S × A → [0, 1], parameterized by θ, such that the expected cumulative discounted reward (known as returns) is maximized. Formally,
+
+∞
+
+π∗ = argmax Eat∼π(·|st),st+1∼P (·|st,at) γtR(st, at) . (5)
+
+π
+
+t=0
+
+Policy gradient methods directly optimize a paraterized policy function (also known as actor network). The central idea behind policy gradient methods is to perform stochastic gradient ascent on expected return (Eq. 5) to learn parameters θ. Under mild conditions (Sutton et al., 2000), the gradient of the Eq. 5 can be written as
+
+∞
+
+∇θJ (θ) = Eτ∼πθ
+
+γtR(st, at)∇θ log(πθ(at|st)) ,
+
+t=0
+
+where τ ∼ πθ are trajectories sampled according to πθ(τ ) and J(θ) is the objective maximised in Eq. 5. With the
+
+observation that action at only affects the reward from time t onwards, we re-write the objective J(θ), replacing returns
+
+using the Q-function, i.e., the expected discounted reward after taking an action a at state s and following πθ afterwards.
+
+Mathematically, Qπθ (s, a) = Eτ∼πθ
+
+∞ k=0
+
+γ
+
+k
+
+R(st+k
+
+,
+
+at+k
+
+)|at
+
+= a, st
+
+=s
+
+.
+
+Using
+
+the
+
+Q-function,
+
+we
+
+can
+
+write
+
+the
+
+gradient of the objective function as
+
+∞
+
+∇θJ (θ) = Eτ∼πθ
+
+Qπθ (st, at)∇θ log(πθ(at|st)) .
+
+t=0
+
+However, the variance in the above expectation can be large, which raises difﬁculties for estimating the expectation
+
+empirically. To reduce the variance of this estimate, a baseline is subtracted from the Q-function—often the value
+
+function or expected cumulative discounted reward starting at a certain state and following a given policy i.e., Vπθ (s) =
+
+Eτ ∼πθ
+
+∞ k=0
+
+γ
+
+k
+
+R(st+k
+
+,
+
+at+k
+
+)|st
+
+=
+
+s
+
+.
+
+The
+
+network
+
+that
+
+estimates
+
+the
+
+value
+
+function
+
+is
+
+often
+
+referred
+
+to
+
+as
+
+critic.
+
+Deﬁne
+
+Aπθ (st, at) = Qπθ (st, at) − Vπθ (st) as the advantage of performing action at at state st. Incorporating an advantage
+
+function, the gradient of the objective function can be written:
+
+∞
+
+∇θJ (θ) = Eτ∼πθ
+
+Aπθ (st, at)∇θ log(πθ(at|st)) .
+
+(6)
+
+t=0
+
+Eq. 6 is the na¨ive actor-critic objective and is used by A2C.
+
+Trust region methods and PPO. Since directly optimizing the cumulative rewards can be challenging, modern policy
+gradient optimization algorithms often optimize a surrogate reward function in place of the true reward. Most commonly, the surrogate reward objective includes a likelihood ratio to allow importance sampling from a behavior policy π0 while optimizing policy πθ, such as the surrogate reward used by Schulman et al. (2015a):
+
+max E(s ,a )∼π πθ(at, st) Aˆπ (st, at) ,
+
+(7)
+
+θ
+
+t t 0 π0(at, st) 0
+
+where Aˆπ = Aπσ−(Aµ(πA)π) (we refer to this as the normalized advantages). However, the surrogate is indicative of the true reward function only when πθ and π0 are close in distribution. Different policy gradient methods (Schulman et al., 2015a; 2017; Kakade, 2002) attempt to enforce the closeness in different ways. In Natural Policy Gradients (Kakade, 2002) and Trust Region Policy Optimization (TRPO) (Schulman et al., 2015a), authors utilize a conservation policy iteration with an explicit divergence constraint which provides provable lower bounds guarantee on the improvements of the parameterized policy. On the other hand, PPO (Schulman et al., 2017) implements a clipping heuristic on the likelihood ratio of the surrogate reward function to avoid excessively large policy updates. Speciﬁcally, PPO optimizes the following objective:
+
+max E(s ,a )∼π
+
+min ρtAˆπ (st, at)clip(ρt, 1 − , 1 + )Aˆπ (st, at) ,
+
+(8)
+
+θt
+
+tt
+
+θt−1
+
+θt−1
+
+θt−1
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+where ρt : = ππθtθ−t (1a(ta,ts,ts)t) and clip(x, 1 − , 1 + ) clips x to stay between 1 + and 1 − . We refer to ρt as likelihood-ratios. Due to a minimum with the unclipped surrogate reward, the PPO objective acts as a pessimistic bound on the true surrogate
+reward. As in standard PPO implementation, we use Generalized Advantage Estimation (GAE) (Schulman et al., 2015b). Moreover, instead of ﬁtting the value network via regression to target values (denoted by Vtrg):
+
+min Es ∼π
+
+(Vθ (st) − Vtrg(st))2 ,
+
+(9)
+
+θt
+
+t θt−1
+
+t
+
+standard implementations ﬁt the value network with a PPO-like objective:
+
+min Es ∼π max (Vθ (st) − Vtrg(st))2 , clip Vθ (st), Vθ (st) − ε, Vθ (st) + ε − Vtrg(st) 2 , (10)
+
+θt
+
+t θt−1
+
+t
+
+t
+
+t−1
+
+t−1
+
+where is the same value used to clip probability ratios in PPO’s loss function (Eq. 8). PPO uses the following training
+procedure: At any iteration t, the agent creates a clone of the current policy πθt which interacts with the environment to collects rollouts S (i.e., state-action pair {(si, ai)}Ni=1). Then the algorithm optimizes the policy πθ and value function for a ﬁxed K gradient steps on the sampled data S. Since at every iteration the ﬁrst gradient step is taken on the same policy from
+which the data was sampled, we refer to these gradient updates as on-policy steps. And as for the remaining K − 1 steps,
+the sampling policy differs from the current agent, we refer to these updates as off-policy steps.
+
+Throughout the paper, we consider a stripped-down variant of PPO (denoted PPO-NOCLIP) that consists of policy gradient with importance weighting (Eq. 7), but has been simpliﬁed as follows: i) no likelihood-ratio clipping, i.e., no objective function clipping; ii) value network optimized via regression to target values (Eq. 9) without value function clipping; and iii) no gradient clipping. Overall PPO-NOCLIP uses the following objective:
+
+max E(s ,a )∼π πθ(at, st) Aˆπ (st, at) − c(Vθ − Vtarg)2 .
+
+θ
+
+t t 0 π0(at, st) 0
+
+t
+
+where c is a coefﬁcient of the value function loss (tune as a hyperparameter). Moreover, no gradient clipping is incorporated in PPO-NOCLIP. One may argue that since PPO-NOCLIP removes the clipping heuristic from PPO, the unconstrained maximization of Eq. 1 may lead to excessively large policy updates. In App. E, we empirically justify the use of Eq. 1 by showing that with the small learning rate used in our experiments (optimal hyperparameters in Table 1), PPO-NOCLIP maintains a KL based trust-region like PPO throughout the training. We elaborate this in App. E.
+
+B. Details on estimators
+We now formalize our setup for studying the distribution of gradients. Throughout the paper, we use the following deﬁnition of the heavy-tailed property: Deﬁnition 2 (Resnick (2007)). A non-negative random variable w is called heavy-tailed if its tail probability Fw(t) : =P (w ≥ t) is asymptotically equivalent to t−α∗ as t → ∞ for some positive number α∗. Here α∗ determines the heavy-tailedness and α∗ is called tail index of w.
+For a heavy-tailed distribution with index α∗, its α-th moment exist only if α < α∗, i.e., E[wα] < ∞ iff α < α∗. A value of α∗ = 1.0 corresponds to a Cauchy distribution and α∗ = ∞ (i.e., all moments exist) corresponds to a Gaussian distribution. Intuitively, as α∗ decreases, the central peak of the distribution gets higher, the valley before the central peak gets deeper, and the tails get heavier. In other words, the lower the tail-index, the more heavy-tailed the distribution. However, in the ﬁnite sample setting, estimating the tail index is notoriously challenging (Simsekli et al., 2019; Danielsson et al., 2016; Hill, 1975).
+In this study, we explore three estimators as heuristic measures to understand heavy tails and non-Gaussianity of gradients.
+
+• Alpha-index estimator. This estimator was proposed in (Mohammadi et al., 2015) for symmeteric α-stable distributions
+
+and was used by (Simsekli et al., 2019) to understand the noise behavior of SGD. This estimator is derived under the
+
+(strong) assumption that the stochastic Gradient Noise (GN) vectors are coordinate-wise independent and follow a
+
+symmetric alpha-stable distribution. Formally, let {Xi}Ni=1 be a collection of N = mn (centered) random variables.
+
+Deﬁne Yi =
+
+m j=1
+
+Xj+(i−1)m
+
+for
+
+i
+
+∈
+
+[n].
+
+Then,
+
+the
+
+estimator
+
+is
+
+given
+
+by
+
+1
+
+1 1n
+
+1
+
+α : = log m n log |Yi| − n N log |Xi| .
+
+i=1
+
+i=1
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+Instead of treating each co-ordinate of gradient noise as an independent scalar, we use these estimators on gradient norms as discussed in Zhang et al. (2019b). With alpha-index estimator, smaller alpha-index value signify higher degree of heavy-tailedness.
+
+• Anderson-Darling test (Anderson & Darling, 1954) on random projections of GN to perform Gaussianity testing. Panigrahi et al. (2019) proposed the Gaussianity test on the projections of GN along 1000 random directions. Their estimate is then the fraction of directions accepted by the Anderson Darling test. While this estimator is informative about the Gaussian behavior, it is not useful to quantify and understand the trends of heavy-tailedness if the predictor nature is non-Gaussian.
+
+• To our knowledge, the deep learning literature has only exploredthese two estimators for analyzing the heavy-tailed nature of gradients. (iii) Finally, in our work, we propose using kurtosis Kurtosis. To quantify the heavy-tailedness
+relative to a normal distribution, we measure kurtosis (fourth standardized moment) of the gradient norms. Given samples {Xi}Ni=1, the kurtosis κ is given by
+
+κ=
+
+Ni=1(Xi − X¯ )4/N ,
+
+Ni=1(Xi − X¯ )2/N 2
+
+where X¯ is the empirical mean of the samples.
+
+Note that both α-index and Anderson-Darling need very strong assumptions to be valid. (i) α-index requires that the true distribution is symmetric and α-stable. In the multivariate setting, the test proposed by Simsekli et al. (2019) relies on the covariance being isotropic. These theoretical limitations also lead to practical consequences. Speciﬁcally, we found that for low-rank Gaussian distributions (for which ideally α = 2), the existing estimators report an α = 1.1, wrongly suggesting heavy-tailendess. Similar limitations were pointed out in recent works (Zhang et al., 2019b; Xie et al., 2021). (ii) Anderson-Darling tests for Gaussianity and is not useful in quantifying the degree of heavy-tailedness. Moreover, the test fails for sub-Gaussian distributions such as uniform distribution.
+On the other hand, our proposed estimator doesn’t require symmetry or Gaussianity, and works well in the aforementioned pathological situations arising in practice. Moreover, well-known fat tailed distributions such as Student’s t-distribution, exponential distribution, etc., have higher Kurtosis than normal distrbution. Even for distributions with less than 4 moments, empirical Kurtosis can be used to understand the “relative” trends in tail behavior for different distributions at ﬁxed sample sizes (ﬁgure 6).
+
+B.1. Synthetic study
+In Figure 6, we show the trends with varying tail index and sample sizes. Clearly as the tail-index increases, i.e., the shape parameter increases, the kurtosis decreases (signifying its correlation to capture tail-index). Although for tail-index smaller than 4 the kurtosis is not deﬁned, we plot empirical kurtosis and show its increasing trend sample size. We ﬁx the tail index of Pareto at 2 and plot ﬁnite sample kurtosis and observe that it increases almost exponentially with the sample size. These two observations together hint that kurtosis is a neat surrogate measure for heavy-tailedness.
+
+kurtosis^{1/4} kurtosis^{1/4}
+
+12 10 8 6 4 2
+102
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+pareto(alpha=2)
+
+normal
+
+5
+
+4
+
+3
+
+2
+
+103Num samples104
+(a)
+
+105
+
+100
+
+Shape of Pareto
+(b)
+
+pareto normal
+101
+
+Figure 6. Kurtosis plots. Analysis on norms of 100-dimensional vectors such that each coordinate is sampled iid from Pareto distribution or normal distribution. (a) Variation in kurtosis (κ1/4) as the sample size is varied for samples from normal distribution and Pareto with tail index 2 (i.e, α = 2). (b) Variation in kurtosis (κ1/4) as the shape of Pareto is varied at ﬁx sample size.
+
+C. GMOM Algorithm
+
+Algorithm 2 GMOM
+
+input : Samples S = {x1, . . . , xn}, number of blocks b
+
+1: m = n/b .
+
+2: for i in 1 . . . b do
+
+3:
+
+µˆi =
+
+m j=0
+
+xj+i∗m/
+
+m.
+
+4: end for
+
+5: µˆGMOM = WEISZFELD(µˆ1, . . . , µˆb).
+
+output : Estimate µˆGMOM
+
+Algorithm 3 WEISZFELD
+
+input : Samples S = {µ1, . . . , µb}, number of blocks b
+
+1: Initialize µ arbitrarily.
+
+2: for iteration ← 1, . . . , n do 3: dj : = ||µ−1µj||2 for j in 1, . . . , b.
+
+4: µ : =
+
+b j=1
+
+µj
+
+dj
+
+/
+
+b j=1
+
+dj
+
+5: end for
+
+output : Estimate µ
+
+D. Experimental setup for gradient distribution study
+Recall that PPO uses the following training procedure: At any iteration t, the agent creates a clone of the current policy πθt which interacts with the environment to collects rollouts S (i.e., state-action pair {(si, ai)}Ni=1). Then the algorithm optimizes the policy πθ and value function for a ﬁxed K gradient steps on the sampled data S. Since at every iteration the ﬁrst gradient step is taken on the same policy from which the data was sampled, we refer to these gradient updates as on-policy steps. And as for the remaining K − 1 steps, the sampling policy differs from the current agent, we refer to these updates as off-policy steps. For all experiments, we aggregate our estimators across 30 seeds and 8 environments. We do this by ﬁrst computing the estimators for individual experiments and then taking the sample mean across all runs. We now describe the exact experimental details.
+In all of our experiments, for each gradient update, we have a batch size of 64. Hence for an individual estimate, we aggregate over 64 samples (batch size in experiments) to compute our estimators. For Anderson Darling test, we use 100 random directions to understand the behavior of stochastic gradient noise.
+On-policy heavy-tailed estimation. At every on-policy gradient step (i.e. ﬁrst step on newly sampled data), we freeze the policy and value network, and save the sample-wise gradients of the actor and critic objective. The estimators are calculated at every tenth on-policy update throughout the training.
+Off-policy heavy-tailed estimation At every off-policy gradient step (i.e. the gradient updates made on a ﬁxed batch of data when the sampling policy differs from the policy being optimized), we freeze the policy and value network, and save the sample-wise gradients of the actor and critic objective. Then at various stages of training, i.e., initialization, 50% max
+
+Mean KL
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+Ant-v2
+
+0.16 0.14
+
+PPPPOO-NoClip
+
+0.12
+
+0.10
+
+0.08
+
+0.06
+
+0.04
+
+0.02
+
+0.00
+
+0 100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+0.0007 0.0006 0.0005 0.0004 0.0003 0.0002 0.0001 0.0000
+0
+
+Hopper-v2 PPPPOO-NoClip
+100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+HalfCheetah-v2 00..0045 PPPPOO-NoClip
+
+0.03
+
+0.02
+
+0.01
+
+0.00 0
+
+100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+1e 7 Humanoid-v2 2.5 PPPPOO-NoClip
+2.0 1.5 1.0 0.5 0.0
+0 100 # I2t0e0 ratio30n0s 400 500
+
+0.007 0.006 0.005 0.004 0.003 0.002 0.001 0.000
+0
+
+CartPole-v1 PPPPOO-NoClip
+100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+0.07 0.06 0.05 0.04 0.03 0.02 0.01 0.00
+0
+
+Reacher-v2 PPPPOO-NoClip
+100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+Walker2d-v2 0.00020 PPPPOO-NoClip
+0.00015
+
+0.00010
+
+0.00005
+
+0.00000 0
+
+100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+0.0014 0.0012 0.0010 0.0008 0.0006 0.0004 0.0002 0.0000
+0
+
+InvertedPendulum-v2 PPPPOO-NoClip
+100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+Figure 7. KL divergence between current and previous policies with the optimal hyperparameters (parameters in Table 1). We measure the mean empirical KL divergence between the policy obtained at the end of off-policy training (after every 320 gradient steps) and the sampling policy at the beginning of every training iteration. The quantities are measured over the state-action pairs collected in the training step (Engstrom et al. (2019) observed similar results with both unseen data and training data). We observe that both the algorithms maintain a KL based trust region. The trend with KL divergence in PPO matches with the observations made in Engstrom et al. (2019) where they also observed that it peeks in halfway in training.
+
+reward and max reward (which corresponds to different batches of sampled data), we ﬁx the collected trajectories and collect sample-wise gradients for the 320 steps taken. We now elaborate the exact setup with one instance, at 50% of the maximum reward. First, we ﬁnd the training iteration where the agent achieves approximately 50% of the maximum reward individually for each environment. Then at this training iteration, we freeze the policy and value network and save the sample-wise gradients of the actor and critic objective for off-policy steps.
+Analysis of PPO-NOCLIP with progressively applying PPO heuristics. We compute the gradients for the off-policy steps taken with the PPO-NOCLIP objective as explained above. Then at each gradient step, we progressively add heuristics from PPO and re-compute the gradients for analysis. Note that we still always update the value and policy network with PPO-NOCLIP objective gradients.
+E. Mean KL divergence between current and previous policy
+Enforcing a trust region is a core algorithmic property of PPO and TRPO. While the trust-region enforcement is not directly clear from the reward curves or heavy-tailed analysis, inspired by Engstrom et al. (2019), we perform an additional experiment to understand how this algorithmic property varies with PPO and our variant PPO-NOCLIP with optimal hyperparameters. In Fig 7, we measure mean KL divergence between successive policies of the agent while training with PPO and PPO-NOCLIP. Recall that while PPO implements a clipping heuristics in the likelihood ratios (as a surrogate to approximate the KL constraint of TRPO), we remove that clipping heuristics in PPO-NOCLIP.
+Engstrom et al. (2019) pointed out that trust-region enforced in PPO is heavily dependent on the method with which the clipped PPO objective is optimized, rather than on the objective itself. Corroborating their ﬁndings, we indeed observe that with optimal parameters (namely small learning rate used in our experiments), PPO-NOCLIP indeed manages to maintain a trust region with mean KL metric (Fig 7) on all 8 MuJoCo environments. This highlights that instead of the core algorithmic objective used for training, the size of the step taken determines the underlying objective landscape, and its constraints. On a related note, Ilyas et al. (2018) also highlighted that the objective landscape of PPO algorithm in the typical sample-regime in which they operate can be very different from the true reward landscape.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+F. Trends with advantages
+F.1. Kurtosis for returns, value estimate and advantages grouped with sign
+
+Kurtosis
+
+2.1 2.0 1.9 1.8 1.7 1.6 1.5 1.4 1.3
+0
+
+A0 A 0+ returns V0
+100On-p2o00licy s3t00eps 400 500
+
+Figure 8. Heavy-tailedness in advantages grouped by their sign, rewards and value estimates. Clearly, as the training progresses the negative advantages become heavy-tailed. For returns, we observe an initial slight increase in the heavy-tailedness which quickly plateaus to a small magnitude of heavytailedness. The heavytailedness in the value estimates and positive advantages remain almost constant throughout the training.
+
+F.2. Heavy-tailedness in A2C and PPO in onpolicy iterations
+
+Kurtosis
+
+2.1 2.0 1.9 1.8 1.7 1.6 1.5 1.4 1.3
+0
+
+A2C-A 0 PPO-A 0
+100On-p2o00licy s3t00eps 400 500
+
+Figure 9. Heavy-tailedness in advantages for A2C and PPO during on-policy iterates. Clearly, as the training progresses heavy-tailedness in PPO advantages increases rapidly when compared with A2C advantages. The observed behavior arises to the off-policy training of the agent in PPO. This explains why we observe heightened heavy-tailedness in PPO during onpolicy iterations in Fig 1(a).
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+F.3. Histograms of advantages on HalfCheetah over training iterations
+
+0.6
+
+Env Steps #102400
+
+>0
+
+0.5
+
+<0
+
+0.4
+
+0.6
+
+Env Steps #204800
+
+0.6
+
+Env Steps #307200
+
+>0
+
+>0
+
+0.5
+
+<0 0.5
+
+<0
+
+0.4
+
+0.4
+
+0.3
+
+0.3
+
+0.3
+
+0.2
+
+0.2
+
+0.2
+
+0.1
+
+0.1
+
+0.1
+
+0.0 14 12 10 8 6 4 2 0 2 0.0 14 12 10 8 6 4 2 0 2 0.0 14 12 10 8 6 4 2 0 2
+
+0.6
+
+Env Steps #409600
+
+>0
+
+0.5
+
+<0
+
+0.4
+
+0.6
+
+Env Steps #512000
+
+>0
+
+0.5
+
+<0
+
+0.4
+
+0.6
+
+Env Steps #614400
+
+>0
+
+0.5
+
+<0
+
+0.4
+
+0.3
+
+0.3
+
+0.3
+
+0.2
+
+0.2
+
+0.2
+
+0.1
+
+0.1
+
+0.1
+
+0.0 14 12 10 8 6 4 2 0 2 0.0 14 12 10 8 6 4 2 0 2 0.0 14 12 10 8 6 4 2 0 2
+
+0.6
+
+Env Steps #716800
+
+0.6
+
+Env Steps #819200
+
+0.6
+
+Env Steps #921600
+
+>0
+
+>0
+
+>0
+
+0.5
+
+<0 0.5
+
+<0 0.5
+
+<0
+
+0.4
+
+0.4
+
+0.4
+
+0.3
+
+0.3
+
+0.3
+
+0.2
+
+0.2
+
+0.2
+
+0.1
+
+0.1
+
+0.1
+
+0.0 14 12 10 8 6 4 2 0 2 0.0 14 12 10 8 6 4 2 0 2 0.0 14 12 10 8 6 4 2 0 2
+
+Figure 10. Distribution of log(|Aπθ |) over training grouped by sign of log(|Aπθ |) for HalfCheetah-v2 . To elaborate, we collect the advantages and separately plot the grouped advantages with their sign, i.e., we draw histograms separately for negative and positive advantages. As training proceeds, we clearly observe the increasing heavy-tailed behavior in negative advatanges as captured by the higher fraction of log(|Aπθ |) with large magnitude. Moreover, the histograms for positive advantages (which resembel Gaussain pdf) stay almost the same throughout training. This highlights the particular heavy-tailed (outlier-rich) nature of negative advantages corroborating our experiments with kurtosis and tail-index estimators.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+G. Analysis with other estimators
+G.1. On-policy gradient analysis
+
+2.2
+
+2.2
+
+2.2
+
+2.0
+
+2.0
+
+2.0
+
+Alpha index Alpha index Alpha index
+
+1.8
+
+1.8
+
+1.8
+
+1.6
+1.4 PPO A2C
+1.2 0 100On-p2o00licy s3t00eps 400 500
+(a)
+
+1.6 actor
+
+1.4
+
+A0
+
+actor/A 0
+
+1.2 0 100On-p2o00licy s3t00eps 400 500
+
+(b)
+
+1.6 critic
+
+1.4
+
+A0
+
+critic/A 0
+
+1.2 0 100On-p2o00licy s3t00eps 400 500
+
+(c)
+
+Figure 11. Heavy-tailedness in PPO during on-policy iterations. All plots show mean alpha index aggregated over 8 MuJoCo environments. A decrease in alpha-index implies an increase in heavy-tailedness. (a) Alpha index vs on-policy iterations for A2C and PPO. Evidently, as training proceeds, the gradients become more heavy-tailed for both the methods. (b) Alpha index vs on-policy iterations for actor networks in PPO. (c) Alpha index vs on-policy iterations for critic networks in PPO. Both critic and actor gradients become more heavy-tailed on-policy steps as the agent is trained. Note that as the gradients become more heavy-tailed, we observe a corresponding increase of heavy-tailedness in the advantage estimates (Aˆπ0 ) . However, “actor/Aˆπ0 ” and “critic/Aˆπ0 ” (i.e., actor or critic gradient norm divided by GAE estimates) remain light-tailed throughout the training.
+
+Fraction Accepted Fraction Accepted
+
+0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1 0.0 0
+
+actor actor/A 0
+100On-p2o00licy s3t00eps 400 500
+
+0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1 0.0 0
+
+critic critic/A 0
+100On-p2o00licy s3t00eps 400 500
+
+(a)
+
+(b)
+
+Figure 12. Heavy-tailedness in PPO during on-policy iterations. All plots show mean fraction of directions accepted by Anderon-
+
+Darling test over 8 MuJoCo environments. A higher accepted fraction indicates a Gaussian behavior. (b) Fraction accepted vs on-policy
+
+iterations for actor networks in PPO. (c) Fraction accepted vs on-policy iterations for critic networks in PPO. Both critic and actor gradients remain non-Gaussian as the agent is trained. However, “actor/Aˆπ0 ” and “critic/Aˆπ0 ” (i.e., actor or critic gradient norm divided
+by GAE estimates) have fairly high fraction of directions accepted, hinting their Gaussian nature.
+
+Alpha index Alpha index Alpha index
+
+G.2. Off-policy gradient analysis
+
+Initialization
+2.00
+
+1.95
+
+1.90
+
+1.85
+
+1.80
+
+1.75 actor
+
+1.70
+
+critic ratios
+
+1.65 actor/ratio
+
+1.60 0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+50% of Max Reward
+2.00
+
+1.95
+
+1.90
+
+1.85
+
+1.80
+
+1.75 actor
+
+1.70
+
+critic ratios
+
+1.65 actor/ratio
+
+1.60 0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+2.00 1.95 1.90 1.85 1.80 1.75 1.70 1.65 1.60 0
+
+Max Reward
+
+actor critic ratios actor/ratio
+
+50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+Figure 13. Heavy-tailedness in PPO-NOCLIP during off-policy steps at various stages of training iterations in MuJoCo environments. All plots show mean alpha index aggregated over 8 Mujoco environments. A decrease in alpha index implies an increase in heavytailedness. As off-policyness increases, the actor gradients get substantially heavy-tailed. This trend is corroborated by the increase of heavy-tailedness in ratios. Moreover, consistently we observe that the heavy-tailedness in “actor/ratios” stays constant. While initially during training, the heavy-tailedness in the ratio’s increases substantially, during later stages the increase tapers off. The overall increase across training iterations is explained by the induced heavy-tailedness in the advantage estimates (cf. Sec. 3.1).
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+H. Hyperparameter settings and Rewards curves on individual enviornments
+
+Hyperparameter
+Steps per PPO iteration Number of minibatches PPO learning rate ROBUST-PPO-NOCLIP learning rate PPO-NOCLIP learning rate Discount factor γ GAE parameter λ Entropy loss coefﬁcient PPO value loss coefﬁcient ROBUST-PPO-NOCLIP value loss coefﬁcient PPO-NOCLIP value loss coefﬁcient Max global L2 gradient norm (only for PPO) Clipping coefﬁcient (only for PPO) Policy epochs Value epochs GMOM number of blocks GMOM Weiszfeld iterations
+
+Values
+2048 32
+0.0003 0.00008 0.00008
+0.99 0.95
+0.0 2.0 2.0 2.0 0.5 0.2 10 10
+8 100
+
+Table 1. Hyperparameter settings. Sweeps were run over learning rates { 0.000025, 0.00005, 0.000075, 0.00008, 0.00009 , 0.0001, 0.0003, 0.0004 } and value loss coefﬁcient { 0.1, 0.5, 1.0, 2.0, 10.0} with 30 random seeds per learning rate.
+
+Rewards
+
+3500 3000 2500 2000 1500 1000 500
+0 0
+
+Walker2d-v2
+PPO-NoClip RobustPPO-NoClip PPO
+20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+HalfCheetah-v2
+
+3000 PPO-NoClip
+
+2500
+
+RobustPPO-NoClip PPO
+
+2000
+
+1500
+
+1000
+
+500
+
+0
+
+500
+
+1000 0
+
+20N00u00mb4e0r00o00f Ti6m000e00step80s0000 1000000
+
+Rewards
+
+Ant-v2
+200 0
+200 400 600
+800 PPO-NoClip 1000 RobustPPO-NoClip
+PPO
+1200
+0 20N00u00mb4e00r00o0 f T6i0m000e0ste80p0s000 1000000
+
+Rewards
+
+Humanoid-v2
+PPO-NoClip 600 RobustPPO-NoClip
+PPO
+500
+
+400
+
+300
+
+200
+
+100 0
+
+20N00u00mb4e00r00o0f T6i0m000e0ste80p0s000 1000000
+
+500 400 300 200 100
+0 0
+
+CartPole-v1
+PPO-NoClip RobustPPO-NoClip PPO
+20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+Hopper-v2
+PPO-NoClip 2500 RobustPPO-NoClip
+PPO
+2000 1500 1000 500
+0
+0 20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+25 0 25 50 75 100 125 150
+0
+
+Reacher-v2
+PPO-NoClip RobustPPO-NoClip PPO
+20N00u00mb4e00r00o0f T6i0m000e0ste80p0s000 1000000
+
+Rewards
+
+1000 800 600 400 200
+0 0
+
+InvertedPendulum-v2
+PPO-NoClip RobustPPO-NoClip PPO
+20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+Figure 14. Reward curves as training progresses in 8 different Mujoco Environments aggregated across 30 random seeds and for hyperparameter setting tabulated in Table 1. The shaded region denotes the one standard deviation across seeds. We observe that except in Hopper-v2 environment, the mean reward with ROBUST-PPO-NOCLIP is signiﬁcantly better than PPO-NOCLIP and close to that achieved by PPO with optimal hyperparameters. Aggregated results shown in Fig. 5.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+I. Analysis on individual enviornments.
+Overall, in the ﬁgures below, we show that the trends observed in aggregated plots in Section 3 with Kurtosis hold true on individual environments. While the degree of heavy-tailedness varies in different environments, the trend of increase in heavy-tailedness remains the same.
+
+Kurtosis
+
+Ant-v2
+
+Hopper-v2
+
+2.4
+
+actor
+
+2.4
+
+actor
+
+2.2
+
+A0 actor/A
+
+2.2
+
+A0 actor/A
+
+0
+
+0
+
+2.0
+
+2.0
+
+Kurtosis
+
+1.8
+
+1.8
+
+1.6
+
+1.6
+
+1.4
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+0 100On-p2o00licy s3t00eps 400 500
+
+Kurtosis
+
+HalfCheetah-v2
+
+2.4
+
+actor
+
+2.4
+
+2.2
+
+A0 actor/A
+
+2.2
+
+0
+
+2.0
+
+2.0
+
+Humanoid-v2
+
+actor A0 actor/A 0
+
+Kurtosis
+
+1.8
+
+1.8
+
+1.6
+
+1.6
+
+1.4
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+0 100On-p2o00licy s3t00eps 400 500
+
+CartPole-v1
+2.4
+
+2.2
+
+2.0
+
+actor
+
+A0
+
+1.8
+
+actor/A 0
+
+1.6
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+Kurtosis
+
+Reacher-v2
+
+Walker2d-v2
+
+2.4
+
+actor
+
+2.4
+
+actor
+
+2.2
+
+A0 actor/A
+
+2.2
+
+A0 actor/A
+
+0
+
+0
+
+2.0
+
+2.0
+
+Kurtosis
+
+1.8
+
+1.8
+
+1.6
+
+1.6
+
+1.4
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+0 100On-p2o00licy s3t00eps 400 500
+
+Kurtosis
+
+InvertedPendulum-v2
+2.4
+
+2.2
+
+2.0
+
+actor
+
+A0
+
+1.8
+
+actor/A 0
+
+1.6
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+Kurtosis
+
+Figure 15. Heavy-tailedness in actor gradients for PPO during on-policy steps for 8 MuJoCo environments. All plots show mean and
+std of kurtosis aggregated over 30 random seeds. As the agent is trained, actor gradients become more heavy-tailed. Note that as the gradients become more heavy-tailed, we observe a corresponding increase of heavy-tailedness in the advantage estimates (Aˆπ0 ). However, “actor/Aˆπ0 ” (i.e., actor gradient norm divided by advantage) remain light-tailed throughout the training.
+
+Kurtosis
+
+Ant-v2
+
+Hopper-v2
+
+2.4
+
+critic
+
+2.4
+
+critic
+
+2.2
+
+A0 critic/A
+
+2.2
+
+A0 critic/A
+
+0
+
+0
+
+2.0
+
+2.0
+
+Kurtosis
+
+1.8
+
+1.8
+
+1.6
+
+1.6
+
+1.4
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+0 100On-p2o00licy s3t00eps 400 500
+
+Kurtosis
+
+HalfCheetah-v2
+
+2.4 critic
+
+2.2
+
+A0 critic/A
+
+0
+
+2.0
+
+Humanoid-v2
+
+2.4
+
+critic
+
+2.2
+
+A0 critic/A
+
+0
+
+2.0
+
+Kurtosis
+
+1.8
+
+1.8
+
+1.6
+
+1.6
+
+1.4
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+0 100On-p2o00licy s3t00eps 400 500
+
+CartPole-v1
+2.4
+
+2.2
+
+2.0
+
+critic
+
+A0
+
+1.8
+
+critic/A 0
+
+1.6
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+Kurtosis
+
+Reacher-v2
+
+Walker2d-v2
+
+InvertedPendulum-v2
+
+2.4
+
+critic
+
+2.4
+
+critic
+
+2.4
+
+2.2
+
+A0 critic/A
+
+2.2
+
+A0 critic/A
+
+2.2
+
+2.0
+
+0
+2.0
+
+0
+2.0
+
+critic
+
+A0
+
+1.8
+
+1.8
+
+1.8
+
+critic/A 0
+
+Kurtosis
+
+Kurtosis
+
+1.6
+
+1.6
+
+1.6
+
+1.4
+
+1.4
+
+1.4
+
+0 100On-p2o00licy s3t00eps 400 500
+
+0 100On-p2o00licy s3t00eps 400 500
+
+0 100On-p2o00licy s3t00eps 400 500
+
+Kurtosis
+
+Figure 16. Heavy-tailedness in critic gradients for PPO during on-policy steps for 8 MuJoCo environments. All plots show mean and
+std of kurtosis aggregated over 30 random seeds. As the agent is trained, critic gradients become more heavy-tailed. Note that as the gradients become more heavy-tailed, we observe a corresponding increase of heavy-tailedness in the advantage estimates (Aˆπ0 ). However, “critic/Aˆπ0 ” (i.e., critic gradient norm divided by advantage) remain light-tailed throughout the training.
+
+Kurtosis
+
+2.4
+
+Ant-v2
+
+actor
+
+2.2
+
+critic
+
+2.0
+
+ratios actor/ratio
+
+1.8
+
+1.6
+
+1.4
+
+0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+2.4
+
+CartPole-v1
+
+actor
+
+2.2
+
+critic
+
+2.0
+
+ratios actor/ratio
+
+1.8
+
+1.6
+
+1.4
+
+0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+Kurtosis
+
+Kurtosis
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+2.4
+
+Hopper-v2
+
+actor
+
+2.2
+
+critic
+
+2.0
+
+ratios actor/ratio
+
+1.8
+
+1.6
+
+1.4
+
+0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+Kurtosis
+
+2.4
+
+HalfCheetah-v2
+
+actor
+
+2.2
+
+critic
+
+2.0
+
+ratios actor/ratio
+
+1.8
+
+1.6
+
+1.4
+
+0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+2.4
+
+Reacher-v2
+
+actor
+
+2.2
+
+critic
+
+2.0
+
+ratios actor/ratio
+
+1.8
+
+1.6
+
+1.4
+
+0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+Kurtosis
+
+2.4
+
+Walker2d-v2
+
+actor
+
+2.2
+
+critic
+
+2.0
+
+ratios actor/ratio
+
+1.8
+
+1.6
+
+1.4
+
+0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+Kurtosis
+
+Kurtosis
+
+Humanoid-v2
+2.4
+
+2.2
+
+actor
+
+2.0
+
+critic
+
+1.8
+
+ratios
+
+actor/ratio
+
+1.6
+
+1.4
+
+0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+2.4 InvertedPendulum-v2
+
+actor
+
+2.2
+
+critic
+
+2.0
+
+ratios actor/ratio
+
+1.8
+
+1.6
+
+1.4
+
+0 50 O1f0f0-po1l5i0cy s2t00eps250 300
+
+Kurtosis
+
+Figure 17. Heavy-tailedness in PPO-NOCLIP during off-policy steps at Initialization for 8 MuJoCo environments. All plots show mean and std of kurtosis aggregated over 30 random seeds. As off-policyness increases, the actor gradients get substantially heavy-tailed. This trend is corroborated by the increase of heavy-tailedness in ratios. Moreover, consistently we observe that the heavy-tailedness in “actor/ratios” stays constant. The trend in heavy-tailedness at later training iteration follow similar trends but the increase in heavytailedness tapers off. The overall increase across training iterations is explained by the induced heavy-tailedness in the advantage estimates (cf. Sec. 3.1).
+
+J. How do heavy-tailed policy-gradients affect training?
+J.1. Effect of heavy-tailedness in advantages
+
+Rewards
+
+4000 3000 2000 1000
+0 1000
+0
+
+HalfCheetah-v2
+PPO-Adv_clip PPO
+20N00u00mb4e0r00o00f Ti6m000e00step80s0000 1000000
+
+Rewards
+
+3000 2500 2000 1500 1000 500
+0 0
+
+Hopper-v2
+PPO-Adv_clip PPO
+20N00u00mb4e00r00o0f T6im000e00ste8p00s000 1000000
+
+Rewards
+
+3500 3000 2500 2000 1500 1000 500
+0 0
+
+Walker2d-v2
+PPO-Adv_clip PPO
+20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+Ant-v2
+0
+500
+1000
+1500
+PPO-Adv_clip 2000 PPO
+0 20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+500 400 300 200 100
+0 0
+
+CartPole-v1
+PPO-Adv_clip PPO
+20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+1000 800 600 400 200
+0 0
+
+InvertedPendulum-v2
+PPO-Adv_clip PPO
+20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+Humanoid-v2
+PPO-Adv_clip 600 PPO
+
+500
+
+400
+
+300
+
+200
+
+100 0
+
+20N00u00mb4e00r00o0f T6i0m000e0ste80p0s000 1000000
+
+Rewards
+
+0 20 40 60 80 100 120 140
+0
+
+Reacher-v2
+PPO-Adv_clip PPO
+20N00u00mb4e00r00o0f T6i0m000e0ste80p0s000 1000000
+
+Figure 18. Reward curves with advantage clipping in 8 different Mujoco Environments aggregated across 30 random seeds. The shaded region denotes the one standard deviation across seeds. The clipping threshold is tuned per environment. We observe that by clipping outlier advantages, we substantially improve the mean rewards for 5 environments. While for the remaining three environments, we didn’t observe any differences in the agent performance.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients J.2. Effect of heavy-tailedness in likelihood-ratios
+
+Rewards
+
+3500 3000 2500 2000 1500 1000 500
+0 0
+
+Walker2d-v2
+PPO PPO-NoClip (10) PPO-NoClip (20) PPO-NoClip (30)
+20N00u00mb4e00r00o0f T6i0m000e0ste8p00s000 1000000
+
+Rewards
+
+HalfCheetah-v2
+3000 PPO PPO-NoClip (10)
+2000 PPO-NoClip (20) PPO-NoClip (30)
+1000 0
+1000 2000
+0 20N00u00mb4e0r00o00f Ti6m000e00step80s0000 1000000
+
+Rewards
+
+200 0
+200 400 600 800 1000
+0
+
+Ant-v2
+PPO PPO-NoClip (10) PPO-NoClip (20) PPO-NoClip (30)
+20N00u00mb4e00r00o0 f T6i0m000e0ste80p0s000 1000000
+
+Rewards
+
+600 500 400 300 200 100
+0
+
+Humanoid-v2
+PPO PPO-NoClip (10) PPO-NoClip (20) PPO-NoClip (30)
+20N00u00mb4e00r00o0f T6i0m000e0ste80p0s000 1000000
+
+Rewards
+
+Hopper-v2
+
+3000 PPO
+
+2500
+
+PPO-NoClip (10) PPO-NoClip (20)
+
+2000 PPO-NoClip (30)
+
+1500
+
+1000
+
+500
+
+0
+0 20N00u00mb4e00r00o0f T6i0m000e0ste8p00s000 1000000
+
+Rewards
+
+500 400 300 200 100
+0 0
+
+CartPole-v1
+PPO PPO-NoClip (10) PPO-NoClip (20) PPO-NoClip (30)
+20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Rewards
+
+0 25 50 75 100 125 150 175
+0
+
+Reacher-v2
+PPO PPO-NoClip (10) PPO-NoClip (20) PPO-NoClip (30)
+20N00u00mb4e00r00o0f T6i0m000e0ste80p0s000 1000000
+
+Rewards
+
+1200 1000 800 600 400 200
+0 0
+
+InvertedPendulum-v2
+PPO PPO-NoClip (10) PPO-NoClip (20) PPO-NoClip (30)
+20N00u00mb4e00r00o0f T6i0m00e00ste8p00s000 1000000
+
+Mean KL
+
+Walker2d-v2
+
+0.00035 PPPPOO-NoClip (10)
+
+0.00030 0.00025
+
+PPPPOO--NNooCClliipp ((2300))
+
+0.00020
+
+0.00015
+
+0.00010
+
+0.00005
+
+0.00000
+
+0 100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+HalfCheetah-v2 0.05 PPPPOO-NoClip (10) 0.04 PPO-NoClip (20) 0.03 PPO-NoClip (30)
+0.02
+
+0.01
+
+0.00 0
+
+100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+Ant-v2
+
+0.16 0.14
+
+PPPPOO-NoClip (10)
+
+0.12 0.10
+
+PPPPOO--NNooCClliipp ((2300))
+
+0.08
+
+0.06
+
+0.04
+
+0.02
+
+0.00
+
+0 100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+1e 7 Humanoid-v2
+
+2.5
+
+2.0 1.5
+
+PPPPOO-NoClip (10)
+
+1.0 PPPPOO--NNooCClliipp ((2300))
+
+0.5
+
+0.0
+0 100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+Hopper-v2
+
+0.0175 0.0150
+
+PPPPOO-NoClip (10)
+
+0.0125 0.0100
+
+PPPPOO--NNooCClliipp ((2300))
+
+0.0075
+
+0.0050
+
+0.0025
+
+0.0000
+
+0 100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+0.030 0.025 0.020 0.015 0.010 0.005 0.000
+0
+
+CartPole-v1 PPPPOO-NoClip (10) PPPPOO--NNooCClliipp ((2300))
+100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+Reacher-v2
+
+0.40 0.35
+
+PPPPOO-NoClip (10)
+
+0.30 0.25
+
+PPPPOO--NNooCClliipp ((2300))
+
+0.20
+
+0.15
+
+0.10
+
+0.05
+
+0.00
+
+0 100 # I2t0e0 ratio30n0s 400 500
+
+Mean KL
+
+InvertedPendulum-v2
+
+0.06 0.05
+
+PPPPOO-NoClip (10)
+
+0.04 PPPPOO--NNooCClliipp ((2300))
+
+0.03
+
+0.02
+
+0.01
+
+0.00 0
+
+100 # I2t0e0 ratio30n0s 400 500
+
+Figure 19. (Top two rows) Reward curves with the varying number of ofﬂine epochs in 8 different Mujoco Environments aggregated across 10 random seeds. Bracketed quantity in the legend denotes the number of ofﬂine epochs used for PPO-NOCLIP training. Clearly, as the number of ofﬂine epochs increases, the performance of the agent drops (consistent behavior across all environments). Furthermore, at 30 epochs the training also gets unstable. We also show the PPO performance curve for comparison. (Bottom two rows) KL divergence between current and previous policies with the optimal hyperparameters (parameters in Table 1) for PPO and PPO-NOCLIP with varying number of ofﬂine epochs. We measure mean empirical KL divergence between the policy obtained at the end of off-policy training and the sampling policy at the beginning of every training iteration. The quantities are measured over the state-action pairs collected in the training step. We observe that till 30 ofﬂine epochs PPO-NOCLIP maintains a trust-region with mean KL metric.
+
+On Proximal Policy Optimization’s Heavy-tailed Gradients
+
+Kurtosis
+
+2.1
+
+2.0
+
+10 epochs
+
+1.9
+
+20 epochs 30 epochs
+
+1.8
+
+1.7
+
+1.6
+
+1.5
+
+1.4
+
+1.3
+0 100On-p2o00licy s3t00eps 400 500
+
+Figure 20. Heavy-tailedness in PPO-NOCLIP advantages throughout the training as the degree of off-policyness is varied in MuJoCo environments. Kurtosis is aggregated over 8 Mujoco environments. We plot kurtosis vs on-policy iterates. As the number of off-policy epochs increases, the heavy-tailedness in advantages remains the same showing an increase in the number of ofﬂine epochs has a minor effect on the induced heavy-tailedness in the advantage estimates.
+
+

@@ -1,0 +1,934 @@
+Parameter Inference with Bifurcation Diagrams
+
+arXiv:2106.04243v3 [cs.LG] 27 Oct 2021
+
+Gregory Szep King’s College London London, WC2R 2LS, UK gregory.szep@kcl.ac.uk
+
+Attila Csikász-Nagy Pázmány Péter Catholic University
+Budapest, 1083, Hungary csikasznagy@gmail.com
+
+Neil Dalchau Microsoft Research Cambridge
+Cambridge, CB1 2FB, UK ndalchau@gmail.com
+
+Abstract
+Estimation of parameters in differential equation models can be achieved by applying learning algorithms to quantitative time-series data. However, sometimes it is only possible to measure qualitative changes of a system in response to a controlled condition. In dynamical systems theory, such change points are known as bifurcations and lie on a function of the controlled condition called the bifurcation diagram. In this work, we propose a gradient-based approach for inferring the parameters of differential equations that produce a user-speciﬁed bifurcation diagram. The cost function contains an error term that is minimal when the model bifurcations match the speciﬁed targets and a bifurcation measure which has gradients that push optimisers towards bifurcating parameter regimes. The gradients can be computed without the need to differentiate through the operations of the solver that was used to compute the diagram. We demonstrate parameter inference with minimal models which explore the space of saddle-node and pitchfork diagrams and the genetic toggle switch from synthetic biology. Furthermore, the cost landscape allows us to organise models in terms of topological and geometric equivalence.
+1 Introduction
+Inverse problems [1] arise in biology and engineering in settings when the model is not fully known and the desire is to match model behaviour to a given set of observations. This helps systematically guide both model and experimental design. While we would like to understand the quantitative details of a system, often only qualitative changes in response to varying experimental conditions can be robustly measured across independent studies [2, 3]. For example, several studies are likely to agree that the human immune system activates above a threshold concentration of a pathogen and deactivates at a lower threshold concentration, but may disagree on the exact quantities of the thresholds or the magnitudes of the immune response. Bifurcation theory provides us a framework for studying these transitions in a manner that is independent of quantitative details [4]. The emerging picture suggests that identiﬁcation of the qualitative behaviour – the bifurcation diagram – should precede any attempt at inferring other properties of a system [5].
+Inferring the parameters of a model directly from a bifurcation diagram is difﬁcult because it is not obvious how multiple parameters in concert control the existence and position of a bifurcation. It could even be impossible for the model to bifurcate in the manner desired. For models with a sufﬁciently small number of parameters, ﬁnding speciﬁc bifurcation diagrams is typically done by
+35th Conference on Neural Information Processing Systems (NeurIPS 2021), Sydney, Australia.
+
+hand [6]. Several approaches exist to place bifurcations to desired locations once a manifold is present [7–9] yet typically resort to sampling techniques to search for them in the ﬁrst place [10, 11]. It is always possible to design bespoke goodness of ﬁt measures to ﬁnd speciﬁc model behaviours, for example using the period and phase of limit cycle oscillations [12]. However, this approach does not generalise across a wider set of qualitative behaviours. Progress has been made in cases where model structure and stability conditions are used to reﬁne the search space [13, 14] yet the resulting objectives are still not explicit in the bifurcation targets and also not differentiable. In the emerging ﬁeld of scientiﬁc machine learning [15–17], parameters of structured mechanistic models are favoured over ﬂexible models in larger parameter spaces. A scalable method for navigating the space of bifurcation diagrams would enable design of differential equations with high-level qualitative constraints. Furthermore one could begin organising models according to qualitatively distinct behaviours.
+Back-propagation through differential equation solvers has been a breakthrough over the past couple of years [18, 19] that enabled scalable parameter inference for differential equations from trajectory data. Although one could use trajectory data to create the aforementioned qualitative constraints [20, 21] this would entail over-constraining information originating from the kinetics and dynamical transients of the model. Furthermore, such data usually does not contain sufﬁcient information about dynamical transients in order to identify kinetic parameters. Techniques for back-propagating through implicit equation solvers have also been developed [22, 23] although to the best of the authors’ knowledge have not been applied to bifurcation diagrams at the time of writing this paper.
+The problem of inferring differential equation parameters against a user-speciﬁed bifurcation diagram decomposes into two parts: searching for bifurcating regimes and matching the locations of bifurcation points to desired values. Matching bifurcation locations is a supervised problem where the data are expressed as bifurcations points [8, 11]. Searching for bifurcations is an unsupervised problem because when bifurcations are not present, there is no distance deﬁned between data and prediction [10]. Therefore only properties of the model can be used to start the search. We propose an approach for performing both tasks in an end-to-end fashion. The bifurcation diagram encodes high-level qualitative information deﬁned by state space structures, rather than kinetics. We apply the strategy of implicit layers [22, 23] to calculate gradients. To compute the diagram we use a predictor-corrector method called deﬂated continuation [24, 25] developed for partial differential equations.
+We ﬁnd that the cost function landscape contains basins that not only allow us to synthesise models with a desired bifurcation diagram but also allow us to organise models in terms of topological and geometric equivalence. We discuss the relevance of this in model selection. In summary, our paper has the following main contributions:
+• An end-to-end differentiable method for locating bifurcations in parameter space and then matching their dependency on a control condition to user-speciﬁed locations
+• Implementation of the method as a Julia package BifurcationInference.jl
+• Leveraging the cost landscape for a novel way of organising differential equation models in terms of geometric and topological equivalence
+
+1.1 Preliminaries
+
+Suppose we collected observations along a scalar control condition p ∈ R and conclude that there are speciﬁc values of p for which there are qualitative changes in system behaviour. Let D be the set of
+those values and let us hypothesise that these transitions occur due to bifurcations in the dynamics that
+drive the underlying mechanism. Let us model the mechanism with a parametrised set of differential equations for states u ∈ RN with a vector function Fθ in a parameter space θ ∈ RM .
+
+For the purposes of introducing this work, we will consider the simplest class of bifurcations known as co-dimension one bifurcations not including limit cycles. Therefore D should contain conditions for which we hypothesise changes in multi-stable behaviour. Let the equations be
+
+∂u = Fθ(u, p)
+
+where Fθ : RN+1 → RN
+
+(1)
+
+∂t
+
+In the context of the differential equations, and not considering limit cycles for now, we show that
+a static non-degenerate bifurcation can be deﬁned by a set of conditions on the determinant of the Jacobian ∂∂Fuθ . The determinant of the Jacobian quantiﬁes the rate at which trajectories in a local
+
+2
+
+patch of state-space u ∈ RN converge or diverge. Let s ∈ R parametrise the curves that trace out the bifurcation diagram. Any location on the curve u(s) and p(s) must satisfy the steady-state of equations (1). Directional derivatives dds along the diagram require the calculation of a vector that is tangent to the diagram (see Supplementary A). The determinant approaching zero along the diagram
+
+means that the dynamics of the system are slowing down, which is an important indicator for the
+
+onset of a transition between qualitative behaviours. Furthermore, the slowing down must necessarily be followed by a breakdown of stability; for this to be true it is sufﬁcient but not necessary to require
+
+that the determinant cross zero with a ﬁnite slope, meaning that its directional derivative along the
+diagram dds ∂∂Fuθ is not zero. This is the non-degeneracy condition. The set of predicted values for the control condition P(θ) ⊂ R at which bifurcations occur are deﬁned as
+
+P(θ) := p | ∃ u : Fθ(u, p) = 0, ∂Fθ = 0, d ∂Fθ = 0 (2)
+
+∂u
+
+ds ∂u
+
+A proof of how the conditions (2) are necessary and sufﬁcient for static non-degenerate bifurcations
+
+is detailed in Supplementary B. The most common bifurcations between steady states, not including
+
+limit cycles, are saddle-nodes and pitchforks [26]. Saddle-node bifurcations, which often appear in
+
+pairs (Figure 1A) are deﬁned by stable and unstable ﬁxed points meeting and disappearing. Pitchfork
+
+bifurcations occur where a single steady state splits into two stable and one unstable steady state (Figure 1B shows an imperfect pitchfork; a perfect pitchfork arises when θ1 = 0). To illustrate these bifurcations, we deﬁne minimal models (Figure 1) that span the space of saddle-node and pitchforks, where indeed zero crossings in the determinant with a ﬁnite slope deﬁne the set of prediction P(θ). The location of these crossings in general may not match the targets D.
+
+A
+
+B
+
+Figure 1: Illustration of bifurcation diagrams for minimal models of bifurcations. A. Saddle-node
+
+bifurcations
+
+arise
+
+for
+
+Fθ (u,
+
+p)
+
+=
+
+p
+
++
+
+θ1u
+
++
+
+θ2u3
+
+when
+
+θ
+
+=
+
+(
+
+5 2
+
+,
+
+−1).
+
+B.
+
+Pitchfork
+
+bifurcations
+
+arise
+
+for Fθ(u, p) = θ1 + pu + θ2u3 when θ = ( 12 , −1). Targets are illustrated by light yellow vertical
+
+lines. Bifurcation curves are shown as solid blue and red lines, with lighter shades indicating the
+
+determinant crossing zero at locations P(θ) giving rise to unstable solutions.
+
+For a given set of parameters θ one could compute the set of predicted bifurcations P(θ) using
+
+parameter continuation methods [25, 24]. Our goal is to ﬁnd optimal parameters θ∗ that match
+
+predictions P(θ∗) to speciﬁed targets D. We must design a suitable cost function L so that
+
+θ∗ := argminθL(θ|D)
+
+(3)
+
+The optimal θ∗ is not expected to always be unique, but is in general a manifold representing the
+
+space of qualitatively equivalent models. Ideally, the cost function L should reward θ for which the
+
+number of predicted bifurcations is equal to the number of targets, |P(θ)| = |D|. This is especially
+
+important in the case where there are no predictions |P(θ)| = 0.
+
+3
+
+2 Proposed Method
+
+2.1 Cost Function
+To identify parameter sets that give rise to bifurcation diagrams with speciﬁed bifurcation points, we propose a cost function that comprises two terms. The role of the error term is simply to reward predicted bifurcations to coincide with the speciﬁed target locations. This of course relies on such bifurcations existing. The role of the eigenvalue term is to encourage an optimiser to move towards parameter regimes that do exhibit bifurcations.
+
+2.1.1 Error term: matching bifurcations to target locations
+
+In order for predicted bifurcations p(θ) ∈ P(θ) to match targets p ∈ D we need to evaluate an error term |p(θ) − p |. A naive approach might take an average over the norms for all prediction-target pairs. However this gives rise to unwanted cross-terms and the possibility of multiple predictions matching the same target without any penalty for unmatched targets. Therefore, we choose a geometric mean over the predictions and an arithmetic mean over targets:
+
+1
+
+1
+
+E(θ, D) =
+
+|p(θ) − p | |P|
+
+(4)
+
+|D|
+
+p ∈D p(θ)∈P(θ)
+
+The error term is only zero when each target is matched by at least one prediction and allows for cases where the number of predictions is greater than or equal to the number of targets |P| ≥ |D|. An alternative approach, which undesirably introduces more hyper-parameters, would be to let each prediction P(θ) represent the centroid of a mixture distribution and use expectation-maximisation to match the centroids to targets D.
+
+2.1.2 Eigenvalue term: encouraging bifurcations
+
+We can see from Figure 1 and deﬁnition (2) that
+predictions p(θ) can be identiﬁed by looking
+for points along the curve where the determinant crosses zero ∂∂Fuθ = 0 with a ﬁnite slope dds ∂∂Fuθ = 0. Using these quantities we can deﬁne a positive semi-deﬁnite measure ϕθ(s) of zero crossings in the determinant along a curve
+parametrised by s which we deﬁne as
+
+∂Fθ
+
+−1
+
+ϕθ(s) := 1 + d ∂∂uFθ (5)
+
+ds ∂u
+
+The bifurcation measure ϕθ(s) is maximal at bifurcations and has ﬁnite gradients in nonbifurcating regimes (Figure 2). More speciﬁcally, the measure ϕθ(s) is one at bifurcation points and goes to zero an odd number of times between bifurcations. This is because ∂∂Fuθ must eventually turn around in order to return back to zero, resulting in the directional derivative dds ∂∂Fuθ going to zero. Hence the measure ϕθ(s) goes to zero for each turning point (see Figure 2).
+On the other hand, as the determinant ∂∂Fuθ diverges, we approach regimes far away from any bifurcations and hence ϕθ(s) → 0. Since we would still like to have non-zero gradients with respect to θ in these regimes we designed the measure to go to zero sufﬁciently slowly.
+
+Figure 2: Bifurcation measure ϕθ(s) and determinant ∂∂Fuθ along the arclength s of two different bifurcation curves demonstrating how maximising the measure along the curve maintains the existing bifurcation marked by a circle, while encouraging new bifurcations marked by stars.
+
+4
+
+While the calculation of the determinant is straightforward, its directional derivative requires a tangent vector to the bifurcation curve. Fortunately the tangent vector Tθ(s) at the solution u(s), p(s) anywhere along the curve s can be calculated as the nullspace of the rectangular N × (N + 1) Jacobian
+∂Fθ · Tθ(s) = 0 (6) ∂(u, p) Fθ(u(s),p(s))=0
+This equation guarantees that the tangent vector Tθ(s) is orthogonal to all hyper-planes deﬁned by the components of Fθ. In this setting the dimension of the nullspace is always known, and therefore can reliably be calculated using QR factorisation methods [27].
+Equipped with a measure that quantiﬁes the appearance of bifurcations along a bifurcation arc we can deﬁne the total measure for a bifurcation diagram as
+
+Ψ(θ) := Fθ(u,p)=0ϕθ(s) ds . (7) Fθ(u,p)=0 ds
+Here we denote Fθ(u,p)=0 ds as the sum of the line integrals in (u, p) ∈ RN+1 deﬁned by the level set Fθ(u, p) = 0 with s being an arbitrary parametrisation of the curves. The total measure Ψ(θ) is normalised such that Ψ(θ) → 1 in the regimes where the controlled condition region p is densely packed with bifurcations. The total measure Ψ(θ) is added to the error term as if it were a likelihood. This deﬁnes the cost function as
+
+L(θ|D) := |P| − |D| log Ψ(θ) + E(θ, D),
+
+(8)
+
+The pre-factor |D| − |P| in the eigenvalue term ensures that the gradients are always pushing optimisers towards a state where |D| = |P|. This can be seen as a step-wise annealing of the eigenvalue term until the desired state is reached.
+
+2.2 Differentiating the cost function
+
+To make use of gradient-based optimisers to locate desired bifurcation diagrams, we show here how to differentiate the cost function. First, we note that while individual bifurcations p(θ) depend smoothly on θ, the total number of predictions |P| does not have gradient contributions with respect to θ. Therefore, we can safely drop the dependency in the prediction counter and now proceed in taking gradients with respect to θ knowing that the only dependencies we need to track are for individual bifurcations p(θ) within the deﬁnition the error term (4) and the total measure (7). Therefore,
+
+∂L =
+
+|P| − |D|
+
+λ ∂Ψ Ψ(θ)−1 +
+
+1
+
+1
+|p(θ) − p | |P|
+
+∂p (p(θ) − p )−1 (9)
+
+∂θ
+
+∂θ
+
+|D||P |
+
+∂θ
+
+p p(θ)
+
+p(θ)
+
+In a similar vein to back-propagation through neural differential equations [18] we would like to be able to calculate the gradient ∂∂Lθ without having to differentiate through the operations of the solver that ﬁnds the bifurcation diagram Fθ(u, p) = 0 and the bifurcation locations p(θ). To calculate the gradient of the measure ∂∂Ψθ we need to differentiate line integrals that depend on θ. Fortunately this can be done by the application of the generalised Leibniz integral rule, details of which can be found
+in Supplementary C.
+
+The gradient of the bifurcation points ∂∂pθ is found by application of the implicit function theorem to a vector function Gθ : RN+1 → RN+1 whose components represent the two constraints Fθ(u, p) = 0 and ∂∂Fuθ = 0. By following a similar strategy to that used by implicit layers [22] we yield an (N + 1) × M Jacobian representing a deformation ﬁeld [28] for each θ direction. The gradient we
+are looking for becomes
+
+∂p
+
+∂Gθ −1 ∂Gθ
+
+Fθ(u, p)
+
+∂θ = −pˆ · ∂(u, p) ∂θ Gθ(u,p)=0 where Gθ(u, p) := ∂∂Fuθ (10)
+
+Here pˆ is a unit vector in (u, p) ∈ RN+1 that picks out the deformations along the p-direction. If we wanted to place the bifurcation at target steady state u as well as target control condition p we would use the full (N + 1) × M deformation matrix. Calculation of this matrix involves inverting an
+
+5
+
+(N + 1) × (N + 1) Jacobian ∂∂(uG,θp) . Instead of explicitly inverting the Jacobian the corresponding system of linear equations is solved. The determinant of this Jacobian goes to zero in the degenerate case where dds ∂∂Fuθ = 0, further justifying our choice of measure Ψ(θ) which discourages the degenerate case.
+
+The cost function is piece-wise smooth and differentiable with undeﬁned gradients only in parameter
+
+contours where the number of predictions |P| changes; this is when Ψ(θ) is undeﬁned and the inverse
+
+of
+
+∂Gθ ∂(u,p)
+
+does
+
+not
+
+exist.
+
+Given
+
+a
+
+set
+
+of
+
+solutions
+
+to
+
+Fθ(u, p)
+
+=
+
+0
+
+and
+
+locations
+
+p(θ)
+
+the
+
+gradient
+
+∂L ∂θ
+
+can be evaluated using automatic differentiation methods [29–31] without needing to back-propagate
+
+through the solver that obtained the level set Fθ(u, p) = 0 in the forward pass.
+
+3 Experiments & Results
+In this section, we apply the method ﬁrst to minimal examples that can produce saddle-node and pitchfork bifurcations (both N = 1, M = 2), and then a slightly more complex model (N = 2, M = 5) that has multiple parametric regimes producing saddle-node bifurcations. We also demonstrate our method on a model of greater complexity, to convince the reader that the method can be used on more realistic examples with practical signiﬁcance. In Supplementary D we demonstrate the identiﬁcation of saddle-node bifurcations and damped oscillations in a model (N = 4, M = 21) of a synthetic gene circuit in E. coli [3].
+
+Figure 3: Saddle-node Fθ(u, p) = p+θ1u+θ2u3 and pitchfork Fθ(u, p) = θ1 +up+θ2u3 optimised with respect to θ so that predicted bifurcations P(θ) match targets D in control condition p. The right panel shows bifurcations diagrams for the three optimal θ∗ marked by stars on the left panel. The optimisation trajectories in white follow the gradient of the cost, approaching the black lines of global minima in the left panel
+3.1 Minimal Models
+Optimisations of two parameters (θ1, θ2) using simple gradient descent from Flux.jl with learning rate η = 0.01 for the minimal saddle-node and pitchfork models (Figure 1) yield trajectories approach-
+6
+
+ing lines of global minima in the cost function (Figures 3) which represent a set of geometrically equivalent models. Two bifurcation diagrams are geometrically equivalent if the number, type and locations of bifurcations match the speciﬁed targets D.
+We can see that the geometrically equivalent lines are contained within larger basins where the correct number and type of bifurcations are present but do not match the locations of targets D. All models within this basin are in some sense topologically equivalent. This hierarchical classiﬁcation allows us to identify the set of models that satisfy observed qualitative behaviour [5] before any attempt at inferring kinetic parameters, which is done by choosing a model along the line of geometrically equivalent models.
+Optimisation trajectories for the two minimal models appear mostly circumferential. This is because the models were set up such that the radial direction from the origin in θ space mostly scale kinetics whereas the circumferential direction changes the bifurcation topology. This suggests that the gradients of our cost function seek to change model geometry over kinetics.
+
+3.2 Genetic Toggle Switch
+
+In this section we optimise a model where the states share a Hill function relationship with cooperatively n = 2; these models often emerge from mass action kinetics with quasi-steady state approximations and are used to model species concentrations. After re-scaling the equations governing the dynamics of concentrations, the simpliﬁed equations for state u1 and u2 become
+
+a1 + (pu2)2
+
+a2 + (ku1)2
+
+∂tu1 = 1 + (pu2)2 − µ1u1 ∂tu2 = 1 + (ku1)2 − µ2u2
+
+(11)
+
+where ak is the baseline production rate for species k in the absence of the other species. Each species
+
+has a ﬁnite degradation rate µk. Finally we have two sensitivity constants p and k, one of which is
+
+chosen as our control condition. A baseline production rate ak > 1 recovers an inhibitor type hill
+
+function for species k and is an activator otherwise. The sensitivities are proportional to the slope
+
+of the hill productions. Solving for the steady states, substituting the equation for u1 into u2 and
+
+rearranging gives rise to the relationship
+
+k (1 + ( p u )2)√a2 − u
+
+= µ2p √
+
+where u := u2µ2
+
+(12)
+
+µ1 (a1 + ( µ2 u )2) u − 1
+
+A
+
+B
+
+Figure 4: Bifurcation inference for the two-state model (11). A. Optimal parameter estimates θ∗ for the targets D = {4, 5} reveal two clusters of qualitatively different regimes: mutual activation (a1 < 1; cluster 1) and mutual inhibition (a1 > 1; cluster 2). B. Example bifurcation diagrams indicate positively and negatively correlated dependencies between the two model states, as a function of the control condition.
+7
+
+which reveals that only a1, a2 and the ratio between the sensitivity and degradation parameters, µk1 , affect the solutions to this equation, and hence the locations of the bifurcations (Figure 4A). In 98% of 800 runs, optimisation using the ADAM optimiser [32] from Flux.jl with learning rate η = 0.1 converged to one of two clusters: mutual activation (a1 < 1, a2 < 1; cluster 1) and mutual inhibition (a1 > 1, a2 > 1; cluster 2) regimes. Example bifurcation diagrams illustrate how the bifurcation curves of each species are positively correlated in mutual activation and negatively correlated for mutual inhibition (Figure 4B).
+In order to maintain biological interpretability, optimisation was restricted to the positive parameter regime by transforming the parameters to log-space θ → 10θ. At the beginning of each optimisation run an initial θ was chosen in the log-space by sampling from a multivariate normal distribution with mean zero and standard deviation one.
+
+3.3 Complexity
+
+Performing one iteration of the optimisation requires the computation of the gradient of the cost (9), requiring a computation of the bifurcation diagram with parameter continuation methods, which includes the evaluation of matrix inversions (10). Instead of evaluating the inversions directly, we solve a system of linear equations, applying the same strategy as implicit layers [22, 23]. This leaves us with the computational bottleneck of calculating the determinant of the state space Jacobian, required in both the bifurcation measure (5) and gradient (10). This calculation scales like N 2 where N is the number of state space variables (Figure 5A).
+
+A
+
+B
+
+Figure 5: A. Execution time (time to calculate cost gradient) with respect to states N . B. Convergence times (the time it takes to ﬁnd and match a bifurcation to within 1% of a speciﬁed target) with respect to the number of parameters M , comparing against a gradient-free approach: Nelder-Mead. Calculations were performed on an Intel Core i7-6700HQ CPU @ 2.60GHz x 8 without GPU acceleration.
+
+For the complexity study, a model was designed so that it is extensible both in the number of
+
+parameters M and the number of states N . There are many choices for this; we opted for a model of
+
+the form
+
+∂tu1 = sin2p − (θ1 sin2p + 1)u1
+
+∂tun = un−1 − (µ2 + 1)un
+
+2≤n≤N
+
+(13)
+
+n
+
+In this model only the ﬁrst state u1 deﬁnes the shape of the bifurcation diagram, while the remaining states are merely linearly proportional to the ﬁrst. The parameters µn contain sums of θm allowing us a ﬂexible choice on the number of parameters while maintaining stable solutions for the bifurcation diagram.
+While still tractable on laptop computers for states N < 100 our implementation currently does not scale well for partial differential equations where a large the number of states N arises from discretisation of the spatial variables. The only reason we need this determinant is because it
+
+8
+
+is an indicator of bifurcations. We can address the computational bottleneck by ﬁnding a more computationally efﬁcient way of calculating this indicator. One approach would be to take the product of a ﬁnite subset of eigenvalues of the system. Note that any more efﬁcient calculation must still permit back-propagation through it.
+To demonstrate the beneﬁts of the gradient-based aspect of our method we compare convergence times of gradient descent against a gradient-free approach. We use the Nelder-Mead method from Optim.jl [33] and obtain convergence times as the number of param√eters M is increased (Figure 5B). We observe that for our method convergence times scale like M compared to M 2 for the gradient-free approach.
+4 Conclusion & Broader Impact
+We proposed a gradient-based approach for inferring the parameters of differential equations that produce a user-speciﬁed bifurcation diagram. By applying implicit layers [22, 23] and the generalised Leibniz rule [34] to the geometry of the implicitly deﬁned steady states [35] it is possible to use automatic differentiation methods to efﬁciently calculate gradients. We deﬁned a bifurcation measure that uses the determinant of the state-space Jacobian as an indicator for bifurcating parameter regimes in the eigenvalue term of the cost function. The gradients of the cost can be efﬁciently computed using automatic differentiation methods. The computational bottleneck is the evaluation of the state-space Jacobian determinant which limits the implementation to ordinary differential equations.
+We demonstrated our approach on models with one bifurcation parameter that can give rise to pitchforks and saddle-nodes. The estimated parameters form distinct clusters, allowing us to organise models in terms of topological and geometric equivalence (Figure 3). In the case of the genetic toggle switch (Figure 4) and a more complex model [3] (Figure D.1) we recovered mutual activation and inhibition regimes. In the more complex model we found a damped oscillatory regime that was not known about in the original paper.
+Although we did not consider limit cycles, the bifurcation measure can be extended to detect PoincaréAndronov-Hopf bifurcations alongside changes in stability of ﬁxed points (see Supplementary E for details). This measure enables detection of the onset of damped oscillations and/or the emergence of limit cycles (Figure E.1). Used together with a steady state solver that detects periodic solutions and gradient-based optimisation, we can specify regions of damped oscillation and limit cycles. Our approach generalises naturally to bifurcation manifolds such as limit point curves or surfaces. This is because the normal components of implicit derivatives can still be calculated for under-determined systems of equations [28, 36, 37]. In the case of manifolds it would be more appropriate to use isosurface extraction algorithms rather than continuation to obtain the steady-state manifold. Our approach does not depend on the details of the steady-state solver and therefore can still be applied.
+In dynamical systems theory the geometry of state-space determines all of the qualitative behaviours of a system. Our work makes progress towards designing models directly in state-space, rather than the spatial or temporal domain. This is valuable to experimentalists who only have qualitative observations available to them and wish to navigate the space of qualitative behaviours of their system. Our work lies within a trend of progress in the scientiﬁc machine learning community, where structured domain-informed models are favoured over ﬂexible models that live in large parameter spaces.
+5 Acknowledgements
+We would like to acknowledge Kieran Cooney for the fruitful conversations that helped guide the derivations and computational approach. A special thanks go to Romain Veltz and the Julia community for helpful pointers on package development and discussions over Slack. This work was supported by Microsoft Research through its PhD Scholarship Programme and the EPSRC Centre for Doctoral Training in Cross-Disciplinary Approaches to Non-Equilibrium Systems (CANES, EP/L015854/1).
+9
+
+References
+[1] U. G. Abdulla, R. Poteau, A. Binder, H. W. Engl, C. Flamm, P. K. Â. Ugler, J. Lu, S. M. Â. Uller, and P. Schuster, “Inverse problems in systems biology,” Inverse Problems, vol. 25, p. 51, 2009.
+[2] J. J. Tyson, K. Chen, and B. Novak, “Network dynamics and cell physiology,” Nature reviews Molecular cell biology, vol. 2, no. 12, pp. 908–916, 2001.
+[3] P. Grant, G. Szep, O. Patange, J. Halatek, V. Coppard, A. Csikász-Nagy, J. Haseloff, J. Locke, N. Dalchau, and A. Phillips, “Interpretation of morphogen gradients by a synthetic bistable circuit,” Nature Communications, vol. 11, no. 1, 2020.
+[4] Y. A. Kuznetsov, “Topological Equivalence, Bifurcations, and Structural Stability of Dynamical Systems,” in Elements of Applied Bifurcation Theory, pp. 39–76, Springer New York, 2004.
+[5] M. P. H. Stumpf and E. Roesch, “Parameter inference in dynamical systems with co-dimension 1 bifurcations,” Royal Society, vol. 6, no. 10, 2019.
+[6] A. Csikász-Nagy, D. Battogtokh, K. C. Chen, B. Novák, and J. J. Tyson, “Analysis of a Generic Model of Eukaryotic Cell-Cycle Regulation,” Biophysical Journal, vol. 90, pp. 4361–4379, 6 2006.
+[7] K. Iwasaki and Y. Kamimura, “An inverse bifurcation problem and an integral equation of the Abel type,” Inverse Problems, vol. 13, pp. 1015–1031, 1997.
+[8] J. Lu, H. W. Engl, and P. Schuster, “Inverse bifurcation analysis: Application to simple gene systems,” Algorithms for Molecular Biology, vol. 1, pp. 1–16, 7 2006.
+[9] I. Dobson, “Distance to Bifurcation in Multidimensional Parameter Space: Margin Sensitivity and Closest Bifurcations,” in Bifurcation Control: Theory and Applications, pp. 49–66, Springer, Berlin, Heidelberg, 4 2004.
+[10] V. Chickarmane, S. R. Paladugu, F. Bergmann, and H. M. Sauro, “Bifurcation discovery tool,” BIOINFORMATICS APPLICATIONS NOTE, vol. 21, no. 18, pp. 3688–3690, 2005.
+[11] E. D. Conrad, J. Tyson, R. Laubenbacher, J. Phillips, and M. Renardy, “Bifurcation Analysis and Qualitative Optimization of Models in Molecular Cell Biology with Applications to the Circadian Clock,” Virginia Tech, 4 2006.
+[12] J. C. W. Locke, A. J. Millar, and M. S. Turner, “Modelling genetic networks with noisy and varied experimental data: the circadian clock in Arabidopsis thaliana,” Journal of theoretical biology, vol. 234, no. 3, pp. 383–393, 2005.
+[13] I. Otero-Muras and J. R. Banga, “Optimization-based prediction of fold bifurcations in nonlinear ODE models,” IFAC-PapersOnLine, vol. 51, pp. 485–490, 1 2018.
+[14] I. Otero-Muras, P. Yordanov, and J. Stelling, “A method for inverse bifurcation of biochemical switches: inferring parameters from dose response curves,” BMC Systems Biology, vol. 8, p. 114, 2014.
+[15] C. Rackauckas and Q. Nie, “Differentialequations.jl - a performant and feature-rich ecosystem for solving differential equations in julia,” Journal of Open Research Software, vol. 5, no. 1, 2017.
+[16] C. Rackauckas, Y. Ma, V. Dixit, X. Guo, M. Innes, J. Revels, J. Nyberg, and V. Ivaturi, “A comparison of automatic differentiation and continuous sensitivity analysis for derivatives of differential equation solutions,” arXiv preprint arXiv:1812.01892, 2018.
+[17] C. Rackauckas, Y. Ma, J. Martensen, C. Warner, K. Zubov, R. Supekar, D. Skinner, and A. Ramadhan, “Universal Differential Equations for Scientiﬁc Machine Learning,” arXiv, 2020.
+[18] R. T. Q. Chen, Y. Rubanova, J. Bettencourt, and D. Duvenaud, “Neural Ordinary Differential Equations,” NIPs, vol. 109, pp. 31–60, 6 2018.
+10
+
+[19] C. Rackauckas, M. Innes, Y. Ma, J. Bettencourt, L. White, and V. Dixit, “DiffEqFlux.jl - A Julia Library for Neural Differential Equations,” ArXiv, 2019.
+[20] S. Ranciati, C. Viroli, and E. Wit, “Bayesian Smooth-and-Match strategy for ordinary differential equations models that are linear in the parameters,” ArXiv, 2017.
+[21] F. Khadivar, I. Lauzana, and A. Billard, “Learning dynamical systems with bifurcations,” Robotics and Autonomous Systems, vol. 136, p. 103700, 2 2021.
+[22] A. Look, S. Doneva, M. Kandemir, R. Gemulla, and J. Peters, “Differentiable Implicit Layers,” ArvXiv, 10 2020.
+[23] S. Bai, J. Z. Kolter, and V. Koltun, “Deep Equilibrium Models,” arXiv, 9 2019. [24] P. E. Farrell, C. H. L. Beentjes, and Ã. Birkisson, “The computation of disconnected bifurcation
+diagrams,” arXiv, 3 2016. [25] R. Veltz, “BifurcationKit.jl,” tech. rep., Inria Sophia-Antipolis, 7 2020. [26] M. Haragus and G. Iooss, Local Bifurcations, Center Manifolds, and Normal Forms in Inﬁnite-
+Dimensional Dynamical Systems. London: Springer London, 2011. [27] Z. Drmacˇ and Z. Bujanovic´, “On the Failure of Rank-Revealing QR Factorization Software – A
+Case Study,” ACM Transactions on Mathematical Software, vol. 35, 7 2008. [28] S. Jos and R. Schmidt, “On the velocity of an implicit surface,” ACM Transactions on Graphics,
+vol. 30, pp. 1–7, 5 2011. [29] J. Revels, M. Lubin, and T. Papamarkou, “Forward-Mode Automatic Differentiation in Julia,”
+ArvXiv, 2016. [30] M. Innes, E. Saba, K. Fischer, D. Gandhi, M. C. Rudilosso, N. M. Joy, T. Karmali, A. Pal, and
+V. Shah, “Fashionable Modelling with Flux,” CoRR, vol. abs/1811.01457, 2018. [31] M. Innes, “Flux: Elegant Machine Learning with Julia,” Journal of Open Source Software,
+2018. [32] D. P. Kingma and J. Ba, “Adam: A Method for Stochastic Optimization,” arXiv, 12 2014. [33] P. K Mogensen and A. N Riseth, “Optim: A mathematical optimization package for Julia,”
+Journal of Open Source Software, vol. 3, p. 615, 4 2018. [34] H. Flanders, “Differentiation Under the Integral Sign,” The American Mathematical Monthly,
+vol. 80, p. 615, 6 1973. [35] R. Goldman, “Curvature formulas for implicit curves and surfaces,” in Computer Aided Geo-
+metric Design, vol. 22, pp. 632–658, Elsevier, 10 2005. [36] M. Tao, J. Solomon, and A. Butscher, “Near-Isometric Level Set Tracking,” Computer Graphics
+Forum, vol. 35, pp. 65–77, 8 2016. [37] M. Fujisawa, Y. Mandachi, and K. T. Miura, “Calculation of Velocity on an Implicit Surface by
+Curvature Invariance,” Information and Media Technologies, vol. 8, no. 4, pp. 674–680, 2013. [38] M. Kratochvíl, O. Hunewald, L. Heirendt, V. Verissimo, J. Vondrášek, V. P. Satagopam,
+R. Schneider, C. Trefois, and M. Ollert, “GigaSOM.jl: High-performance clustering and visualization of huge cytometry datasets,” GigaScience, vol. 9, pp. 1–8, 11 2020.
+11
+
+Supplementary Material
+
+A Bifurcation Diagrams as Tangent Fields
+
+Let each component of the vector function Fθ in the model (1) implicitly deﬁne a surface embedded in RN+1. Let’s assume that the intersection of these N surfaces exists and is not null or degenerate, then the steady states of (1) must be a set of one dimensional space curves in z ∈ RN+1 deﬁned by
+
+Fθ(z) = 0
+
+(A.1)
+
+Figure A.1: Two implicit surfaces fθ(z) = 0 and gθ(z) = 0 in R3 intersecting to form a space curve which is tangent to ﬁeld Tθ(z) and perpendicular to gradients ∂zfθ and ∂zgθ
+
+An expression for the ﬁeld Tθ(z) tangent to the set of curves would allow us to take derivatives and integrals along the bifurcation curve. This is exactly what we need to do to evaluate our cost function
+8. Fortunately the tangent ﬁeld can be constructed by ensuring it is perpendicular to the gradient ∂z of each component of Fθ as illustrated by an example two component system in Figure A.1. The tangent ﬁeld Tθ(z) can be constructed perpendicular to all gradient vectors using the properties of the determinant [35]
+
+Tθ(z) := ∂zzˆFθ
+
+Tθ : RN+1 → RN+1
+
+(A.2)
+
+= N+1 zˆi(−1)i+1 ∂Fθ i=1 ∂(z \ zi)
+
+(A.3)
+
+where zˆ is a collection of unit basis vectors in the RN+1 space and ∂zFθ is an N ×(N +1) rectangular Jacobian matrix of partial derivatives and z \ zi denotes the N dimensional vector z with component zi removed. This construction ensures perpendicularity to any gradients of Fθ
+
+Tθ(z) · ∂zfθ = ∂∂zzFfθθ = 0 ∀fθ ∈ Fθ
+
+(A.4)
+
+since the determinant of any matrix with two identical rows or columns is zero. Note that the tangent ﬁeld Tθ(z) is actually deﬁned for all values of z where adjacent ﬁeld lines trace out other level sets where Fθ(z) = 0. Furthermore deformations with respect to θ are always orthogonal to the tangent
+
+Tθ(z) · dTθ = 0 dθ
+
+(A.5)
+
+Figure A.2 shows how the bifurcation curve deﬁned by Fθ(z) = 0 picks out one of many level sets or traces in tangent ﬁeld Tθ(z) for the saddle and pitchfork. The tangent ﬁeld Tθ(z) can always be
+
+1
+
+Figure A.2: Left/Right : Determinant
+
+∂Fθ ∂u
+
+and tangent ﬁeld Tθ(z) for the saddle-node/pitchfork
+
+models for some set values of θ revealing that ∂∂Fuθ = 0 deﬁnes bifurcations
+
+analytically evaluated by taking the determinant in (A.2). We will proceed with calculations on Tθ(z) in the whole space z and pick out a single trace by solving Fθ(z) = 0 later. For our two models
+
+Tθ(z) = uˆ − ( 3θ2u2 + θ1 ) pˆ
+saddle−node model
+
+Tθ(z) = uuˆ − ( 3θ2u2 + p ) pˆ
+pitchfork model
+
+(A.6)
+
+Figure A.2 reveals that
+
+∂Fθ ∂u
+
+= 0 is also a level set and that the intersection with level set Fθ(z) = 0
+
+deﬁnes the bifurcations at speciﬁc parameter θ. In this particular setting we can see that the tangent
+
+ﬁeld Tθ(z) only folds when
+
+∂Fθ ∂u
+
+= 0. Plotting the value of the determinant along Fθ(z) = 0 from
+
+Figure A.2 would give rise to Figures 1. The directional derivative of the determinant ∂∂Fuθ along
+
+the tangent ﬁeld Tθ(z) is deﬁned as
+
+d ∂Fθ := Tˆθ(z) · ∂ ∂Fθ
+
+ds ∂u
+
+∂z ∂u
+
+(A.7)
+
+where Tˆθ(z) is the unit tangent ﬁeld.
+
+B Bifurcation Measure Properties
+
+Consider a vector v(s) ∈ RN parametrised by s ∈ R that is tangent to an equilibrium manifold deﬁned by Fθ(u) = 0. The conditions for a non-degenerate static bifurcation at s∗ along such a
+tangent can be expressed in terms of an eigenvalue λ(s) of the state-space Jacobian crossing zero with a ﬁnite slope. A bifurcation exists at s∗ if
+
+∂Fθ v(s) = λ(s) v(s) ∃λ : ∂u
+
+λ(s)|s=s∗ = 0
+
+dλ =0
+ds s=s∗
+
+(B.1)
+
+These conditions are necessary and sufﬁcient for a non-degenerate static local breakdown of stability.
+
+For now we do not consider dynamic bifurcations involving limit cycles or imaginary parts of
+
+eigenvalues and restrict λ ∈ R.
+
+Cases where both λ(s)|s=s∗
+
+= 0 and
+
+dλ ds s=s∗
+
+= 0 require
+
+investigation into higher order derivatives ddnsnλ . These are the cases we refer to as degenerate and are
+
+not considered here.
+
+Instead of considering conditions on each eigenvalue individually it is possible to use the determinant of the state-space Jacobian to detect whether the conditions (B.1) are satisﬁed. The determinant can
+
+2
+
+be expressed as the product of eigenvalues
+
+∂Fθ
+
+N
+
+= ∂u
+
+λn(s)
+
+n=1
+
+Applying the product rule when differentiating yields
+
+(B.2)
+
+d ∂Fθ
+
+N dλn
+
+=
+
+ds ∂u
+
+ds
+
+λn (s)
+
+n=1
+
+n =n
+
+= ∂Fθ N dλn λn(s)−1
+
+∂u
+
+ds
+
+n=1
+
+Substituting this expression into measure (5)
+
+
+N
+
+−1−1
+
+ϕθ(s) = 1 +
+
+dλn λn(s)−1 
+
+ds
+
+n=1
+
+(B.3) (B.4)
+(B.5)
+
+Which implies the following
+
+λ(s) = 0 dλ = 0
+
+∃λ :
+
+ds
+λ(s) = 0 dλ → ±∞
+
+=⇒ ϕθ(s) = 1
+
+ds
+
+(B.6)
+
+If there exists an eigenvalue that satisﬁes conditions (B.1) then the measure is equal to one. The measure also approaches one in cases where the rate of change of an eigenvalue with respect to a manifold s location diverges while not crossing zero. This gives rise to ﬁnite gradients in the eigenvalue term in regimes far away from any bifurcation.
+
+C Leibniz Rule for Space Curves
+
+Suppose there exists a one dimensional space curve C(θ) embedded in z ∈ RN+1 whose geometry changes depending on input parameters θ ∈ RM . This curve could be open or closed and changes in θ could change the curve topology as well. Let the function γθ : R → RN+1 be a parametrisation of the
+position vector along the curve within a ﬁxed domain s ∈ S. Note that the choice of parametrisation
+is arbitrary and our results should not depend on this choice. Furthermore, if we parametrise the
+curve C(θ) with respect to a ﬁxed domain S the dependence on θ is picked up by the parametrisation γθ(s). We can write a line integral of any scalar function Lθ : RN+1 → R on the curve as
+
+dγθ L(θ) := C(θ)Lθ(z) dz = S Lθ(z) ds ds z=γθ(s)
+
+(C.1)
+
+where ddγsθ is the magnitude of tangent vectors to the space curve and we remind ourselves that the
+integrand is evaluated at z = γθ(s). We would like to track how this integral changes with respect to θ. The total derivative with respect to θ can be propagated into the integrand [34] as long as we keep track of implicit dependencies
+
+dL = dγθ dθ S ds
+
+∂L ∂L dz
+
+d dγθ
+
++· ∂θ ∂z dθ
+
++ Lθ(z) dθ
+
+ds ds z=γθ(s)
+
+(C.2)
+
+Here we applied the total derivative rule in the ﬁrst term due to the implicit dependence of z on θ through z = γθ(s). Applying the chain rule to the second term
+
+d dγθ
+
+dγθ −1 dγθ d dγθ
+
+=
+
+·
+
+dθ ds
+
+ds ds dθ ds
+
+(C.3)
+
+By choosing an s that has no implicit θ dependence we can commute derivatives
+
+d dγθ = d dγθ
+
+dθ ds
+
+ds dθ
+
+d dγθ
+
+dγθ −1 dγθ d dγθ
+
+⇒
+
+=
+
+·
+
+dθ ds
+
+ds ds ds dθ
+
+(C.4)
+
+3
+
+To proceed we note that the unit tangent vector can be written as an evaluation of a tangent ﬁeld Tˆθ(z) deﬁned in the whole domain z ∈ RN+1 along the parametric curve z = γθ(s). The unit tangent ﬁeld may disagree with the tangent given by ddγsθ up to a sign
+
+Tˆ (z)
+
+dγθ −1 dγθ =±
+
+θ z=γθ (s)
+
+ds ds
+
+(C.5)
+
+this leads to
+
+d dγθ = dγθ
+
+dθ ds
+
+ds
+
+Tˆθ(z) · ∂ dΓθ · Tˆθ(z)
+
+∂z dθ
+
+z=γθ (s)
+
+(C.6)
+
+It is possible to ﬁnd the normal deformation of the implicit space curves due to changes in θ. This can be done by taking the total derivative of the implicit equation deﬁning the level set
+
+dFθ(z) = ∂F + ∂F · dz
+
+dθ
+
+∂θ ∂z dθ
+
+(C.7)
+
+We can rearrange for ddzθ using the Moore-Penrose inverse of the rectangular Jacobian matrix ∂∂Fz which appeared in equation (A.2). Since the level set is deﬁned by Fθ(z) = 0 the total derivative along the level set dFθ(z) = 0 and we arrive at an expression for the deformation ﬁeld [28]
+
+dz ∂F
+
+=−
+
+dθ
+
+∂z
+
+∂F ∂F ∂z ∂z
+
+−1
+∂F
+∂θ
+
+(C.8)
+
+The tangential component of the deformation ﬁeld is not uniquely determined because there is
+
+no unique way of parametrising a surface. This is the subject of many computer graphics papers
+
+[28, 36, 37]. We are however not interested in the continuous propagation of a mesh - as is the subject
+
+of those papers. In fact we are looking for a deformation ﬁeld that is orthogonal to the tangent vector
+
+Tˆθ(z) ·
+
+dz dθ
+
+=
+
+0
+
+for
+
+the
+
+space
+
+curve,
+
+and
+
+therefore
+
+letting
+
+the
+
+tangential
+
+component
+
+of
+
+the
+
+deformation
+
+equal zero is a valid choice and we can it instead of the parametrised deformation
+
+dγθ → dz dθ dθ
+
+(C.9)
+
+To summarise we now have the gradient of our line integral only in terms of the implicit function deﬁning the integration region.
+
+dL =
+
+∂L + ∂L · ϕθ(z) + Lθ(z) Tˆθ(z) · ∂ϕ · Tˆθ(z) dz
+
+dθ
+
+Fθ(z)=0 ∂θ ∂z
+
+∂z
+
+where Tˆθ(z) := Tθ(z) |Tθ (z )|
+
+Tθ(z) := ∂zzˆFθ
+
+∂F ϕθ(z) := − ∂z
+
+∂F ∂F ∂z ∂z
+
+(C.10)
+−1
+∂F ∂θ
+(C.11)
+
+We have settled on choosing normal deformations which we will call ϕθ(z). The above result can be seen a the generalised Leibniz rule [34] for the case of line integration regions. The last integrand term can be seen as the divergence the vector ﬁeld ϕθ(z) projected onto the one dimensional space curve.
+
+4
+
+D Application of Bifurcation Inference to a Complex Model
+
+To demonstrate the wider reaching applicability of our method we optimise the double exclusive reporter [3], a synthetic gene circuit in E. coli that was designed to exhibit a cusp bifurcation. The circuit behaviour is observed by measuring a ﬂuorescent protein whose expression is controlled by transcription factors (regulatory proteins) LacI (L) and TetR (T ), whose expression is in turn controlled by externally controllable input signals c6 and c12. To apply the method, we consider one of the input signals be the control condition c6 = p, with the other packed together with the remaining 20 parameters into vector θ. Once the optima θ∗ have been obtained, we perform dimensionality reduction using GigaSOM.jl [38] so that the results can be visualised in a two dimensional embedding (Figure D.1A).
+The embedding reveals four optimal parameter regions. We ﬁnd that, as with the two-state model in the main text (11), there are two qualitatively distinct regimes: mutual activation (region 1) and inhibition (regions 2-4). The mutual inhibition region can be further subdivided into three regions that are geometrically equivalent, but kinetically distinct: region 3 has swapped kinetic roles for regulatory proteins LacI and TetR compared to region 2, and region 4 has additional damped oscillations in the dynamics across the whole range of input c6 (Figure D.1B). The two dimensional embedding of sampled optima θ∗ enables navigation the space of qualitative behaviours of the double exclusive reporter and organisation in terms of geometric and kinetic equivalence.
+
+A
+
+B
+
+Figure D.1: Bifurcation inference for the double exclusive reporter. A. Optimal parameter estimates θ∗ for the targets D = {1, 2} (indicated by yellow lines in panel B) reveal four regions with two geometrically different regimes: mutual activation (region 1) and mutual inhibition (regions 2-4). B. Example bifurcation diagrams indicate that region 2 has swapped kinetics between L and T to region 3. Region 4 has models with non-zero imaginary parts to eigenvalues indicating damped oscillations (shown in light green).
+
+These results were obtained with a modiﬁcation of the bifurcation measure (5) to improve convergence
+
+rates. In parameter regimes where bifurcations are not present, according to conditions (B.6),
+
+maximising
+
+the
+
+measure
+
+ϕθ (s)
+
+can
+
+lead
+
+to
+
+a
+
+divergence
+
+in
+
+directional
+
+derivative
+
+dλ ds
+
+→
+
+±∞
+
+rather
+
+than a creation of a bifurcation. To discourage this from happening we can ﬂatten out the gradients in
+
+that regime by applying the tanh non-linearity to the determinant. This leads to
+
+tanh ∂Fθ
+
+−1
+
+ϕθ(s) := 1 + d
+
+∂u ∂F
+
+ds tanh
+
+θ
+∂u
+
+(D.1)
+
+5
+
+E Extension for Hopf Bifurcations
+
+In order to detect bifurcations involving limit cycles, the measure must be extended to detect changes in the real part e[λ(s)] for any eigenvalue of the Jacobian. These conditions can no longer be compactly written in terms of the determinant. Instead, the measure can be deﬁned as the sum of eigenvalue terms
+
+ϕθ(s) :=
+λ(s)∈ ∂∂Fuθ
+
+d −1 −1 log e[λ(s)] + 1
+ds
+
+(E.1)
+
+The directional derivative of the logarithm diverges under two conditions: when eigenvalues vanish λ(s) = 0 and when the directional derivative dds e[λ(s)] diverges. These properties are sufﬁcient for detecting the onset of damped oscillations and emergence of limit cycles via Hopf bifurcation as
+shown in Figure E.1. Eigenvalues with negative real part which gain a ﬁnite imaginary part give rise to damped oscillations. At this onset we observe a discontinuity in the derivative dds e[λ(s)] which is detected by equation (E.1). Once damped oscillations exist, ﬂipping the stability of the stable ﬁxed point gives rise to a limit cycle, which can be detected by inspecting e[λ(s)].
+
+Figure E.1: Bifurcation measure ϕθ(s) and eigenvalues λ(s) along the arclength s for two different bifurcation curves demonstrating how the measure detects non-zero imaginary parts m[λ] (onset of damped oscillations marked by circle) and sign changes in real parts e[λ] (Hopf bifurcations marked by stars) In principle it is possible to construct measures to detect a variety of bifurcations as long as the conditions can be expressed in terms of derivatives with respect to ﬁxed-point manifold direction s. Measures can be used sequentially or in parallel to encourage optimisers to run through a sequence of bifurcations or place speciﬁc bifurcation types next to each other.
+6
+
+

@@ -1,0 +1,1023 @@
+This paper is superseded by the ACM SOSP 2019 paper “Parity Models: Erasure-Coded Resilience for Prediction Serving Systems”
+
+Parity Models: A General Framework for Coding-Based Resilience in ML Inference
+
+arXiv:1905.00863v2 [cs.DC] 16 Sep 2019
+
+Jack Kosaian
+Carnegie Mellon University jkosaian@cs.cmu.edu
+
+K. V. Rashmi
+Carnegie Mellon University rvinayak@cs.cmu.edu
+
+Shivaram Venkataraman
+University of Wisconsin-Madison shivaram@cs.wisc.edu
+
+Abstract
+Machine learning models are becoming the primary workhorses for many applications. Production services deploy models through prediction serving systems that take in queries and return predictions by performing inference on machine learning models. In order to scale to high query rates, prediction serving systems are run on many machines in cluster settings, and thus are prone to slowdowns and failures that inflate tail latency and cause violations of strict latency targets. Current approaches to reducing tail latency are inadequate for the latency targets of prediction serving, incur high resource overhead, or are inapplicable to the computations performed during inference.
+We present ParM, a novel, general framework for making use of ideas from erasure coding and machine learning to achieve low-latency, resource-efficient resilience to slowdowns and failures in prediction-serving systems. ParM encodes multiple queries together into a single parity query and performs inference on the parity query using a parity model. A decoder uses the output of a parity model to reconstruct approximations of unavailable predictions. ParM uses neural networks to learn parity models that enable simple, fast encoders and decoders to reconstruct unavailable predictions for a variety of inference tasks such as image classification, speech recognition, and object localization. We build ParM atop an open-source prediction-serving system and through extensive evaluation show that ParM improves overall accuracy in the face of unavailability with low latency while using 2-4× less additional resources than replication-based approaches. ParM reduces the gap between 99.9th percentile and median latency by up to 3.5× compared to approaches that use an equal amount of resources, while maintaining the same median.
+1 Introduction
+Machine learning has become ubiquitous in production services [16, 22] and user-facing applications [1, 5, 7]. This has increased the importance of inference, the process of returning a prediction from a trained machine learning model. Prediction serving systems are platforms that host machine learning models for inference and deliver model predictions for input queries. Numerous prediction serving systems are being developed both by cloud service providers [3, 4, 8] as well as by open-source communities [9, 10, 26, 65].
+
+Queries
+
+Frontend Encoder
+
+Query 1 Prediction 1 Query k
+
+Predictions Decoder Parity Query
+
+Model Instance 1
+
+Model Instance k Parity Model
+
+Figure 1. Architecture of a prediction serving system along with components introduced by ParM (darkly shaded).
+
+In order to meet the demands of user-facing production services, prediction serving systems must deliver predictions with low latency (e.g., within tens of milliseconds [26]). Similar to other latency-sensitive services, prediction services must adhere to strict service level objectives (SLOs). Queries that are not completed by their SLO are often useless to applications [16]. In order to reduce SLO violations, prediction serving systems must minimize tail latency.
+Prediction serving systems often employ distributed architectures to support the high throughput required by production services [26, 58]. As depicted in Figure 1 (ignoring the dark components for the moment), a prediction serving system consists of a frontend which receives queries and dispatches them to one or more model instances. Model instances perform inference and return predictions. This distributed setup is typically run in large-scale, multi-tenant clusters (e.g., public clouds), where tail latency inflation is a common problem [27]. There are numerous causes of inflated tail latencies in these settings, such as multi-tenancy and resource contention [39, 46, 91], hardware unreliability and failures [21], and other complex runtime interactions [20]. Within the context of prediction serving systems, network and computation contention have both been shown as potential bottlenecks [26, 39], and routines like loading a new model can also cause latency spikes [65].
+Due to the many causes of tail latency inflation, it is important for mitigations to be agnostic to the cause of slowdown [27]. However, current agnostic approaches for mitigating tail latency inflation are either inadequate for the low latency typical of prediction-serving [92, 97] or replicate queries, requiring significant resource overhead [19, 20, 83].
+Erasure codes are popular tools employed for imparting resilience to data unavailability while remaining agnostic to the cause of unavailability and using less resources than
+
+replication-based approaches. Erasure codes are used in various settings such as storage [6, 44, 67–69, 94] and communication [73, 74]. An erasure code encodes k data units to produce r redundant units called “parities” in such a way that any k of the total (k + r ) data and parity units are sufficient for a decoder to recover the original k data units. The overhead incurred by an erasure code is k+r , which is typically
+k
+much less than that of replication (by setting r < k). A number of recent works have explored using erasure
+codes for alleviating the effects of slowdowns and failures that occur in distributed computation [31, 51, 52, 52, 56, 80, 95]. In this setup, called “coded-computation,” erasure coding is used for recovering the outputs of a deployed computation over data units. In coded-computation, data units are encoded into parity units, and the deployed computation is performed over all data and parity units in parallel. A decoder then uses the outputs from the fastest k of these computations to reconstruct the outputs corresponding to the original data units. For a prediction serving system, employing coded-computation would involve encoding queries such that a decoder can recover unavailable predictions from slow or failed model instances.
+The primary differences between coded-computation and the traditional use of erasure codes in storage and communication come from (1) performing computation over encoded data and (2) the need for an erasure code to recover the results of computation over data units rather than the data units themselves. Whereas traditional applications of erasure codes involve encoding data units and decoding from a subset of data and parity units, in coded-computation one decodes by using the output of computation over data and parity units. This difference calls for fundamentally rethinking the design of erasure codes, as many of the erasure codes which have found widespread use in storage and communication (e.g., Reed-Solomon codes [71]), are applicable only to a highly restricted class of computations [56].
+As erasure codes can correct slowdowns with low latency and require less resource overhead than replication-based techniques, enabling the use of coded-computation in prediction serving systems has promising potential for efficient mitigation of tail latency inflation. However, the complex non-linear components common to popular machine learning models deployed in prediction serving systems, like neural networks, make it challenging to design effective codedcomputation solutions.
+Most prior coded-computation techniques support only rudimentary computations such as linear functions, lowdegree polynomials, and a subset of matrix operations [30, 31, 56, 59, 63, 72, 84, 95, 96]. These prior approaches are unable to support the complex non-linear computations common to popular machine learning models like neural networks, making them inadequate for machine learning inference.
+
+Kosaian et al. [53] proposed the first approach enabling coded-computation for machine learning inference by introducing two key ideas: (1) Allowing for approximation: Prior coded-computation approaches focused on recovering unavailable outputs exactly. Kosaian et al. [53] introduced the notion of approximation in coded-computation by observing that the exact reconstruction requirement can be relaxed for machine learning inference because the predictions from machine learning models are themselves approximate. (2) Using learning: Prior coded-computation approaches focused on hand-designing encoders and decoders. Kosaian et al. [53] proposed the first learning-based approach for codedcomputation by designing encoders and decoders as machine learning models and learning an erasure code for imparting resilience over a given computation. Using this approach, Kosaian et al. [53] learn encoders and decoders for imparting resilience over neural network inference. This marked a significant step forward from prior coded-computation techniques, which, at the time, were unable to support even simple non-linear functions.
+While the learning-based approach proposed by Kosaian et al. [53] showcases the promise for imparting codingbased resilience to neural network inference, the approach introduces a number of challenges: (1) High latency of reconstructions: The learned encoders and decoders proposed by Kosaian et al. [53] are computationally expensive. As will be described in §2.4, these encoders and decoders can be up to 7× slower than the deployed models over which they are intended to impart resilience. This high latency makes this approach appropriate for reducing only the far end of tail latency. (2) Need for hardware acceleration: The latency of learned encoders and decoders can potentially be reduced through the use of hardware acclerators (e.g., GPU, TPU). However, doing so requires the use of a more expensive prediction serving system frontend which, as will be described in §3, is the ideal location for placing encoders and decoders.
+To address these challenges, we present a fundamentally new, general framework for coded-computation, aimed at mitigating tail latency inflation in prediction serving systems, which we call ParM (parity models). Unlike conventional coded-computation approaches, which design new erasure codes, ParM allows for simple, fast encoders and decoders and instead employs specialized units for performing computation over parities, which we call parity models, as depicted in Figure 1. ParM encodes queries together into a parity query. A parity model transforms the parity query such that its output enables the decoder to reconstruct unavailable predictions. ParM designs parity models as neural networks and learns a transformation over parity queries that enables simple encoders and decoders (such as addition and subtraction) to impart resilience for a given deployed model.
+The contributions of this paper are as follows.
+
+2
+
+1. We present ParM, a novel, general framework for efficient use of coded-computation in prediction serving systems.
+2. We propose and design parity models as a new building block in coded computation. Our approach of using parity models makes ParM applicable to a wide variety of inference tasks such as image classification, speech recognition, and object localization.
+3. We have built ParM atop Clipper [26], a popular opensource prediction serving system.
+4. We extensively evaluate ParM’s ability to reduce tail latency and improve accuracy under unavailability. Our evaluations show that ParM significantly reduces tail latency and helps in improving overall accuracy in the face of unavailablility, while using 2-4× less additional resources than replication-based approaches.
+5. Accuracy: ParM accurately reconstructs unavailable predictions for a variety of inference tasks such as image classification, speech recognition, and object localization, and for a variety of neural networks. For example, using only half of the additional resources as replication, ParM’s reconstructions from ResNet-18 models on various tasks are up to 89% more accurate than approaches that return default predictions in the face of unavailability. Further, ParM can reconstruct unavailable predictions to be within a 6.5% difference in accuracy compared to if the original predictions were not slow or failed.
+6. Latency: ParM reduces tail latency across a variety of query rates, levels of background load, and amounts of redundancy. For example, ParM reduces 99.9th percentile latency in the presence of load imbalance for a ResNet18 model by up to 48% compared to a baseline that uses the same amount of resources as ParM, while maintaining the same median. This brings tail latency up to 3.5× closer to median latency, enabling ParM to return predictions with predictable latencies in the face of unavailability.
+Our results show the promise of ParM’s approach of using parity models as building blocks in coded-computation for machine learning inference. This framework opens new doors for imparting resource-efficient resilience to prediction serving systems.
+
+2.1 Prediction serving systems A prediction serving system hosts machine learning models for inference; it accepts queries from clients, performs inference on hosted models, and returns predictions. We refer to a model hosted for inference as a “deployed model.”
+As depicted in Figure 1 (ignoring the dark components), prediction serving systems have two types of components: a frontend and model instances. The frontend receives queries and dispatches them to model instances for inference.1 Model instances are containers or processes that contain a copy of the deployed model and return predictions by performing inference on the deployed model.
+Scale-out architecture. Prediction serving systems use scale-out architectures to serve predictions with low latency and high throughput and to overcome the memory and processing limitations of a single server [58]. In such a setup, multiple model instances are deployed on separate servers, each containing a copy of the same deployed model [26]. The frontend distributes queries to model instances according to a load-balancing strategy (e.g., single-queue, round-robin).
+Inference hardware and query batching. Prediction serving systems use a variety of hardware for performing inference, including GPUs [26], CPUs [40, 66, 99], TPUs [50], and FPGAs [24]. As some hardware is optimized for batched operation (e.g., GPUs), some prediction serving systems will buffer and batch queries at the frontend and dispatch queries to model instances in batches [26, 65]. However, as batching induces latency, many systems perform minimal or no batching [24, 99], especially when using hardware that is not tailored for batched operation (e.g., FPGAs [24], CPUs [40]).
+2.2 Challenges and opportunity As described above, prediction serving systems are often run in a distributed fashion and make use of many cluster resources (e.g., compute, network). These systems are thus prone to the slowdowns and failures common to cloud and cluster settings. Left unmitigated, these slowdowns inflate tail latency. Prediction serving systems must therefore employ some means to mitigate the effects of slowdowns in order to meet latency SLOs. Due to the many causes of slowdowns, such as those described in §1, it is important for mitigations to be agnostic to the cause of slowdowns [27]. How-
+
+ever, as we describe next, existing agnostic techniques are
+
+either inadequate for the low latency required of prediction-
+
+2 Background and Motivation
+This section describes the architecture of prediction serving systems, as well as the challenges and opportunities for improvement. This discussion is informed by popular prediction serving systems [26, 65] and conversations with service providers via personal communication.
+
+serving, or rely on resource-intensive replication. Speculative execution techniques [14, 97] wait for a task
+to progress before detecting that the task is slow and taking corrective action. Other techniques predict when slowdowns will occur, but incur scheduling delays in mitigating slowdowns [92]. While the delays incurred by these
+
+We also describe current approaches for imparting resilience to distributed computation, as well as their limitations, which we specifically address in this paper.
+
+1Not all prediction-serving frameworks (e.g., TensorFlow Serving [65]) have a specific frontend process. These systems make use of a load balancer to distribute queries, which acts in many ways like the frontend we describe.
+
+3
+
+Figure 2. Abstract example of coded-computation with k = 2 original units and r = 1 parity units.
+
+ℱ (X)
+
+ℱ (P)
+
+Desired ℱ (P)
+
+2X
+
+2X1 + 2X2
+
+2X1 + 2X2
+
+X 2 X12 + 2X1X2 + X22
+
+X12 + X22
+
+Table 1. Toy example with parity P = X1 + X2 showing the
+
+challenges of coded-computation on non-linear functions.
+
+approaches are negligible for the timescales of data analytics tasks, they are inadequate for mitigating slowdowns in prediction-serving, where queries are expected to be processed within tens to hundreds of milliseconds [26, 35].
+Replication-based techniques [19, 20, 27, 83] mitigate slowdowns proactively by sending duplicate queries to replicas of an underlying task that utilize separate resources (e.g., deployed models on separate servers) and waiting only for
+
+and ℱ(X2). In a prediction serving system, ℱ is a deployed model and X1 and X2 are queries. Coded-computation adds an encoder ℰ and a decoder 𝒟, along with a third copy of ℱ for tolerating one of the copies of ℱ being unavailable. The encoder produces a parity P = ℰ(X1, X2). The parity is dispatched to the third copy of ℱ to produce ℱ(P). Given ℱ(P) and any one of {ℱ (X1), ℱ (X2)}, the decoder reconstructs the
+unavailable output. In the example in Figure 2, the second
+
+the first replica to respond. Thus, a system which replicates a query k times can tolerate (k − 1) slow or failed responses. By proactively issuing redundant queries at the same time as the original query, replication mitigates slowdowns without additional delay for detecting slowdowns. However, replication requires high resource overhead, as replicating queries k times requires k-times as many resources to handle increased load. Attempting to reduce this overhead by retrying queries only if a response has not been received by a certain time (i.e., “hedged requests” [27]) results in reducing only the far end of tail latency due to delays induced by waiting, similar to the speculative techniques described above.
+Erasure codes are used in storage [6, 67–69, 94] and com-
+
+computation is slow. The decoder produces a reconstruction
+of ℱ (X2) as 𝒟(ℱ (X1), ℱ (P)). General parameters. More generally, given k instances
+of ℱ , for k queries X1, . . . , Xk , the goal is to output ℱ (X1), . . . , ℱ(Xk ). To tolerate any r of these being unavailable, the encoder generates r parity queries that are operated on by r redundant copies of ℱ. The decoder acts on any k outputs of these (k + r ) instances of ℱ to recover ℱ (X1), . . . , ℱ (Xk ).
+Challenges. Coded-computation is straightforward when the underlying computation ℱ is a linear function. A function ℱ is linear if, for any inputs X1 and X2, and any constant a: (1) ℱ (X1 +X2) = ℱ (X1) + ℱ (X2) and (2) ℱ (aX1) = aℱ (X1).
+Many of the erasure codes used in traditional applications,
+
+munication [73, 74] to mitigate slowdowns and failures both such as Reed-Solomon codes in storage, can recover from un-
+
+with low latency and with less resources than replication. Leveraging ideas from erasure codes to recover unavailable outputs from inference—rather than recovering unavailable data as in traditional applications—could potentially alleviate slowdowns and failures in a resource-efficient manner in
+
+availability of any linear function [56]. For example, consider
+having k = 2, r = 1. Suppose ℱ is a linear function as in the first row of Table 1. Here, even a simple parity P = X1 + X2 suffices since ℱ (P) = ℱ (X1) + ℱ (X2) and the decoder can
+subtract the available output from the parity output to re-
+
+prediction serving systems while remaining agnostic to the cause of unavailability.
+2.3 Coded-computation and its challenges The approach of using erasure codes for alleviating the effects of slowdowns and failures in computation is termed “coded-computation.” Coded-computation differs fundamen-
+
+cover the unavailable output. The same argument holds for any linear ℱ. However, a non-linear ℱ significantly complicates the scenario. For example, consider ℱ to be the simple
+non-linear function in the second row of Table 1. As shown in the table, ℱ (P) ℱ (X1) + ℱ (X2), and even for this simple function, ℱ(P) involves complex non-linear interactions of the inputs which makes decoding difficult.
+
+tally from the traditional use of erasure codes. Erasure codes
+
+Handling non-linear computation is key to using coded-
+
+have traditionally been used for recovering unavailable data computation in prediction serving systems due to the many
+
+units using a subset of data and parity units. In contrast, un- non-linear components of popular machine learning models,
+
+der coded-computation, (1) computation is performed over
+encoded data and (2) the goal is to recover unavailable outputs of computation over data units using a subset of the
+outputs of computation over data and parity units.
+Example. Consider an example in Figure 2. Let ℱ be a computation that is deployed on two servers. Let X1 and X2 be inputs to the computation. The goal is to return ℱ(X1)
+
+such as neural networks. While neural networks do contain linear components (e.g., matrix multiplication), they also contain many non-linear components (e.g., activation functions, max-pooling), which make the overall function computed by a neural network non-linear.
+As discussed in §1, most prior techniques approach codedcomputation by hand-crafting new encoders and decoders.
+
+4
+
+However, due to the challenge of handling non-linear compu-
+
+tations, these approaches support only rudimentary compu-
+
+tations [30, 31, 56, 59, 63, 72, 84, 95, 96], and hence are unable
+
+to support popular machine learning models like neural net-
+
+works. Kosaian et al. [53] present the first coded-computation
+
+approach applicable for machine learning inference. We dis-
+
+cuss benefits and challenges of this approach below. 2.4 Benefits and challenges of learning a code
+
+Figure 3. Abstract example of coded-computation when using a parity model (ℱP ) with k = 2 original units and r = 1
+parity units.
+
+As illustrated in §2.3, it is challenging to hand-craft erasure
+
+codes for the non-linear components common to neural net-
+works. This problem is further complicated by the multitude
+of mathematical components employed in neural networks
+(e.g., types of layers, activation functions); even if one devel-
+oped an erasure code suitable for one neural network, the
+approach might not work for other neural networks.
+To overcome this, Kosaian et al. [53] observe that erasure codes for coded-computation can be learned. Using machine learning models for encoders and decoders, designing an
+erasure code simply involves training encoder and decoder
+models. Consider again the example in Figure 2. An optimization problem for learning encoder ℰ and decoder 𝒟 for this example is: given ℱ, train ℰ and 𝒟 so as to minimize the difference between ℱ(X2), the output of the decoder, and ℱ (X2), for all pairs (X1, X2), and with P = ℰ(X1, X2) and ℱ (X2) = 𝒟(ℱ (X1), ℱ (P)). One distinction of using learned encoders and decoders as opposed to traditional hand-crafted
+
+encoding, (2) performing k out of (k + r ) computations, and (3) decoding. As neural networks are computationally expensive, encoding and decoding with neural networks adds significant latency to this process, and thus limits opportunities for tail latency reduction. Indeed, we found that the average latency of encoding and decoding using convolutional neural networks [53] was up to 7× higher than that of the deployed model, making this approach appropriate only for reducing the far end of tail latency. While the latency of learned encoders and decoders can potentially be reduced through the use of hardware accelerators, this necessitates a beefier, expensive frontend which, as will be described in §3.1, is the ideal location for encoders and decoders.
+3 Parity Models Framework
+In order to overcome both the challenge of performing coded-
+
+ones is that reconstructions of unavailable outputs will be approximations of the function outputs that would be returned if they were not slow or failed. This is appropriate for prediction serving systems because the predictions re-
+
+computation over non-linear functions as well as the high latency of learned encoders and decoders, we take a fundamentally new approach to coded-computation in ParM. Rather than designing new encoders and decoders, ParM uses sim-
+
+turned by deployed models themselves are approximations. Further, any decrease in accuracy due to reconstruction is only incurred in the case when a model is slow to return a prediction. In this scenario, prediction services prefer to return an approximate prediction rather than a late one [16].
+Using this approach, Kosaian et al. [53] designed neural network encoders and decoders for imparting resilience over neural network inference. For example, the approach enables unavailable predictions from a ResNet-18 model trained for
+
+ple, fast encoders and decoders and instead designs a new computation over parities, called a “parity model.” As depicted in Figure 3, instead of the extra copy of ℱ deployed by current coded-computation approaches, ParM introduces a parity model, which we denote as ℱP . The key challenge of this approach is to design a parity model that enables reconstruction for a given computation ℱ. ParM addresses this by designing parity models as neural networks, and learning a parity model that enables a simple encoder and decoder to
+
+CIFAR-10 to be reconstructed with up to 82% accuracy. This reconstruct slow or failed predictions.
+
+is a small drop in accuracy compared to the accuracy of the
+
+By learning a parity model and using simple, fast encoders
+
+deployed model (93%), and the drop only occurs when the and decoders, ParM is (1) able to impart resilience to mod-
+
+deployed model is unavailable. This marked a significant step ern machine learning models, like neural networks, while
+
+forward from prior coded-computation techniques, which, (2) operating with low latency without requiring expensive
+
+at the time, were unable to support even simple non-linear functions.
+Challenges of learned codes. While the approach taken by Kosaian et al. [53] showcases the potential of using machine learning for coded-computation, it also reveals a chal-
+
+hardware acceleration for encoding and decoding.
+Setting and notation. We first describe ParM in detail for imparting resilience to any one out of k predictions experiencing slowdown or failure (i.e., r = 1). This setting is motivated by measurements of production clusters [68, 69].
+
+lenge: neural network encoders and decoders add significant latency to reconstruction. Recall that a coded-computation technique can reconstruct unavailable outputs only after (1)
+
+Section 3.5 describes how the proposed approach can tolerate multiple unavailabilities (i.e., r > 1) as well. We will continue to use the notation of ℱ to represent the deployed
+
+5
+
+Queries Predictions
+
+Batching
+
+Frontend
+
+Load Balancer
+
+Encoder
+
+Parity Load Balancer
+
+Reconstructions Decoder
+
+Deployed Model
+Deployed Model . . .
+Parity Model
+
+Predictions that are returned to the frontend by model instances are immediately returned to clients.3 ParM’s decoder is only used when any one of the k prediction batches from a coding group is unavailable. The decoder uses the outputs of the parity model and the (k − 1) available model instances to reconstruct an approximation of the unavailable
+prediction batch. Approximate predictions are returned only
+when predictions from the deployed model are unavailable,
+
+and can be annotated so that they are appropriately handled
+
+Figure 4. Components of a prediction serving system and those added by ParM (dotted). Queues indicate components which may group queries/predictions (e.g., coding group).
+
+by clients.
+3.2 Encoder and decoder design space ParM’s approach of introducing and learning a parity model
+
+enables the use of simple, fast erasure codes to reconstruct
+
+model, Xi to represent a query, ℱ (Xi ) to represent a prediction resulting from inference on ℱ with Xi . We will let ℱ (Xi ) represent a reconstruction of ℱ (Xi ) when ℱ (Xi ) is
+unavailable.
+
+unavailable predictions. There are many encoder and decoder designs that ParM can support, opening up a rich design space in ParM’s framework. In this paper, we will illustrate the power of ParM’s approach by using the deadsimple addition/subtraction erasure code described in §2.3,
+
+3.1 System architecture
+The architecture of ParM is shown in Figure 4. ParM builds atop a typical prediction serving system architecture that has m instances of a deployed model. Queries sent to the frontend are batched (according to a batching policy) and dispatched to a model instance for inference on the deployed model. Query batches2 are dispatched to model instances according to a provided load-balancing strategy.
+ParM adds an encoder and a decoder on the frontend along with m instances of a parity model. Each parity model uses
+k
+the same amount of resources (e.g., compute, network) as a
+1
+deployed model. ParM thus adds k resource overhead. As query batches are dispatched, they are placed in a
+coding group consisting of k batches that have been consecutively dispatched. A coding group acts similarly to a “stripe” in erasure-coded storage systems; the query batches of a coding group are encoded to create a single “parity batch.” Encoding takes place across individual queries of a coding group: the ith queries of each of the k query batches in a coding group are encoded to produce the ith query of the parity batch. Encoding does not delay query dispatching as query batches are immediately handled by the load balancer when they are formed, and placed in a coding group for later encoding. The parity batch is dispatched to a parity model and the output resulting from inference over the parity model is returned to the frontend. Encoding is performed on the
+1
+frontend rather than on a parity model so as to incur only k network bandwidth overhead. Otherwise, all queries would need to be replicated to a parity model prior to encoding, which would incur 2× network bandwidth overhead.
+2We use the terms “batch” and “query batch” to refer to one or more queries dispatched to a model instance at a single point in time.
+
+and showing that even with the simplest choice of the en-
+
+coder and decoder, ParM significantly reduces tail latency
+
+and helps improve overall accuracy in the presence of un-
+
+availabilities.
+
+We choose this simple encoder and decoder to showcase
+
+ParM’s applicability to a variety of inference tasks including
+
+image classification, speech recognition, and object local-
+
+ization. A prediction serving system that is specialized to a specific inference task could potentially benefit from designing task-specific encoders and decoders for use within ParM. For example, for image classification tasks, an encoder could
+
+resize and concatenate image queries for image classification.
+
+We evaluate such task-specific encoders in §4.2.3 and show
+
+that the accuracy of reconstructed predictions does increase, as expected due to the specialization.4
+
+Under the simple addition/subtraction encoder and de-
+
+coder, the encoder produces a parity as the summation of
+
+queries in an coding group, i.e., P =
+
+k i =1
+
+Xi .
+
+Queries
+
+are
+
+normalized to a common size prior to encoding, and sum-
+
+mation is performed across corresponding features of each
+
+query (e.g., top-right pixel of each image query). The decoder
+
+subtracts (k − 1) available predictions from the output of the
+
+parity model ℱP (P) to reconstruct an unavailable prediction.
+
+Thus, an unavailable prediction ℱ(Xj ) is reconstructed as
+
+ℱ (Xj ) = ℱP (P) −
+
+k i
+
+j
+
+ℱ (Xi ).
+
+3.3 Parity model design ParM uses neural networks for parity models to learn a model that transforms parities into a form that enables decoding.
+
+3Returning predictions from model instances to the frontend is not a new requirement imposed by ParM. This is standard in systems with a frontend, like Clipper [26]. 4We note that a concurrent work [64] focusing on image classification tasks proposes a similar concatenation approach. We discuss this in §6.
+
+6
+
+Similar to ParM’s encoder and decoder, there is a rich design
+space for potential parity models. Training data. A parity model is trained prior to being
+deployed. The training data are the parities generated by the
+encoder and the associated training labels are the transforma-
+tions expected by the decoder. For the simple encoder and decoder described in §3.2, with k = 2, training data from queries X1 and X2 are (X1 + X2) and labels are (ℱ (X1) + ℱ (X2)).
+Training data is generated using queries that are represen-
+tative of those issued to the deployed model for inference.
+
+X1 X2 X3
+Σ
+
+F
+
+unavailable
+
+approximate
+
+prediction
+
+reconstruction
+
+0.19 0.71 0.10
+
+0.26 0.61 0.18
+
+0.30 0.08 0.62
+
+0.72 0.23 0.05
+FP FP(P) - F(X3) - F(X2) =
+1.28 0.92 0.85
+
+A parity model is trained using the same dataset used for training the deployed model, whenever available. Thus, if the
+
+Figure 5. Example of ParM (k = 3) mitigating a slowdown.
+
+deployed model was trained using the CIFAR-10 [17] dataset, samples from CIFAR-10 are used as queries X1, . . . , Xk that are encoded together to generate training samples for the
+
+neural architecture search [100]. However, we do not focus on this case in this work.
+
+parity model. Labels are generated by performing inference with the deployed model to obtain ℱ (X1), . . . , ℱ (Xk ) and summing these predictions to form the desired parity model output. When a labeled dataset is available, ParM can also use as labels the summation of the true labels for queries.
+If the dataset used for training the deployed model is not available, a parity model can be trained using queries that have been issued to ParM for inference on the deployed model. The predictions that result from inference on the deployed model are used to form labels for the parity model. In this case, as expected, ParM can deliver benefits only after the parity model has been trained to a sufficient degree.
+Neural network architecture. The design space of neural network architectures is large and presents a tradeoff between model accuracy and runtime. For example, increasing the number of layers in a neural network may lead to increased accuracy at the expense of increased runtime.
+
+3.4 Example
+Figure 5 shows an example of how ParM mitigates unavailability of any one of three model instances (i.e., k = 3). Queries X1, X2, X3 are dispatched to three separate model instances for inference on deployed model ℱ to return predictions ℱ (X1), ℱ (X2), ℱ (X3). The learning task here is classification across n classes. Each ℱ(Xi ) is thus a vector of n floating-points (n = 3 in Figure 5). As queries are dispatched to model instances, they are encoded (Σ) to generate a parity P = (X1 + X2 + X3). The parity is dispatched to a parity model ℱP to produce ℱP (P). In this example, the model instance processing X1 is slow. The decoder reconstructs this unavailable prediction as (ℱP (P) − ℱ (X3) − ℱ (X2)). The reconstruction provides a reasonable approximation of the
+true prediction that would have been returned had the model
+instance not been slow (labeled as “unavailable prediction”).
+
+In order for a parity model to help in mitigating slowdowns, the average runtime of a parity model should be equal to or less than that of the deployed model. When the deployed model is a neural network, as is the case for stateof-the-art techniques, one way to enforce this by using the same neural network architecture for the parity model as is used for the deployed model. Thus, if the deployed model is a ResNet-18 [41] architecture, the parity model can also use ResNet-18, but with parameters trained using the procedure described above, rather than for the task of the deployed model. Note that because a parity model is trained for a different task than the deployed model, it computes a different
+
+3.5 Handling concurrent unavailabilities
+ParM can accommodate concurrent unavailabilities by using decoders parameterized with r > 1. In this case, r separate parity models are trained to produce different trans-
+formations of a parity query. For example, consider having k = 2, r = 2 and queries X1 and X2, with parity P = (X1 + X2). One parity model is trained to transform P into ℱ (X1) + ℱ (X2), while the second is trained to transform P into ℱ (X1) + 2ℱ (X2). The decoder reconstructs the initial k predictions using any k out of the (k + r ) predictions from deployed models and parity models.
+
+function than the deployed model. As a neural network’s architecture determines its runtime, this approach ensures that the parity model has the same average runtime as the deployed model.
+
+4 Evaluation of Accuracy
+In this section, we evaluate ParM’s ability to accurately reconstruct unavailable predictions.
+
+In general, a parity model is not required to use the same architecture as the deployed model. In cases where it is nec-
+
+4.1 Experimentation setup
+
+essary or preferable to use a different neural network architecture for the parity model than is used for the deployed model, such as when the deployed model is not a neural network, one can potentially be designed via techniques like
+
+We use PyTorch [13] to train separate parity models for each parameter k, dataset, and deployed model.
+Inference tasks and models. We evaluate ParM using popular image classification (CIFAR-10 and 100 [17], Cat
+
+7
+
+Accuracy (Percent) Accuracy (Percent)
+
+Available (Aa ) Default Degraded (Ad ) 100
+
+ParM Degraded (Ad )
+
+80
+
+60
+
+40
+
+20
+
+0 MNIST Fashion Cat/Dog Speech Cifar10 Cifar100 Dataset
+
+100 95 90 85 80
+0
+
+ParM k=2 ParM k=4
+
+ParM k=3 Default
+
+0.025 0.05 0.075 0.1 Fraction Unavailable (fu )
+
+Ground Truth Available Degraded
+
+Figure 6. Accuracies of reconstructed predictions compared to returning a default response when predictions from the deployed model are unavailable (Ad ). “Available” is the accuracy achieved when deployed model predictions are available (Aa). ParM uses k = 2 and the generic encoder and decoder.
+
+Figure 7. Overall accuracy (Ao) of predictions on CIFAR-10 as the fraction of predictions that are unavailable (fu ) increases. The horizontal orange line shows the accuracy of the ResNet-18 deployed model (Aa).
+
+Figure 8. Example of ParM’s reconstruction for object localization.
+
+v. Dog [15], Fashion-MNIST [90], and MNIST [54]), speech recognition (Google Commands [87]), and object localization (CUB-200 [89]) tasks with varying degrees of complexity.
+As described in §3.3, a parity model uses the same neural network architecture as the deployed model. We consider five different architectures: a multi-layer perception (MLP),5
+
+when predictions from the deployed model are available (Aa) and its accuracy when these predictions are unavailable (Ad , “degraded mode”). If fu fraction of deployed model predictions are unavailable, the overall accuracy (Ao) is:
+
+Ao = (1 − fu )Aa + fuAd
+
+(1)
+
+LeNet-5 [55], VGG-11 [78], ResNet-18, and ResNet-152 [41]. The former two are simpler neural networks while the others are variants of state-of-the-art neural networks.
+Parameters. We consider values for parameter k of 2, 3, and 4, corresponding to 33%, 25%, and 20% redundancy, respectively. We use the Adam optimizer [28] with learning rate of 0.001, L2-regularization of 10−5, and minibatch sizes between 32 and 64. Convolutional layers are initialized by the uniform Xavier technique [33], biases are initialized to zero, and other weights are initialized from 𝒩 (0, 0.01).
+Encoder and decoder. Unless otherwise specified, we use the generic addition encoder and subtraction decoder described in §3.2. We showcase the benefit of employing task-specific encoders and decoders within ParM in §4.2.3.
+Loss function. While there are many loss functions that could be used in training a parity model, we use the meansquared-error (MSE) between the output of the parity model and the desired output as the loss function. We choose MSE rather than a task-specific loss function (e.g., cross-entropy) to make ParM applicable to many inference tasks.
+Metrics. Analyzing erasure codes for storage and communication involves reasoning about performance under normal operation (when unavailability does not occur) and performance in “degraded mode” (when unavailability occurs and reconstruction is required). These different modes of operation are similarly present for inference. The overall accuracy of any approach is calculated based on its accuracy
+5The MLP has two hidden layers with 200 and 100 units and uses ReLU activation functions.
+
+ParM aims to achieve high Ad ; it does not change the accuracy when predictions from the deployed model are available (Aa). We report both Ao and Ad .
+All accuracies are evaluated using test datasets, which are
+not used in training. Test samples are randomly placed into groups of k and encoded to produce a parity. For each parity P, we compute the output of inference on the parity model as ℱP (P). During decoding, we use ℱP (P) to reconstruct ℱ (Xi ) for each Xi that was used in encoding P, simulating every scenario of one prediction being unavailable. Each ℱ(Xi ) is compared to the true label for Xi . For CIFAR-100, we report top-5 accuracy, as is common (i.e., the fraction for which the true class of Xi is in the top 5 of ℱ (Xi )).
+Baseline. We compare ParM to the approach used in Clipper [26] to deal with unavailability: if a prediction is not
+returned to the frontend by its SLO, a default prediction is
+returned. This approach is motivated by observations from
+production services that it is better to return an incorrect
+prediction than a late one [16]. However, this results in pre-
+dictions that are no better than random guesses.
+4.2 Results Figure 6 shows the accuracy of the deployed model (Aa) along with the degraded mode accuracy (Ad ) of ParM with k = 2 and the default approach for image classification and speech recognition tasks using ResNet-18.6 ParM improves degraded mode accuracy by 41-89% compared to returning a default
+6VGG-11 is used for the speech dataset and ResNet-152 for CIFAR-100.
+
+8
+
+Available (Aa ) ParM k=4 (Ad ) 100
+
+ParM k=2 (Ad ) Default (Ad )
+
+ParM k=3 (Ad )
+
+Input Images
+
+Parity Image
+
+Accuracy (Percent)
+
+80 60 40 20 0
+MNIST Fashion Cat/Dog Speech Cifar10 Cifar100 Dataset
+
+32 32
+
+Encoding
+
+32 32
+
+Figure 9. Accuracies of predictions reconstructed by ParM with k = 2, 3, 4 and using the generic encoder and decoder compared to returning a default response when deployed
+model predictions are unavailable (Ad ).
+
+Figure 10. Example of an image-classification-specific encoder with k = 4 on the CIFAR-10 dataset.
+Figure 8 shows the bounding boxes returned by the de-
+
+prediction. Interestingly, even when comparing ParM’s degraded mode accuracy to the deployed model when predictions are not slow or failed, ParM’s reconstructed predictions are at most 6.5% less accurate than those the deployed model would return if it were available. As Figure 7 illustrates, this enables ParM to maintain high overall accuracy (Ao) in the face of unavailability. For this example at expected levels of unavailability (i.e., fu less than 10%), ParM’s overall accuracy is at most 0.4%, 1.9%, and 4.1% lower than when all predictions are available at k values of 2, 3, and 4, respectively. This indicates a tradeoff between ParM’s parameter k, which controls resource-efficiency and resilience, and the accuracy of reconstructed predictions, which we discuss in §4.2.2. In contrast, the overall accuracy when returning default predictions in this setting drops by over 8.3%.
+4.2.1 Inference tasks ParM achieves high degraded mode accuracy with k = 2 for all image classification and speech recognition datasets considered. For these tasks, degraded mode accuracy is at most 6.5% lower than when predictions are not slow or failed and is up to 89% more accurate than returning a default prediction. These improvements hold for a variety of neural network architectures. For example, on the Fashion-MNIST dataset, ParM’s reconstructions for all of the MLP, LeNet5, and ResNet-18 models are 70-81% more accurate than
+
+ployed model and ParM’s reconstruction for an example image. For this example, the deployed model has an IoU of 0.880 and ParM’s reconstruction has an IoU of 0.611. ParM’s reconstruction captures the gist of the localization and would serve as a reasonable approximation in the face of unavailability. Returning a reasonable default prediction would be infeasible for this regression task. On the entire dataset, the deployed model achieves an average IoU of 0.945 with ground-truth bounding boxes. In degraded mode, ParM’s reconstructions with k = 2 achieve an average IoU of 0.674.
+4.2.2 Varying redundancy via parameter k Figure 9 shows ParM’s degraded mode accuracy with k = 2, 3, 4 as compared to returning a default prediction. ParM’s degraded mode accuracy decreases with increasing parameter k. As parameter k is increased, features from more queries are packed into a single parity query, making the parity query noisier and making it challenging to learn a parity model. This indicates a tradeoff between the value of parameter k (i.e., redundancy) and degraded mode accuracy. This is similar to the performance tradeoffs that occur with increasing k in the use of erasure codes in storage systems. Even at higher values of k, ParM’s degraded mode accuracy is still significantly higher than returning a default prediction, resulting in similar overall accuracy as the deployed model at expected levels unavailability, as shown in Figure 7.
+
+returning a default prediction. Object localization task. We next evaluate ParM on ob-
+ject localization, which is a regression task. The goal in this
+
+4.2.3 Inference task-specific encoders and decoders As described in §3.2, ParM’s framework of introducing and
+
+task is to predict the coordinates of a bounding box surround- learning a parity model enables a large design space for pos-
+
+ing an object of interest in an image. As a proof of concept sible encoders and decoders. So far, all evaluation results
+
+of ParM’s applicability for this task, we evaluate ParM on have used the simplest, general choice of using addition and
+
+the Caltech-UCSD Birds dataset [89] using ResNet-18. The subtraction as encoder and decoder (described in §3.2), which
+
+performance metric for localization tasks is the intersection allowed us to showcase ParM’s applicability to a variety of
+
+over union (IoU): the IoU between two bounding boxes is inference tasks including image classification, speech recog-
+
+computed as the area of their intersection divided by the nition, and object localization. We now showcase the breadth
+
+area of their union. IoU values fall between 0 and 1, with an of ParM’s framework by evaluating ParM’s accuracy when
+
+IoU of 1 corresponding to identical boxes, and an IoU of 0 employing, alternate, encoders and decoders that are specific
+
+corresponding to boxes with no overlap.
+
+to a particular inference task.
+
+9
+
+We showcase the benefit of task-specific encoders and in C++. The deployed models and parity models are Py-
+
+decoders for image classification tasks. We design an encoder specialized for image classification which takes in k image queries, and downsizes and concatenates them into a single
+
+Torch [13] models in Docker containers, as is standard in Clipper. We disable the prediction caching feature in Clipper to evaluate end-to-end latency, however we note that ParM
+
+parity query. For example, as shown in Figure 10, given k = 4 images from the CIFAR-10 dataset (each of which have 32 × 32 × 3 features), each image is resized to have 16 × 16 × 3 features and concatenated together. The resultant parity query is 2 × 2 grid of these resized images, and thus has a total of 32 × 32 × 3 features, the same amount as a single
+image query. We continue to use the subtraction decoder
+
+does not preclude the use of prediction caching. For concreteness, we showcase ParM on an image classification workload. We use OpenCV [12] for pixel-level encoder operations. We use the addition encoder and subtraction decoder described in §4.2.3 in all latency evaluations.
+Baselines. We consider as a baseline a prediction serving system with the same number of instances as ParM but us-
+
+alongside this task-specific encoder.
+
+ing all additional instances for deploying extra copies of the
+
+As expected, due to the specialization to the task at hand, using this task-specific encoder leads to improved degraded mode accuracy compared to using the general addition and subtraction code. For example, at k values of 2 and 4 on the CIFAR-10 dataset, the task-specific encoder achieves a de-
+
+deployed model. We call this baseline “Equal-Resources.” For
+a setting of parameter k on a cluster with m model instances for deployed models, both ParM and Equal-Resources use m
+k
+additional model instances. ParM uses these extra instances
+to deploy parity models, whereas the Equal-Resources base-
+
+graded mode accuracy of 89% and 74%, respectively. Further, line hosts extra deployed models on these instances. These
+
+on the 1000-class ImageNet dataset (ILSVRC 2012 [75]) with k = 2 and using ResNet-50 models for both the deployed model and parity model, this approach achieves a 61% top-5
+
+extra instances enable the baseline to reduce system load, which reduces tail latency and provides an apples-to-apples comparison. We compare ParM to another baseline, namely,
+
+degraded mode accuracy. These results highlight the potential of using inference-task-specific encoders and decoders within ParM’s framework.7
+
+deploying approximate backup models, in §5.2.6. Cluster setup. All experiments are run on Amazon EC2.
+We evaluate ParM on two different cluster setups to mimic
+
+5 Evaluation of Tail Latency Reduction
+We next evaluate ParM’s ability to reduce tail latency. The highlights of the evaluation results are as follows:
+• ParM serves predictions with predictable latencies by significantly reducing tail latency: In the presence of load imbalance, ParM reduces 99.9th percentile latency by up to 48%, bringing tail latency up to 3.5× closer to median latency, while maintaining the same median (§5.2.1). Even with very little load imbalance, ParM reduces the gap between tail latency and median latency by up to 2.3× (§5.2.4). These benefits hold for different inference hardware and a wide range of query rates.
+• ParM is effective with various batch sizes (§5.2.3). • ParM’s approach of introducing and learning parity mod-
+els enables using encoders and decoders with negligible latencies (less than 200 µs and 20 µs respectively) (§5.2.5). • ParM reduces tail latency while maintaining simpler development and deployment than other hand-crafted approaches such as deploying approximate models (§5.2.6).
+
+various production prediction-serving settings. • GPU cluster. Each model instance is a p2.xlarge instance with one NVIDIA K80 GPU. We use 12 instances
+12
+for deployed models and k additional instances for redundancy. With k = 2 there are thus 18 instances. • High-performance CPU cluster. Each model instance is a c5.xlarge instance, which Amazon recommends for inference [2]. We use 24 instances for deployed models
+24
+and k additional instances for redundancy. This emulates certain production prediction services that use CPUs for inference (e.g., Facebook [40, 66], Microsoft [99]). This cluster is larger than the GPU cluster since the CPU instances are less expensive than GPU instances.
+We use a single frontend of type c5.9xlarge. We use this larger instance for the frontend to sustain high aggregate network bandwidth to model instances (10 Gbps). Each instance uses AWS ENA networking and we observe bandwidth of 1-2 Gbps between each GPU instance and the frontend and of 4-5 Gbps between each CPU instance and the frontend.
+Queries and deployed models. Recall that accuracy results were presented for various tasks and deployed models
+
+5.1 Implementation and Evaluation Setup Implementation. We have built ParM atop Clipper [26], a popular open-source prediction serving system. We implement ParM’s encoder and decoder on the Clipper frontend
+
+in §4. For latency evaluations we choose one of these models, ResNet-18 [41]. We use ResNet-18 rather than a larger model like ResNet-152, which would have a longer runtime, to provide a more challenging scenario in which ParM must reconstruct predictions with low latency. Queries are drawn
+
+from the Cat v. Dog [15] dataset. These higher-resolution
+
+7We note that a concurrent work [64] focusing on image classification tasks proposes a similar concatenation approach. We discuss this in §6.
+
+images test the ability of ParM’s encoder to operate with low
+
+10
+
+Latency (ms) Latency (ms) Latency (ms)
+
+E.R. med.
+E.R. 99.9th 60
+
+ParM med. ParM 99.9th
+
+E.R. med. E.R. 99.9th 225
+
+ParM med. ParM 99.9th
+
+50 175
+40
+125 30
+
+20 150 210 270 330 390 Query Rate (qps)
+
+75 120 144 168 192 216 240 Query Rate (qps)
+
+(a) GPU cluster
+
+(b) CPU cluster
+
+Figure 11. Latencies of ParM and Equal-Resources (E.R.). The CPU cluster has twice as many instances as the GPU cluster and thus sustains comparable load.
+
+ParM k=2 (33%) ParM k=4 (20%)
+
+ParM k=3 (25%) Equal-Resources (33%)
+
+50
+40
+30
+20
+10
+0 Med. Mean 99th 99.5th 99.9th Metric
+Figure 12. Latencies of ParM at varying values of k compared to the strongest baseline. The amount of redundancy used in each configuration is listed in parentheses.
+
+latency.8 We modify deployed models and parity models to return vectors of 1000 floating points as predictions to create
+
+Latency metric. All latencies measure the time between when the frontend receives a query and when the correspond-
+
+a more computationally challenging decoding scenario in ing prediction is returned to the frontend (from a deployed
+
+which there are 1000 classes in each prediction, rather than model or reconstructed). The latency of communication be-
+
+the usual 2 classes for this task.
+
+tween clients and the frontend is not included, as this latency
+
+Client instances send 100-thousand queries to the frontend is not controlled by ParM. We report the median of three
+
+using a variety of Poisson arrival rates. Unless otherwise runs of each configuration (each with 100-thousand queries),
+
+noted, all experiments are run with batch size of one, as with error bars showing the minimum and maximum.
+
+this is the preferred batch size for low latency [24, 99]. We evaluate ParM with larger batch sizes in §5.2.3.
+Load balancing. Both ParM and the baseline use a singlequeue load balancing strategy for dispatching queries to
+
+5.2 Results We now report ParM’s reduction of tail latency.
+
+model instances as is used in Clipper, and is optimal in reducing average response time [37]. The frontend maintains a single queue to which all queries are added. Model instances pull queries from this queue when they are available. Similarly, ParM adds parity queries to a single queue which parity models pull from. Evaluation on other, sub-optimal, load balancing strategies (e.g., round-robin) revealed results that are even more favorable for ParM than those showcased below.
+Background traffic. As it is difficult to mimic tail latency inflation scenarios without access to production systems, we evaluate ParM with various types and degrees of background load. The main form of background load we use emulates network traffic typical of data analytics workloads. Specifically, two model instances are chosen at random to transfer data to one another of size randomly drawn between 128 MB and 256 MB. Unless otherwise mentioned, four of these shuffles take place concurrently. In this setting only the cluster network is imbalanced and we do not introduce any computational multitenancy. We experiment with light multitenant computation and varying the number of shuffles in §5.2.4.
+
+5.2.1 Varying query rate
+Figure 11 shows median and 99.9th percentile latencies with k = 2 (i.e., both ParM and the Equal-Resources baseline have 33% redundancy) on the GPU and CPU clusters. We consider query rates up until a point in which a prediction serving system with no redundancy (i.e., using only m instances) experiences tail latency dominated by queueing. Beyond this point, ParM could be used alongside a number of techniques that reduce queueing delays [25].
+ParM reduces the gap between 99.9th percentile latency and median latency by 2.6-3.2× compared to Equal-Resources on the GPU cluster, and by 3-3.5× on the CPU cluster. ParM’s 99.9th percentile latencies are thus 38-43% lower on the GPU cluster and 44-48% lower on the CPU cluster. This enables ParM to return predictions with more predictable latencies. As expected from any redundancy-based approach, ParM adds additional system load by issuing redundant queries, leading to a slight increase in median latency (less than half of a millisecond, which is negligible).
+
+5.2.2 Varying redundancy via parameter k
+
+Figure 12 shows the latencies achieved by ParM with k being
+
+8 While CIFAR-10/100 are more difficult tasks for training a model than Cat v. Dog, their low resolution makes them computationally inexpensive. This makes Cat v. Dog a more realistic workload for evaluating latency.
+
+2, 3, and 4, when operating at 270 qps on the GPU cluster.
+As k increases, ParM’s tail latency also increases. This is due to two factors. First, at higher values of k, ParM is more
+
+11
+
+Latency (ms) Latency (ms) Latency (ms)
+
+E.R. med. E.R. 99.9th
+
+ParM med. ParM 99.9th
+
+60
+
+50
+
+40
+
+30
+
+20
+
+2
+
+3
+
+4
+
+5
+
+Number of background shuffles
+
+E.R. med. E.R. 99.9th 35
+
+ParM med. ParM 99.9th
+
+30
+
+25
+
+20 150 210 270 330 390 Query Rate (qps)
+
+A.B. med. A.B. 99.9th 40
+
+ParM med. ParM 99.9th
+
+35
+
+30
+
+25
+
+20 150 210 270 330 390 Query Rate (qps)
+
+Figure 13. ParM and Equal-Resources Figure 14. ParM and Equal-Resources Figure 15. Latencies of ParM and using (E.R.) with varying network imbalance. (E.R.) with light inference multitenancy. approximate backup models (A.B.).
+
+vulnerable to multiple predictions in a coding group being unavailable, as the decoder requires k −1 predictions from the deployed model to be available (in addition to the output of
+
+To evaluate ParM’s resilience to a different, lighter form of load imbalance, we run light background inference tasks on model instances. Specifically, we deploy ResNet-18 models
+
+the parity model). Second, increasing k increases the amount of time ParM needs to wait for k queries to arrive before encoding into a parity query. This increases the latency of the
+end-to-end path of reconstructing an unavailable prediction. Despite these factors, ParM still reduces tail latency over
+the baseline that uses more resources than ParM. At k values of 3 and 4, which have 25% and 20% redundancy respec-
+tively, ParM reduces the difference between 99.9th percentile and median latency by up to 2.5× compared to when Equal-
+
+on one ninth of instances using a separate copy of Clipper, and send an average query rate of less than 5% of what the cluster can maintain. We do not add network imbalance in this setting. Figure 14 shows latencies at k = 2 on the GPU cluster with varying query rate. Even with this light form of imbalance, ParM reduces the gap between 99.9th percentile and median latency by up to 2.3× over Equal-Resources.
+5.2.5 Latency of ParM’s components
+
+Resources has 33% redundancy.
+
+ParM’s latency of reconstructing unavailable predictions con-
+
+5.2.3 Varying batch size
+
+sists of three components: encoding, parity model inference, and decoding. ParM has median encoding latencies of 93 µs,
+
+Due to the low latencies required by user-facing applications, 153 µs, and 193 µs, and median decoding latencies of 8 µs,
+
+many prediction serving systems perform no or minimal query batching [24, 40, 99]. For completeness, we evaluate ParM when queries are batched for inference on the GPU cluster. ParM uses k = 2 in these experiments and query rate is set to 460 qps and 584 qps for batch sizes of 2 and
+
+14 µs, and 19 µs for k values of 2, 3, and 4, respectively. As the latency of parity model inference is tens of milliseconds, ParM’s encoding and decoding make up a very small fraction of end-to-end reconstruction latency. These fast encoders and decoders are enabled by ParM’s new approach of introducing
+
+4, respectively. These query rates are obtained by scaling parity models that allows it to use simple erasure codes.
+
+from 300 qps used at batch size 1 based on the throughput improvement observed with increasing batch sizes.
+ParM outperforms Equal-Resources at all batch sizes: at batch sizes of 2 and 4, ParM reduces 99.9th percentile latency
+
+5.2.6 Comparison to approximate backup models An alternative to ParM is to replace ParM’s parity models with less computationally expensive models that approxi-
+
+by 43% and 47%. This reduces gap between 99.9th percentile and median latency by up to 4× over Equal-Resources.
+
+mate the predictions of the deployed model, and to replicate queries to these approximate models. While potentially ca-
+
+5.2.4 Varying degrees and types of load imbalance
+
+pable of returning approximate predictions in the face of unavailability, this approach has a number of drawbacks: (1)
+
+All experiments so far were run with background network it is unstable at expected query rates, (2) it is inflexible to
+
+imbalance, as described in §5.1. ParM reduces tail latency even with lighter background network load: Figure 13 shows that when 2 and 3 concurrent background shuffles take place (as opposed to the 4 used for most experiments), ParM reduces 99.9th percentile latency over Equal-Resources by 35%
+
+changes in hardware, limiting deployment flexibility, and (3)
+it requires 2× network bandwidth. To showcase these drawbacks, we compare ParM (with k = 2) to the aforementioned alternative using m extra model instances for approximate
+k
+models. We use MobileNet-V2 [76] (width factor of 0.25) as
+
+and 39%, respectively on the GPU cluster with query rate of the approximate models because this model has similar accu-
+
+270 qps. ParM’s benefits increase with higher load imbalance, racy (87.6%) as ParM’s reconstructions (87.4%) for CIFAR-10.
+
+as ParM reduces the gap between 99.9th and median latency by 3.5× over Equal-Resources with 5 background shuffles.
+
+Figure 15 shows the latencies of these approaches on the GPU cluster with varying query rate. While ParM’s 99.9th
+
+12
+
+percentile latency varies only modestly, using approximate models results in tail latency variations of over 36%. This vari-
+
+Coded-computation. Most prior work related to codedcomputation was discussed in detail in §1 and §2. We discuss
+
+ance occurs because all queries are replicated to approximate
+1
+models even though there are only k as many approximate models as there are deployed models. Thus, approximate
+
+a some of these related works in more detail below. A recently proposed class of codes [96] supports polyno-
+mial (non-linear) functions, but requires as many or more
+
+models must be k-times faster than the deployed model for this system to be stable. The approximate model in this case
+
+resources than replication-based approaches. Another approach [29] performs coded-computation over the linear
+
+is not k-times faster than the deployed model, leading to inflated tail latency due to queueing as query rate increases.
+
+operations of neural networks and decodes before each nonlinear operation. This requires splitting the operations of
+
+Even if one crafted an approximate model satisfying the a model onto multiple servers and many decoding steps,
+
+runtime requirement described above, the model may not be appropriate for different hardware. We find that the speedup
+
+which increases latency even when predictions are not slow or failed. In contrast, ParM uses 2-4× less resource overhead
+
+achieved by the approximate model over the deployed model than replication and does not require neural network op-
+
+varies substantially across different inference hardware. For example, the MobileNet-V2 approximate model is 1.4× faster than the ResNet-18 deployed model on the CPU cluster, but only 1.15× faster on the GPU cluster. Thus, an approximate model designed for one hardware setup may not provide
+
+erations to be performed on separate servers and does not induce latency when there is no unavailability.
+In a concurrent work focusing on image classification tasks, Narra et al. [64] propose to concatenate multiple images into a single image for inference on a specialized, multi-
+
+benefits on other hardware, limiting deployment flexibility. object detection model. This approach fits within ParM’s
+
+Designing an approximate model for every possible hard- framework as an example of employing task-specific en-
+
+ware setup would require iterative effort from data scientists. Finally, this approach uses 2× network bandwidth by repli-
+
+coders and decoders as discussed in §3.2. In fact, the encoding proposed in [64] is very similar to the concatenation-based
+
+cating queries. This can be problematic, as limited bandwidth
+
+has been shown to hinder prediction-serving [26, 39].
+
+ParM does not have any of these drawbacks. As described
+
+in §3, ParM’s parity models can be chosen to have the same
+
+average runtime as deployed models, as showcased in the
+
+evaluation. Furthermore, ParM encodes k queries into one
+
+parity query prior to dispatching to a parity model. The m
+k
+
+parity
+
+models
+
+therefore
+
+receive
+
+1 k
+
+the
+
+query
+
+rate
+
+of
+
+the m
+
+deployed models, and thus naturally keep pace. This reduced
+
+query rate also means that ParM adds only minor network
+
+bandwidth overhead. Further, when using the same model
+
+architecture for parity models as is used for deployed models,
+
+ParM does not face hardware-related deployment issues.
+
+image-classification-specific encoder that we proposed in §4.2.3. In contrast, ParM is a general framework for codingbased resilient inference, which we have shown to be applicable for a variety of inference tasks including image classification, speech recognition, and object localization. ParM’s approach of using parity models opens up a rich design
+space for designing encoders, decoders, and parity mod-
+els, enabling specialization to specific inference tasks when
+needed. Further, the approach proposed in [64] results in concatenated images that can be up to k-times larger than the original images (e.g., for CIFAR-10 when images are not resized), which can consume up to 2× additional network
+1
+bandwidth. In contrast, ParM incurs only k network bandwidth overhead.
+
+6 Related Work
+
+High performance inference methods. There are many techniques for reducing the average latency [11, 23, 47, 57, 82, 86] and improving the throughput [48, 57] of inference.
+
+Mitigating slowdowns. Many approaches alleviate specific causes of slowdown. Examples of such techniques include
+
+In contrast ParM is designed for mitigating latency spikes that occur throughout prediction-serving, including those
+
+configuration selection [18, 60, 81, 93], tenant isolation [34, that occur during model inference, network transfer, and
+
+46, 62, 91], replica selection [36, 79], queueing disciplines [32, system faults. These techniques are complementary to ParM.
+
+49, 61, 77], and autoscaling [25, 35]. As these techniques are applicable only to certain types of slowdowns and are often not straightforward to weave together, they are unable
+
+Accuracy-latency tradeoff. A number of systems [85, 98] and machine learning techniques [43, 45] actively trade prediction accuracy with latency. This enables these tech-
+
+to mitigate all slowdowns. In contrast, ParM is agnostic to niques to handle query rate variation in a resource-efficient
+
+the cause of slowdown. In §2.2, we described two existing manner, but may result in lower accuracy. In contrast, ParM
+
+agnostic approaches to mitigating unavailability and their does not proactively degrade prediction accuracy. Rather,
+
+downsides, which ParM overcomes.
+
+any inaccuracy that comes from ParM is incurred only when
+
+There are many techniques [38, 42, 70, 88] for mitigating slowdowns that occur in training a model. These techniques exploit iterative computations specific to training and are thus inapplicable to alleviating slowdowns during inference.
+
+a prediction experiences slowdown or failure.
+
+13
+
+7 Conclusion
+We have presented ParM, a general framework for imparting
+coding-based resilience against slowdowns and failures that
+occur in prediction serving systems. ParM overcomes the
+challenges of prior coding-based resilience techniques by introducing parity models as a new building block that enable simple, fast encoders and decoders to reconstruct unavailable
+predictions for a variety of inference tasks, including image
+classification, speech recognition, and object localization. We
+have built ParM atop a popular open-source prediction serv-
+ing system and extensively evaluated the ability of ParM’s
+framework to reduce tail latency and improve overall ac-
+curacy under unavailability for a wide variety of inference
+tasks. ParM reduces the gap between 99.9th percentile and median latency by up to 3.5× compared to approaches that use the same amount of resources, while maintaining the
+same median.
+ParM’s framework presents a fundamentally new coding-
+based approach for imparting resilience to general inference
+tasks. Our evaluation results showcase the promise of ParM’s
+approach for adding resource-efficient resilience to predic-
+tion serving systems.
+References
+[1] Amazon Alexa. https://developer.amazon.com/alexa. Last accessed 01 April 2019.
+[2] Amazon EC2 C5 Instances. https://aws.amazon.com/ec2/ instance-types/c5/. Last accessed 01 April 2019.
+[3] Azure Machine Learning Studio. https://azure.microsoft.com/en-us/ services/machine-learning-studio/. Last accessed 01 April 2019.
+[4] Google Cloud AI. https://cloud.google.com/products/ machine-learning/. Last accessed 01 April 2019.
+[5] Google lens: real-time answers to questions about the world around you. https://bit.ly/2MHAOLq. Last accessed 01 April 2019.
+[6] HDFS RAID. http://www.slideshare.net/ydn/hdfs-raid-facebook. Last accessed 01 April 2019.
+[7] iOS Siri. https://www.apple.com/ios/siri/. Last accessed 01 April 2019. [8] Machine Learning on AWS. https://aws.amazon.com/
+machine-learning/. Last accessed 01 April 2019. [9] Microsoft Machine Learning for Apache Spark. https://github.com/
+Azure/mmlspark. Last accessed 01 April 2019. [10] Model Server for Apache MXNet. https://github.com/awslabs/
+mxnet-model-server. Last accessed 01 April 2019. [11] NVIDIA TensorRT. https://developer.nvidia.com/tensorrt. Last ac-
+cessed 01 April 2019. [12] OpenCV. https://opencv.org/. Last accessed 01 April 2019. [13] Pytorch. https://pytorch.org/. Last accessed 01 April 2019. [14] Speculative Execution in Hadoop MapReduce. https://data-flair.
+training/blogs/speculative-execution-in-hadoop-mapreduce/. Last accessed 01 April 2019. [15] Asirra: A CAPTCHA That Exploits Interest-aligned Manual Image Categorization. In Proceedings of the 14th ACM Conference on Computer and Communications Security (CCS 07) (2007). [16] Agarwal, D., Long, B., Traupman, J., Xin, D., and Zhang, L. Laser: A Scalable Response Prediction Platform for Online Advertising. In Proceedings of the 7th ACM International Conference on Web Search and Data Mining (WSDM 14) (2014). [17] Alex Krizhevsky and Vinod Nair and Geoffrey Hinton. The CIFAR-10 and CIFAR-100 Datasets. https://www.cs.toronto.edu/~kriz/
+14
+
+cifar.html. [18] Alipourfard, O., Liu, H. H., Chen, J., Venkataraman, S., Yu, M.,
+and Zhang, M. CherryPick: Adaptively Unearthing the Best Cloud Configurations for Big Data Analytics. In 14th USENIX Symposium on Networked Systems Design and Implementation (NSDI 17) (2017). [19] Ananthanarayanan, G., Ghodsi, A., Shenker, S., and Stoica,
+I. Why Let Resources Idle? Aggressive Cloning of Jobs with Dolly. In Proceedings of the 4th USENIX Conference on Hot Topics in Cloud Ccomputing (HotCloud 12) (2012). [20] Ananthanarayanan, G., Ghodsi, A., Shenker, S., and Stoica, I. Effective Straggler Mitigation: Attack of the Clones. In 10th USENIX Symposium on Networked Systems Design and Implementation (NSDI 13) (2013). [21] Ananthanarayanan, G., Kandula, S., Greenberg, A. G., Stoica,
+I., Lu, Y., Saha, B., and Harris, E. Reining in the Outliers in MapReduce Clusters using Mantri. In 9th USENIX Symposium on Operating Systems Design and Implementation (OSDI 10) (2010). [22] Baylor, D., Breck, E., Cheng, H.-T., Fiedel, N., Foo, C. Y., Haqe, Z.,
+Haykal, S., Ispir, M., Jain, V., Koc, L., et al. TFX: A Tensorflow-Based Production-Scale Machine Learning Platform. In Proceedings of the 23rd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD 17) (2017). [23] Chen, T., Moreau, T., Jiang, Z., Zheng, L., Yan, E., Shen, H., Cowan,
+M., Wang, L., Hu, Y., Ceze, L., Guestrin, C., and Krishnamurthy,
+A. TVM: An automated end-to-end optimizing compiler for deep learning. In 13th USENIX Symposium on Operating Systems Design and Implementation (OSDI 18). [24] Chung, E., Fowers, J., Ovtcharov, K., Papamichael, M., Caulfield,
+A., Massengill, T., Liu, M., Lo, D., Alkalay, S., Haselman, M., et al.
+Serving DNNs in Real Time at Datacenter Scale with Project Brainwave. IEEE Micro 38, 2 (2018), 8–20. [25] Crankshaw, D., Sela, G.-E., Zumar, C., Mo, X., Gonzalez, J. E.,
+Stoica, I., and Tumanov, A. InferLine: ML Inference Pipeline Composition Framework. arXiv preprint arXiv:1812.01776 (2018). [26] Crankshaw, D., Wang, X., Zhou, G., Franklin, M. J., Gonzalez, J. E.,
+and Stoica, I. Clipper: A Low-Latency Online Prediction Serving System. In 14th USENIX Symposium on Networked Systems Design and Implementation (NSDI 17) (2017). [27] Dean, J., and Barroso, L. A. The Tail at Scale. Communications of the ACM 56, 2 (2013), 74–80. [28] Diederik P. Kingma and Jimmy Ba. Adam: A Method for Stochastic Optimization. In International Conference on Learning Representations (ICLR 15) (2015). [29] Dutta, S., Bai, Z., Jeong, H., Low, T. M., and Grover, P. A unified
+coded deep neural network training strategy based on generalized polydot codes for matrix multiplication. In Proceedings of the 2018 IEEE International Symposium on Information Theory (ISIT 18) (2018). [30] Dutta, S., Cadambe, V., and Grover, P. Short-dot: Computing Large
+Linear Transforms Distributedly Using Coded Short Dot Products. In Advances In Neural Information Processing Systems (NIPS 16) (2016). [31] Dutta, S., Cadambe, V., and Grover, P. Coded Convolution for Parallel and Distributed Computing Within a Deadline. In Proceedings of the 2017 IEEE International Symposium on Information Theory (ISIT 17) (2017). [32] Gardner, K., Zbarsky, S., Doroudi, S., Harchol-Balter, M., and
+Hyytia, E. Reducing Latency via Redundant Requests: Exact Analysis. ACM SIGMETRICS Performance Evaluation Review 43, 1 (2015), 347– 360.
+[33] Glorot, X., and Bengio, Y. Understanding the Difficulty of Training Deep Feedforward Neural Networks. In Proceedings of the Thirteenth International Conference on Artificial Intelligence and Statistics (AISTATS 10) (2010).
+[34] Grosvenor, M. P., Schwarzkopf, M., Gog, I., Watson, R. N. M.,
+Moore, A. W., Hand, S., and Crowcroft, J. Queues don’t matter
+
+when you can JUMP them! In 12th USENIX Symposium on Networked Systems Design and Implementation (NSDI 15) (2015). [35] Gujarati, A., Elnikety, S., He, Y., McKinley, K. S., and Bran-
+denburg, B. B. Swayam: Distributed Autoscaling to Meet SLAs
+of Machine Learning Inference Services with Resource Efficiency. In Proceedings of the 18th ACM/IFIP/USENIX Middleware Conference (Middleware 17) (2017). [36] Hao, M., Li, H., Tong, M. H., Pakha, C., Suminto, R. O., Stuardo,
+C. A., Chien, A. A., and Gunawi, H. S. MittOS: Supporting Millisec-
+ond Tail Tolerance with Fast Rejecting SLO-Aware OS Interface. In Proceedings of the 26th Symposium on Operating Systems Principles (SOSP 17) (2017). [37] Harchol-Balter, M. Performance Modeling and Design of Computer Systems: Queueing Theory in Action. Cambridge University Press, 2013.
+[38] Harlap, A., Cui, H., Dai, W., Wei, J., Ganger, G. R., Gibbons, P. B.,
+Gibson, G. A., and Xing, E. P. Addressing the Straggler Problem for Iterative Convergent Parallel ML. In Proceedings of the Seventh ACM Symposium on Cloud Computing (SoCC 16) (2016). [39] Hauswald, J., Kang, Y., Laurenzano, M. A., Chen, Q., Li, C., Mudge,
+T., Dreslinski, R. G., Mars, J., and Tang, L. DjiNN and Tonic: DNN as
+a Service and Its Implications for Future Warehouse Scale Computers. In 2015 ACM/IEEE 42nd Annual International Symposium on Computer Architecture (ISCA 15) (2015). [40] Hazelwood, K., Bird, S., Brooks, D., Chintala, S., Diril, U., Dzhul-
+gakov, D., Fawzy, M., Jia, B., Jia, Y., Kalro, A., et al. Applied
+Machine Learning at Facebook: A Datacenter Infrastructure Perspective. In 2018 IEEE International Symposium on High Performance Computer Architecture (HPCA 18) (2018). [41] He, K., Zhang, X., Ren, S., and Sun, J. Deep Residual Learning for Image Recognition. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR 16) (2016). [42] Ho, Q., Cipar, J., Cui, H., Lee, S., Kim, J. K., Gibbons, P. B., Gibson,
+G. A., Ganger, G., and Xing, E. P. More Effective Distributed ML via a Stale Synchronous Parallel Parameter Server. In Advances in Neural Information Processing Systems (NIPS 13) (2013). [43] Hu, H., Dey, D., Bagnell, J. A., and Hebert, M. Learning Anytime Predictions in Neural Networks via Adaptive Loss Balancing. arXiv preprint arXiv:1708.06832 (2018). [44] Huang, C., Simitci, H., Xu, Y., Ogus, A., Calder, B., Gopalan, P., Li,
+J., and Yekhanin, S. Erasure Coding in Windows Azure Storage. In 2012 USENIX Annual Technical Conference (USENIX ATC 12) (2012). [45] Huang, G., Chen, D., Li, T., Wu, F., van der Maaten, L., and Wein-
+berger, K. Q. Multi-Scale Dense Networks for Resource Efficient Image Classification. arXiv preprint arXiv:1703.09844 (2017). [46] Iorgulescu, C., Azimi, R., Kwon, Y., Elnikety, S., Syamala, M.,
+Narasayya, V., Herodotou, H., Tomita, P., Chen, A., Zhang, J., and
+Wang, J. PerfIso: Performance Isolation for Commercial LatencySensitive Services. In 2018 USENIX Annual Technical Conference (USENIX ATC 18) (2018). [47] Jacob, B., Kligys, S., Chen, B., Zhu, M., Tang, M., Howard, A.,
+Adam, H., and Kalenichenko, D. Quantization and Training of
+Neural Networks for Efficient Integer-Arithmetic-Only Inference. arXiv preprint arXiv:1712.05877 (2017). [48] Jiang, A. H., Wong, D. L.-K., Canel, C., Tang, L., Misra, I., Kamin-
+sky, M., Kozuch, M. A., Pillai, P., Andersen, D. G., and Ganger,
+G. R. Mainstream: Dynamic Stem-Sharing for Multi-Tenant Video Processing. In 2018 USENIX Annual Technical Conference (USENIX ATC 18) (2018). [49] Joshi, G., Liu, Y., and Soljanin, E. On the Delay-Storage Trade-Off in Content Download From Coded Distributed Storage Systems. IEEE JSAC, 5 (2014), 989–997. [50] Jouppi, N. P., Young, C., Patil, N., Patterson, D., Agrawal, G.,
+Bajwa, R., Bates, S., Bhatia, S., Boden, N., Borchers, A., et al.
+
+In-Datacenter Performance Analysis of a Tensor Processing Unit. In 2017 ACM/IEEE 44th Annual International Symposium on Computer Architecture (ISCA 17) (2017). [51] Karakus, C., Sun, Y., Diggavi, S., and Yin, W. Straggler Mitigation in Distributed Optimization Through Data Encoding. In Advances in Neural Information Processing Systems (NIPS 17) (2017). [52] Konstantinidis, K., and Ramamoorthy, A. Leveraging Coding Techniques for Speeding up Distributed Computing. In Proceedings of the 2018 IEEE Global Communications Conference (GlobeCom 18) (2018).
+[53] Kosaian, J., Rashmi, K. V., and Venkataraman, S. Learning a Code:
+Machine Learning for Approximate Non-Linear Coded Computation. arXiv preprint arXiv:1806.01259 (2018). [54] LeCun, Y. The MNIST database of handwritten digits. http://yann. lecun.com/exdb/mnist/. [55] LeCun, Y., Bottou, L., Bengio, Y., and Haffner, P. Gradient-based Learning Applied to Document Recognition. Proceedings of the IEEE 86, 11 (1998), 2278–2324. [56] Lee, K., Lam, M., Pedarsani, R., Papailiopoulos, D., and Ramchan-
+dran, K. Speeding Up Distributed Machine Learning Using Codes. IEEE Transactions on Information Theory (July 2018). [57] Lee, Y., Scolari, A., Chun, B.-G., Santambrogio, M. D., Weimer, M.,
+and Interlandi, M. PRETZEL: Opening the black box of machine learning prediction serving systems. In 13th USENIX Symposium on Operating Systems Design and Implementation (OSDI 18) (2018). [58] Lee, Y., Scolari, A., Interlandi, M., Weimer, M., and Chun, B.-G. Towards High-Performance Prediction Serving Systems. NIPS ML Systems Workshop (2017). [59] Li, S., Maddah-Ali, M. A., and Avestimehr, A. S. A Unified Coding
+Framework for Distributed Computing With Straggling Servers. In 2016 IEEE Globecom Workshops (GC Wkshps) (2016). [60] Li, Z. L., Liang, C.-J. M., He, W., Zhu, L., Dai, W., Jiang, J., and Sun, G. Metis: Robustly Tuning Tail Latencies of Cloud Systems. In 2018 USENIX Annual Technical Conference (USENIX ATC 18) (2018). [61] Liang, G., and Kozat, U. C. FAST CLOUD: Pushing the Envelope on Delay Performance of Cloud Storage with Coding. arXiv:1301.1294 (Jan. 2013).
+[62] Mace, J., Bodik, P., Musuvathi, M., Fonseca, R., and Varadarajan,
+K. 2DFQ: Two-Dimensional Fair Queuing for Multi-Tenant Cloud Services. In Proceedings of the 2016 ACM SIGCOMM Conference (SIGCOMM 16) (2016). [63] Mallick, A., Chaudhari, M., and Joshi, G. Rateless Codes for Near-
+Perfect Load Balancing in Distributed Matrix-Vector Multiplication. arXiv preprint arXiv:1804.10331 (2018). [64] Narra, K. G., Lin, Z., Ananthanarayanan, G., Avestimehr, S.,
+and Annavaram, M. Collage Inference: Tolerating Stragglers in Distributed Neural Network Inference using Coding. arXiv preprint arXiv:1904.12222 (2019). [65] Olston, C., Fiedel, N., Gorovoy, K., Harmsen, J., Lao, L., Li, F.,
+Rajashekhar, V., Ramesh, S., and Soyke, J. TensorFlow-Serving: Flexible, High-Performance ML Serving. NIPS ML Systems Workshop (2017).
+[66] Park, J., Naumov, M., Basu, P., Deng, S., Kalaiah, A., Khudia, D.,
+Law, J., Malani, P., Malevich, A., Nadathur, S., et al. Deep
+Learning Inference in Facebook Data Centers: Characterization, Performance Optimizations and Hardware Implications. arXiv preprint arXiv:1811.09886 (2018). [67] Patterson, D. A., Gibson, G., and Katz, R. H. A Case for Redundant Arrays of Inexpensive Disks (RAID). In Proceedings of the ACM SIGMOD International Conference on Management of Data (SIGMOD 88) (1988). [68] Rashmi, K. V., Chowdhury, M., Kosaian, J., Stoica, I., and Ram-
+chandran, K. EC-Cache: Load-Balanced, Low-Latency Cluster Caching with Online Erasure Coding. In 12th USENIX Symposium on
+
+15
+
+Operating Systems Design and Implementation (OSDI 16) (2016). [69] Rashmi, K. V., Shah, N. B., Gu, D., Kuang, H., Borthakur, D., and
+Ramchandran, K. A Hitchhiker’s Guide to Fast and Efficient Data Reconstruction in Erasure-Coded Data Centers. In Proceedings of the 2014 ACM SIGCOMM Conference (SIGCOMM 14) (2014). [70] Recht, B., Re, C., Wright, S., and Niu, F. Hogwild: A Lock-Free Approach to Parallelizing Stochastic Gradient Descent. In Advances in Neural Information Processing Systems (NIPS 11) (2011). [71] Reed, I. S., and Solomon, G. Polynomial Codes Over Certain Finite Fields. Journal of the society for industrial and applied mathematics 8, 2 (1960), 300–304.
+[72] Reisizadeh, A., Prakash, S., Pedarsani, R., and Avestimehr, S. Coded Computation Over Heterogeneous Clusters. In Proceedings of the 2017 IEEE International Symposium on Information Theory (ISIT 17) (2017).
+[73] Richardson, T., and Urbanke, R. Modern Coding Theory. Cambridge University Press, 2008.
+[74] Rizzo, L. Effective erasure codes for reliable computer communication protocols. ACM SIGCOMM computer communication review 27, 2 (1997), 24–36.
+[75] Russakovsky, O., Deng, J., Su, H., Krause, J., Satheesh, S., Ma, S.,
+Huang, Z., Karpathy, A., Khosla, A., Bernstein, M., Berg, A. C.,
+and Fei-Fei, L. ImageNet Large Scale Visual Recognition Challenge. International Journal of Computer Vision (IJCV) 115, 3 (2015), 211–252. [76] Sandler, M., Howard, A., Zhu, M., Zhmoginov, A., and Chen,
+L.-C. Mobilenetv2: Inverted Residuals and Linear Bottlenecks. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR 18) (2018). [77] Shah, N. B., Lee, K., and Ramchandran, K. When do Redundant Requests Reduce Latency? IEEE Transactions on Communications 64, 2 (2016), 715–722.
+[78] Simonyan, K., and Zisserman, A. Very Deep Convolutional Networks for Large-Scale Image Recognition. In International Conference on Learning Representations (ICLR 15) (2015).
+[79] Suresh, L., Canini, M., Schmid, S., and Feldmann, A. C3: Cutting
+Tail Latency in Cloud Data Stores via Adaptive Replica Selection. In 12th USENIX Symposium on Networked Systems Design and Implementation (NSDI 15) (2015). [80] Tandon, R., Lei, Q., Dimakis, A. G., and Karampatziakis, N. Gradient Coding. In Proceedings of the International Conference on Machine Learning (ICML 17) (2017). [81] Venkataraman, S., Yang, Z., Franklin, M., Recht, B., and Stoica,
+I. Ernest: Efficient Performance Prediction for Large-Scale Advanced Analytics. In 13th USENIX Symposium on Networked Systems Design and Implementation (NSDI 16) (2016). [82] Viola, P., and Jones, M. J. Robust Real-Time Face Detection. International Journal of Computer Vision 57, 2 (2004), 137–154. [83] Vulimiri, A., Michel, O., Godfrey, P., and Shenker, S. More is Less: Reducing Latency via Redundancy. In Proceedings of the 11th ACM Workshop on Hot Topics in Networks (HotNets 12) (2012). [84] Wang, S., Liu, J., and Shroff, N. Coded Sparse Matrix Multiplication. In Proceedings of the International Conference on Machine Learning (ICML 18) (2018). [85] Wang, W., Wang, S., Gao, J., Zhang, M., Chen, G., Ng, T. K., and
+Ooi, B. C. Rafiki: Machine Learning as an Analytics Service System. arXiv preprint arXiv:1804.06087 (2018). [86] Wang, X., Luo, Y., Crankshaw, D., Tumanov, A., Yu, F., and Gon-
+zalez, J. E. IDK Cascades: Fast Deep Learning by Learning not to Overthink. In Proceedings of the Conference on Uncertainty in Artificial Intelligence (UAI 18) (2018). [87] Warden, P. Speech commands: A dataset for limited-vocabulary speech recognition. arXiv preprint arXiv:1804.03209 (2018). [88] Wei, J., Dai, W., Qiao, A., Ho, Q., Cui, H., Ganger, G. R., Gibbons,
+P. B., Gibson, G. A., and Xing, E. P. Managed Communication and
+
+Consistency for Fast Data-Parallel Iterative Analytics. In Proceedings of the Sixth ACM Symposium on Cloud Computing (SoCC 15) (2015). [89] Welinder, P., Branson, S., Mita, T., Wah, C., Schroff, F., Belongie,
+S., and Perona, P. Caltech-UCSD Birds 200. Tech. Rep. CNS-TR-
+2010-001, California Institute of Technology, 2010.
+[90] Xiao, H., Rasul, K., and Vollgraf, R. Fashion-Mnist: A Novel Image Dataset for Benchmarking Machine Learning Algorithms. arXiv preprint arXiv:1708.07747 (2017).
+[91] Xu, Y., Musgrave, Z., Noble, B., and Bailey, M. Bobtail: Avoiding Long Tails in the Cloud. In 10th USENIX Symposium on Networked Systems Design and Implementation (NSDI 13) (2013).
+[92] Yadwadkar, N. J., Ananthanarayanan, G., and Katz, R. Wrangler: Predictable and Faster Jobs using Fewer Resources. In Proceedings of the ACM Symposium on Cloud Computing (SoCC 14) (2014).
+[93] Yadwadkar, N. J., Hariharan, B., Gonzalez, J. E., Smith, B., and
+Katz, R. H. Selecting the Best VM Across Multiple Public Clouds: A Data-Driven Performance Modeling Approach. In Proceedings of the ACM Symposium on Cloud Computing (SoCC 17) (2017). [94] Yan, S., Li, H., Hao, M., Tong, M. H., Sundararaman, S., Chien,
+A. A., and Gunawi, H. S. Tiny-Tail Flash: Near-Perfect Elimination of Garbage Collection Tail Latencies in NAND SSDs. In 15th USENIX Conference on File and Storage Technologies (FAST 17) (2017). [95] Yu, Q., Maddah-Ali, M., and Avestimehr, S. Polynomial Codes: An
+Optimal Design for High-Dimensional Coded Matrix Multiplication. In Advances in Neural Information Processing Systems (NIPS 17) (2017). [96] Yu, Q., Raviv, N., So, J., and Avestimehr, A. S. Lagrange Coded
+Computing: Optimal Design for Resiliency, Security and Privacy. In Proceedings of the 22nd International Conference on Artificial Intelligence and Statistics (AISTATS 19) (2019). [97] Zaharia, M., Konwinski, A., Joseph, A. D., Katz, R., and Stoica, I.
+Improving MapReduce Performance in Heterogeneous Environments. In Proceedings of the 8th USENIX Conference on Operating Systems Design and Implementation (OSDI 08) (2008). [98] Zhang, H., Ananthanarayanan, G., Bodik, P., Philipose, M., Bahl,
+P., and Freedman, M. J. Live Video Analytics at Scale with Approximation and Delay-Tolerance. In 14th USENIX Symposium on Networked Systems Design and Implementation (NSDI 17) (2017). [99] Zhang, M., Rajbhandari, S., Wang, W., and He, Y. DeepCPU: Serving RNN-based Deep Learning Models 10x Faster. In 2018 USENIX Annual Technical Conference (USENIX ATC 18) (2018). [100] Zoph, B., and Le, Q. V. Neural Architecture Search with Reinforcement Learning. arXiv preprint arXiv:1611.01578 (2016).
+
+16
+
+

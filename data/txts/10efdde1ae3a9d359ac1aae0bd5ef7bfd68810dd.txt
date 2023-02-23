@@ -1,0 +1,786 @@
+DICT-MLM: Improved Multilingual Pre-Training using Bilingual Dictionaries.
+Aditi Chaudhary1 ∗, Karthik Raman2, Krishna Srinivasan2, Jiecao Chen2 1Language Technologies Institute, Carnegie Mellon University 2 Google Research, Mountain View
+aschaudh@cs.cmu.edu {karthikraman,krishnaps,chenjiecao}@google.com
+
+arXiv:2010.12566v1 [cs.CL] 23 Oct 2020
+
+Abstract
+Pre-trained multilingual language models such as mBERT (Devlin et al., 2019) have shown immense gains for several natural language processing (NLP) tasks, especially in the zeroshot cross-lingual setting. Most, if not all, of these pre-trained models rely on the maskedlanguage modeling (MLM) objective as the key language learning objective. The principle behind these approaches is that predicting the masked words with the help of the surrounding text helps learn potent contextualized representations. Despite the strong representation learning capability enabled by MLM, we demonstrate an inherent limitation of MLM for multilingual representation learning. In particular, by requiring the model to predict the language-speciﬁc token, the MLM objective disincentivizes learning a languageagnostic representation – which is a key goal of multilingual pre-training. Therefore to encourage better cross-lingual representation learning we propose the DICT-MLM method. DICT-MLM works by incentivizing the model to be able to predict not just the original masked word, but potentially any of its crosslingual synonyms as well. Our empirical analysis on multiple downstream tasks spanning 30+ languages, demonstrates the efﬁcacy of the proposed approach and its ability to learn better multilingual representations.
+1 Introduction
+Masked Language Modeling (MLM), introduced by Devlin et al. (2019), Taylor (1953), in conjunction with transformers (Vaswani et al., 2017), has spurred a rapid succession of massive pre-trained models – RoBERTa (Liu et al., 2019a), ALBERT (Lan et al., 2019), ELECTRA (Clark et al., 2020), etc. These new models have shown signiﬁcant advances in several natural language processing
+∗Work done as part of Google Research Internship.
+
+(NLP) tasks and set new benchmarks. The success of MLM is attributed to the model learning better contextualized representations by virtue of using the bi-directional context to predict randomly masked tokens or sub-words in a sequence.
+MLM and its variants have also been applied successfully to the multilingual setting (mBERT1, XLM; Lample and Conneau (2019)) wherein a single model is pre-trained on the concatenated monolingual corpora of multiple languages. This has greatly improved the cross-lingual generalizability of the pre-trained model resulting in signiﬁcant improvements, especially in the zero-shot setting where the pre-trained model is ﬁne-tuned for the task in question on one language and directly applied to another language.
+The key to successful cross-lingual transfer learning (especially in the zero-shot setting) is the ability to learn semantically rich language-agnostic representations (Ruder et al., 2019). The more language-agnostic a representation, the better its chances of carrying over knowledge seamlessly across languages and overcome the lack of training data in other languages (Upadhyay et al., 2016; Ruder et al., 2019).
+However, the design of MLM is not conducive for learning language-agnostic representations. This is because MLM requires the model to predict the masked token in the speciﬁc language, and not any of its synonyms – either within or across languages. For example, in the following sentence Food and water are neccessities of life, with the word life masked, the MLM objective drives the model to learn this exact word (life) in the given context. This thus forces the learned representation of the word to be different from its synonyms in other languages (e.g. vida, Leben, jeevan, . . . ). In other words the learned representations of the
+1https://github.com/googleresearch/bert/blob/master/multilingual.md
+
+model are forced to be language-speciﬁc to help identify the exact language of the sentence. This is partially the reason behind mBERT being very good at the Language-Identiﬁcation task2 (Pires et al., 2019).
+This behavior is also seen when we evaluate the language-agnosticity of the learnt mBERT representations across the multiple layers of the model. As seen in Figure 3, the 8th layer of mBERT is 25+% better at cross-lingual semantic retrieval compared to the ﬁnal layer of BERT. This behavior has also been observed in prior work (Hu et al., 2020; Pires et al., 2019). One approach proposed to improve this language-agnosticity is translation language modeling – TLM – (Lample and Conneau, 2019). However this relies on the use of expensive, sentence-aligned parallel corpora, while still retaining the same MLM-incentive issues.
+To address these limitations, we propose DICTMLM which facilitates cross-lingual alignment more directly. DICT-MLM achieves this by incentivizing the model to be able to predict not only the masked token in its original language, but also its synonyms in other languages. While some existing approaches rely on millions of expensive translations, we show that even with only thousands of cross-lingual word pairs (from bilingual dictionaries), DICT-MLM is able to learn a more potent language-agnostic representation than mBERT.
+We demonstrate this empirically on multiple downstream tasks including sequence labeling (NER, POS), classiﬁcation (MLDOC-Headline, PAWS-X), textual entailment (XNLI) and crosslingual sentence retrieval (TATOEBA) – leveraging a data setup similar to the XTREME (Hu et al., 2020) benchmark which covers 40 typologically diverse languages. Our contributions can be summarized as follows:
+• We propose a new pre-training method DICTMLM to enforce cross-lingual alignment more directly. We ﬁnd that DICT-MLM is especially effective for sequence-labeling tasks (NER, POS) since these tasks rely more on token-level representations rather than the full sequence representation which is more conducive to our cross-lingual word alignment objective (Table 1).
+• Overall, we observe that our model outper-
+2In fact, prior work (Conneau et al., 2017) has explicitly tried to learn multilingual representations by adversarially training the model to not be able to distinguish language.
+
+forms mBERT for all tasks with improvements of +2.4 F1 for NER, +3.7 accuracy for POS, +0.5 accuracy for XNLI, +2.5 accuracy for MLDOC-Headline and +5.3 accuracy for PAWS-X, averaged across all languages. Furthermore, our model also outperforms existing work that leverage parallel text which is a more expensive resource than bilingual dictionaries (Table 1 and Table 2).
+• Our learned representations are empirically shown to be far more cross-lingual, with 20+% improvements observed on TATOEBA. (Fig 3).
+• Qualitative analysis reveals that even languages which do not have publicly available bilingual dictionaries beneﬁt from DICT-MLM (Table 3).
+2 Methodology
+Our Focus: While there exists different (often complementary) techniques to improve crosslingual transfer learning – including use of larger, richer pretraining datasets (Conneau et al., 2020) or ﬁnetuning using data augmentation (Fang et al., 2020) – our focus is speciﬁcally on the improving the pretraining objective that is common to all of these approaches, namely MLM.
+In order to address the aforementioned limitations of MLM, we propose DICT-MLM which leverages bilingual dictionaries during pre-training to explicitly facilitate cross-lingual word alignment. In Section §2.2 we describe the training data creation for DICT-MLM followed by the model and training regimen in Section §2.3.
+2.1 Preliminaries
+Given an input text stream W = w1, w2 · · · wn, MLM uses the past and future tokens W\t := (w1, · · · , wt−1, wt+1, · · · , wn) to predict the masked token wt. Devlin et al. (2019) apply this objective on the concatenated monolingual corpora of 104 languages to get a pre-trained multilingual model (mBERT).3
+2.2 Preparing the Training Data
+To facilitate cross-lingual word alignment during pre-training, DICT-MLM is trained to predict the cross-lingual synonym of the masked token.
+3https://github.com/googleresearch/bert/blob/master/multilingual.md
+
+Original sentence Transformed Sentence Masked token language
+
+Food and
+
+water are necessities of life
+
+खाना and
+
+agua are necessities of ζωή
+
+Hindi
+
+Spanish
+
+Greek
+
+Figure 1: Generation of training data for DICT-MLM. Tokens in bold are masked out and DICT-MLM is trained to predict the corresponding cross-lingual synonym as shown in the transformed sentence.
+
+To train this model, we ﬁrst create multilingual
+
+code-switched sentences from the monolingual
+
+corpora of L languages by leveraging bilingual
+
+dictionaries. Consider the monolingual corpus
+
+Dl
+
+=
+
+{x
+
+l 1
+
+,
+
+x
+
+l 2
+
+,
+
+·
+
+·
+
+·
+
+,
+
+x
+
+l n
+
+}
+
+for
+
+language
+
+l.
+
+For
+
+each
+
+sentence xli ∈ Dl, we randomly select (and mask)
+
+15% of whole words which have at least one dic-
+
+tionary entry in any bilingual lexicon. For each such masked token (wl ∈ xli), we ﬁrst retrieve all its synonyms from the bilingual dictionaries4.
+
+From the retrieved set of candidate (cross-lingual)
+
+synonyms we then randomly select one synonym given by slwd where ld refers to the language of the selected synonym. An example of such a gener-
+
+ated sentence can be seen in Figure 1. Note that
+
+since synonyms for masked tokens are sampled in-
+
+dependently, the resulting sentences could contain
+
+tokens from multiple different languages (as seen
+
+in above example). This makes the masking task a
+
+lot more challenging, as the model not only needs
+
+to learn the semantics of the word in the masked
+
+slot, but also needs to predict the word in the de-
+
+sired language (which may not be the same as the
+
+surrounding context). Our hypothesis is that this
+
+dual-challenge now forces the learned representa-
+
+tions to be both semantically and cross-lingually
+
+rich. By repeating this process for all monolingual
+
+corpora of the L different languages, we get the desired training dataset5.
+
+After generating this multilingual code-switched
+
+data we perform WordPiece (Wu et al., 2016) to-
+
+kenization following BERT (Devlin et al., 2019).
+
+In the original implementation of BERT (Devlin
+
+et al., 2019), the authors mask individual word-
+
+pieces within a sentence which however causes
+
+only some word-pieces within a word to be masked
+
+making MLM a simpler task. The authors later
+
+4Some words occur in multiple bilingual dictionaries thus allowing us to potentially extract synonyms across multiple languages in these cases.
+5Note that in our experiments, we used bilingual lexicons for only 45 languages. Languages without any lexicon instead relied only on vanilla MLM instead.
+
+proposed to perform whole-word masking (WWM) wherein all the wordpieces of a word are masked while keeping the percentage of masked tokens as before. They empirically ﬁnd WWM to perform better hence we also perform WWM for DICTMLM. We further use a dynamic masking strategy, as proposed by RoBERTa (Liu et al., 2019a), which duplicates the data n times causing different tokens to be selected for masking each time. For DICTMLM, this ampliﬁes the randomness since during the dictionary-replacement step the cross-lingual synonym is also selected randomly.
+2.3 Model and Training Regimen
+We next describe the training setup used for pretraining the different models. We base our model on mBERT (Devlin et al., 2019) which uses a transformer stack (Vaswani et al., 2017) and is trained on the Wikipedia monolingual corpora of 104 languages. For the DICT-MLM methods, we did not use the next sentence prediction (NSP) objective as prior work (Liu et al., 2019a) has shown that to add very little gains.
+As in the original mBERT implementation, masked tokens are replaced with the [MASK] token 80% of the time, 10% of the time with the original token and the remaining 10% with a random token. Given that downstream tasks/datasets are typically monolingual in nature, we combine our DICT-MLM objective with the regular MLM objective to ensure the model learns from monolingual contexts just as well. In particular, we multitask these two objectives by setting the label of the masked token to be the cross-lingual synonym t% of the time. For the remaining (100-t%) time the original token is used as the label. We show the effect of the value of t in our experimental section.
+At this point, an astute reader may wonder how a model can learn to predict masked tokens in different languages without being given any cue about the target token’s language. To remedy this we make two architectural changes to the mBERT
+
+Output Prediction
+
+खाना
+
+agua
+
+ζωή
+
+Concatenation
+Output hidden states Language embeddings
+
+CONDITIONING DENSE LAYER
+
+TRANSFORMER STACK
+
+Token
+
+embeddings [CLS]
+
+[MASK]
+
+and
+
+Language
+
+embeddings en
+
+hi
+
+en
+
+Position
+
+embeddings 0
+
+1
+
+2
+
+[MASK]
+
+are
+
+es
+
+en
+
+3
+
+4
+
+necessities of
+
+en
+
+en
+
+5
+
+6
+
+[MASK]
+el 7
+
+Figure 2: Illustration of our DICT-MLM model for the input sentence ‘Food and water are necessities of life’.
+
+model. First, we add a language embedding layer to the input layer similar to the position and segment embeddings layer. Furthermore, since we want to provide the MLM prediction task with additional language context to help it predict tokens in the appropriate language, we make a second change as well. Speciﬁcally we modify the dense transformation that happens as part of the MLM prediction. Rather than providing this dense block only the token embedding of the ﬁnal transformer layer as in mBERT, we additionally concatenate this token representation with an embedding of the associated language. As in MLM, the output of this dense transformation is used to make a prediction over the shared wordpiece vocabulary via softmax. These modiﬁcations are illustrated in Figure 2. It is worth noting that the latter change – of the additional conditioning before the MLM softmax – only affects the pretraining and not the ﬁnetuning.
+Furthermore since the number of languages is much smaller than the vocabulary size, these changes add very few parameters to the overall model, and do not affect inference / training speed. While both of the above mentioned modiﬁcations require the use of language embeddings, which could be independently learned, in practice we found that coupling the two help improve performance slightly and is thus the setup we use in our experimentation. We also looked to understand the
+
+effect of these architecture changes in our empirical analyses.
+DICT-TLM Inspired by the translation language modeling (TLM) objective (Lample and Conneau, 2019), we experiment with a similar TLM variant of DICT-MLM which uses bilingual dictionaries instead of parallel data. Speciﬁcally, rather than rely on parallel corpora for sentence-aligned translations, we instead simulate translations using the multilingual code-switched sentences as described in Section §2.3. As in TLM, this (synthetic) translation is concatenated with the original sentence, with 15% of the tokens of the concatenated sentence being masked (WWM) and predictions made using the MLM objective. We refer to this model variant as DICT-TLM.
+3 Experiments
+In this section, we empirically demonstrate the efﬁcacy of DICT-MLM on several downstream tasks including textual entailment, sequence labeling, sentence classiﬁcation and sentence retrieval.
+Data: We use the Wikipedia monolingual corpora for 104 languages. Owing to wide differences in the monolingual data availability of the different languages we employ a temperature based data sampling policy following Siddhant et al. (2020). We use the publicly released MUSE (Conneau et al.,
+
+Baseline Ours
+
+Model
+MBERT (OURS) MBERT (PUBLIC) XLM
+DICT-MLM-50 DICT-MLM-70 DICT-MLM-90 DICT-TLM
+
+Sequence Labeling NER (F1) POS (Acc.)
+
+68.9
+
+67.9
+
+62.2
+
+71.5
+
+61.2
+
+71.3
+
+71.3 ±0.5 69.0 ±0.1 67.8 ±0.6
+65.0
+
+70.4 ±0.1 69.9 ±0.2 69.4 ±2.3
+71.6
+
+Sentence Classiﬁcation MLDOC-H (Acc.) PAWS-X (Acc.)
+
+65.2
+
+79.5
+
+-
+
+81.9
+
+-
+
+80.9
+
+66.1 ±1.9 66.1 ±1.0 65.6 ±1.0
+67.7
+
+84.2 ±0.4 84.6
+84.1 ±0.2 84.8
+
+Textual Entailment XNLI (Acc.)
+68.1 65.4 69.1
+67.9 ±2.5 68.6 ±1.1 67.2 ±1.8
+66.6
+
+Sentence Retrieval TATOEBA (Acc.)
+33.3 38.7 32.6
+46.4 47.3 45.1 36.9
+
+Table 1: Average scores for each task across the respective languages reveal that our proposed methods outperform existing baselines. The models/tasks for which we were able to train multiple runs, we report the mean and std. deviation across two runs, wherever applicable. We refer to XTREME Hu et al. (2020) for the MBERT (PUBLIC) and XLM results. For TATOEBA, we report the accuracy averaged across last four layers while Hu et al. (2020) report results by concatenating the representations from those last four layers.
+
+2017) bilingual dictionaries, which comprises of 110 dictionaries spanning 45 (of the 104) languages. We pre-process all 110 dictionaries to create a single dictionary aggregating all synonyms across multiple languages as seen in Table 4. While 40 of the 45 languages have dictionaries available only to/from English, ﬁve languages (German, Spanish, Italian, French, Portuguese) have additional dictionaries between them. As mentioned in Section §2.3, we randomly sample one synonym for each (DICT-MLM) masked token ensuring that synonyms from all languages have equal probability.
+3.1 Experimental setup
+We follow the same hyperparameter settings as mBERT (Devlin et al., 2019) using 12 layers of the transformer stack (Vaswani et al., 2017) with 768 hidden units. We use a learning rate of 0.0016 with the LAMB optimizer (You et al., 2020) and a batch size of 8192. We train all our models including the mBERT baseline with the above hyperparameters on 128 TPU v3 chips for 500K steps. We use language embeddings of 768 hidden size. We experiment with three different DICT-MLM models by varying the percentage of regular MLM tokens denoted by t = [50%, 70%, 90%], as outlined in Section §2.3. To account for model variance we pre-train the DICT-MLM model twice and report the averaged results (along with the variance). We believe this provides a more fair assessment of the efﬁcacy of these deep models given their inherent variance across runs.
+During ﬁne-tuning we use a learning rate of 3e− 5 with the AdamW optimizer and train for 8 epochs. In order to be consistent with the pre-training setup, for all DICT-MLM ﬁne-tuning runs we add language embeddings with the token embeddings as input to the transformer stack. We evaluate our model in
+
+the zero-shot setting where we ﬁne-tune the models only on the English portion of the tasks and directly apply the model on the test portion of the different languages.
+3.2 Tasks
+Textual Entailment We use cross-lingual natural language inference XNLI (Conneau et al., 2018) dataset which covers 15 languages. The model takes in two input sentences and is required to classify into one of the three labels: entailment, contradiction, neutral.
+Sequence Labeling We use named entity recognition NER (Pan et al., 2017) and part-of-speech tagging POS (Nivre et al., 2018) datasets which cover 38 languages and 33 languages respectively. We use the same set of languages as the XTREME benchmark (Hu et al., 2020). For NER, the model takes in an input sequence and is required to identify entities of the following three types: PER, ORG, LOC. For POS tagging, the model is required to tag each token in the input sequence with its universal part-of-speech (UPOS) tag.
+Sentence classiﬁcation We use the PAWS-X (Yang et al., 2019) dataset which takes two input sequences and classiﬁes whether these sequences are paraphrases of each other. This is available for 7 languages. We also use the MLDOC (Schwenk and Li, 2018) dataset which performs document classiﬁcation (into 4 categories) given an input headline and is available for 8 languages.
+Sentence Retrieval We use the TATOEBA (Artetxe and Schwenk, 2019) dataset which contains upto 1000 English-aligned sentences across 122 languages. We use the same set of languages as the XTREME benchmark (Hu et al., 2020). We
+
+ﬁnd the nearest neighbor using cosine similarity of the sentence embeddings. Sentence embeddings are derived by mean-pooling of the token embeddings.6
+3.3 Results
+In Table 1 we report results for the six tasks, averaged across all languages and runs.7 We ﬁnd that our proposed models signiﬁcantly outperform the vanilla mBERT baselines. Furthermore, the DICT-MLM models even outperform existing works that leverage (millions of) parallel sentence pairs, speciﬁcally the XLM model (Lample and Conneau, 2019). Table 2 directly compares the performance of our approach versus the recently proposed contrastive alignment method (Wu and Dredze, 2020b). In particular, Wu and Dredze (2020b) – which proposes several alignment methods that use parallel data to improve the learned multilingual representations8 – only report results on NER, POS and XNLI for 9 languages. Table 2 reports performance for those languages and tasks with signiﬁcant gains observed for NER and XNLI tasks. Interestingly on POS tagging, Wu and Dredze (2020b) report signiﬁcantly higher results for their mBERT baseline itself than either we could reproduce or that previous works reported (Hu et al., 2020). We still observed DICT-MLM outperform (our implementation of) mBERT and leave resolving this disparity to future work. A further discussion on a possible explanation for DICT-MLM’s reduced performance on POS-tagging can be found in Sec. §3.4.
+Does DICT-MLM help learn more languageagnostic representations? The primary motivation behind DICT-MLM was overcoming the limitations of MLM when it comes to learning language-agnostic representations. Thus to understand the cross-linguality of the learned representations of the DICT-MLM models, we use the Tatoeba cross-lingual nearest-neighbor retrieval task. This dataset directly measures and rewards the languageagnosticity of the learned representations. As seen in Figure 3, we ﬁnd that our proposed methods
+6The results and trends are similar for other distance functions and pooling strategies but we leave out these variants for the sake of brevity.
+7We use the same set of test languages as used by the XTREME (Hu et al., 2020) benchmark. Due to time constraints we only pre-train the DICT-MLM-X models twice.
+8We compare with the Strong Align variant from Wu and Dredze (2020b) which improves upon the mBERT model in most cases.
+
+ACCURACY
+
+0.6 0.5 0.4 0.3 0.2 0.1
+0 1
+
+M-BERT (Public) DICT-MLM-70
+
+M-BERT (Ours) DICT-MLM-90
+
+DICT-MLM-50 DICT-TLM
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9 10 11 12
+
+TRANSFORMER LAYER
+
+Figure 3: Accuracy of different models on the TATOEBA cross-lingual sentence retrieval task using representations from different layers of the transformer stack. The y-axis reports the nearest-neighbor accuracy and x-axis denotes the layer number.
+
+are able to learn much better cross-lingual representations across *all* layers relative to mBERT. Relative to the steep drop-off in performance between middle and ﬁnal layers observed in mBERT models, the DICT-MLM models are able to retain signiﬁcantly more multilingual representations in the ﬁnal layer representations. One hypothesis for the observed drop in the DICT-MLM models’ ﬁnal layer is the reliance on the language embedding added to the input. We leave further investigation of this phenomena to future work.
+3.4 Analysis
+In this section, we aim to understand the behavior and performance of the proposed DICT-MLM models in more detail.
+Is there a relation between dictionary availability and the downstream performance? As mentioned earlier, the MUSE bilingual dictionaries cover only 45 of the 104 languages used for pretraining. Speciﬁcally, across these 45 languages, we ﬁnd 34.15% of the total Wikipedia tokens have at least one synonym available. Naturally a question arises whether only languages having dictionaries are beneﬁted by this approach? In Table 3 we therefore compare the downstream performance on languages which have dictionaries available versus those which do not. We report the difference in the (average) scores between the DICT-MLM50 model and the mBERT model for NER, POS and TATOEBA.9 Needless to say, languages which have dictionaries available show more improvements however, we do observe signiﬁcant gains
+9For MLDOC-H, PAWS-X and XNLI tasks most or all languages are covered by the dictionaries and hence we do not report results for them.
+
+Baseline Ours
+
+Model
+MBERT (OURS) MBERT (THEIRS)* Wu and Dredze (2020b)
+DICT-MLM-50 DICT-MLM-70 DICT-MLM-90 DICT-TLM
+
+Sequence Labeling NER (F1) POS (Acc.)
+
+76.4 67.7 ±1.3 67.1 ±1.1
+
+68.7 78.3 ±0.5 79.0 ±0.7
+
+77.5 ±0.5 76.1 ±2.0 75.7 ±1.1
+72.0
+
+71.7 ±0.9 73.1 ±0.4 71.6 ±2.5
+73.1
+
+Textual Entailment XNLI (Acc.)
+71.5 70.1 ±0.8 70.5 ±0.7
+71.6 ±2.3 72.7 ±2.4 72.2 ±0.9
+70.2
+
+Table 2: Average scores for each task across the 9 languages (as reported in Wu and Dredze (2020b)) reveal that our proposed dictionary-based methods outperform the existing baseline which uses parallel data. MBERT (THEIRS)* refers to the results reported for mBERT by Wu and Dredze (2020b) and MBERT (OURS) refer to the scores from our re-trained model. For our trained models we report the mean and std. deviation across two runs, wherever applicable.
+
+TASK
+NER POS TATOEBA
+
+WITHOUT DICT
++2.3 (21) +0.9 (6) +2.7 (9)
+
+WITH DICT
++2.4 (27) +3 (27) +6.95 (27)
+
+Table 3: Each cell is the difference in average scores between the DICT-MLM-50 model and the mBERT model, split based on whether the language was covered in the bilingual dictionaries or not. Even for languages not having dictionaries, we observe improvements over mBERT. For each setting, brackets denote the number of languages over which the average was computed.
+
+even for languages which have no dictionaries available. In particular, the gains on the TATOEBA dataset, indicate that the DICT-MLM models are learning a more cross-lingual representation for all languages, despite there being no dictionaries available for most languages.
+Do some tasks/languages beneﬁt more from a particular DICT* variant? As mentioned in Section §2.2, we multi-task between the regular MLM objective and the DICT-MLM objective for the three model variants. This leads to having different amounts of cross-lingual masked token labels in the pre-training data for the variants. In particular, 34% of the labels of the masked tokens of the DICTMLM-50 dataset, belong to a different language than the sentence. Likewise this fraction is 55% and 82% for DICT-MLM-70 and DICT-MLM-90 re-
+
+spectively.10
+Based on the results, such as those in Table 1, we ﬁnd that the DICT-MLM-50 and DICT-MLM-70 consistently score higher than the DICT-MLM-90 variant across all tasks. This conﬁrms our intuition for the need to multi-task with regular MLM. By relying so heavily on predicting cross-lingual synonyms largely (82% of masked tokens), DICTMLM-90 does worse than the other variants on the downstream tasks which are all monolingual texts – something it sees only 10% of the time. This pretraining-downstream mismatch coupled with not learning from enough monolingual examples, is likely why it trails the other two.
+We also ﬁnd the DICT-TLM variant to be fairly competitive in some tasks, most notably the POStagging ones. We believe this is due to a notable downside of our setup affecting the DICT-MLM variants. Among all of the evaluated tasks, POS tagging is the most reliant on lexical cues. If is often the case that the internal structure (morphology) of the individual tokens is sufﬁcient to correctly predict its POS value. However as part of our cross-lingual synonym prediction task in the DICTMLM variants, we sample synonyms randomly i.e., we do not consider the morphology of the word or the surrounding context. Since most publicly released dictionaries only have a single morphological form annotated, this can lead to grammatically incorrect substitutions or a loss of morphological information. For instance, in Table 4 we ﬁnd that
+10Note these numbers have been calculated on the training data which was duplicated 5 times for dynamic masking.
+
+SOURCE
+pt: andar no: vokal ms: cubaan
+
+TARGET
+it:camminare, es:piso, en:walking, en:walk en:vowels, en:vowel en:attempt, en:attempting, en:attempted, en:testing, en:attempts
+
+Table 4: Example dictionary entries show that a given source word has multiple synonyms across different languages. The same source word also has synonyms across different morphological forms of which one form is randomly selected. The language codes are - pt: Portuguese, no: Norwegian, ms: Malay, it: Italian, es: Spanish, en: English.
+
+% Difference of Accuracy % Difference of F1 score
+
+DICT-MLM-50 5
+
+DICT-MLM-70
+
+0
+
+-5
+
+-10
+
+-15
+
+-20
+
+6
+
+8
+
+DICT-MLM-90 DICT-TLM
+
+10
+
+12
+
+14
+
+(a) XNLI
+
+DICT-MLM-50 10
+
+DICT-MLM-70
+
+DICT-MLM-90
+
+DICT-TLM
+
+5
+
+0
+
+-5
+
+-10
+
+-15
+
+4
+
+6
+
+8
+
+10
+
+12
+
+14
+
+(b) NER
+
+Figure 4: Comparing the (avg.) performance across the different pre-trained models grouped by Wikipedia size for a) XNLI and b) NER task. Note higher scores are better. For XNLI we plot difference in the accuracy and for NER difference in the F1 score with respect to mBERT on y-axis.
+
+the Norwegian word for ‘vokal’ (vowel) is mapped to both singular and plural form of the respective English word which is incorrect since Norwegian has a different word ‘vokaler’ for the plural form (vowels). We posit that cleaning up the lexicons and a more careful selection of synonyms can help alleviate this issue.
+We further compare the performance of the model variants with respect to the pre-training corpus size (wikipedia-size) of the different languages. We group languages by their Wikipedia size and use the same grouping as Wu and Dredze (2020a). In Figure 4 we present results for two tasks, NER and XNLI.11 First, we observe that the difference between the model variants is more apparent for NER than for XNLI. This is because NER being a sequence labeling task, the ﬁne-tuned model for NER relies heavily on token-level representations as compared to XNLI which uses the full sequence representation ([CLS] token) for ﬁnal prediction. This probably leads the sequence labeling models to be more sensitive to the different variants.
+Speciﬁcally for NER and POS, we observe that languages with small wikipedia sizes are bene-
+11Plots for other tasks can be found in the Appendix.
+
+ﬁted more which suggests that the additional crosslingual supervision in the form of bilingual dictionary is particularly helpful for low to mid-resource languages. Further, we ﬁnd that for a given task, the proposed methods perform consistently across all language families i.e. in most cases the different model variants have a similar rank order with respect to their performance across the language families. This is promising as researchers do not need to pre-train multiple model variants for a given task saving much time and computation effort.
+Is the language conditioning layer in DICTMLM* necessary? In Section §2.2, we discussed two architectural changes to the mBERT model where one of them was adding a language conditioning dense layer for the (dict) MLM prediction task. Speciﬁcally, we concatenated the associated language’s embedding with the token’s embedding from the ﬁnal transformer layer to aid in the crosslingual synonym prediction. To evaluate the effect of the conditioning layer, we conduct an ablation study by removing the conditioning layer and report the results on ﬁve downstream tasks for the DICT-MLM-50 model variant in Table 5. We
+
+TASK
+NER POS XNLI MLDOC PAWS-X
+
+WITH CONDITIONING
+71.3 70.4 67.8 62.1 84.3
+
+WITHOUT
+69.1 72.6 67.1 62.1 85.4
+
+Table 5: Ablation study to evaluate the effectiveness of language conditioning layer for the DICT-MLM-50 model. All scores are averaged across the respective languages.
+
+ﬁnd that for NER, removing the conditioning layer causes a signiﬁcant drop in the performance as compared to XNLI and MLDOC-H. For POS and PAWS-X we observe a slight increase in performance upon removing the language conditioning layer. We do note that DICT-MLM-50 is the best performing model variant for NER which could suggest that the conditioning layer is indeed providing additional performance gain. However, we leave this for future work to further investigate this observation.
+4 Related Work
+There has been a growing trend towards using explicit alignment objectives to encourage crosslinguality in word representations. Upadhyay et al. (2016) show that training word representations with different levels of cross-lingual alignment supervision improves downstream performance on both semantic and syntactic tasks. They use supervision in the form of parallel text with word alignments, an expensive cross-lingual resource, to predict words cross-lingually. They also ﬁnd that for syntactic tasks such as dependency parsing, a weaker supervision signal in the form of bilingual dictionaries is competitive with other alignment objectives which require parallel text.
+Recently, such alignment objectives have also been incorporated with pre-trained models. The most recent work is perhaps by Wu and Dredze (2020b) which proposes various methods to align the source and target word representations using parallel text and observe slight improvements over mBERT. However, for a larger capacity model such as XLM-R they do not observe signiﬁcant gains under an extensive evaluation setup. XLM (Lample and Conneau, 2019) also uses parallel data with the MLM objective to implicitly encourage cross-lingual alignment. In contrast, our work demonstrates signiﬁcant improvements over existing works while using only bilingual dictionaries
+
+which are more easily available than parallel text. Bilingual dictionaries have been used for train-
+ing task-speciﬁc models such as in Liu et al. (2019b) where they use an attention matrix to select the words for dictionary replacement and create code-mixed sentences. Parallel to our work Qin et al. (2020) also propose to use bilingual dictionaries to construct code-switched sentences for training downstream models. Qin et al. (2020) follow a similar approach as ours of random sampling both word and their synonyms. Our work differs from Qin et al. (2020); Liu et al. (2019b) in two aspects: 1) we pre-train our model from scratch whereas Qin et al. (2020) ﬁne-tune the mBERT model on the multilingual code-switched sentences, and 2) we propose two architectural changes to the pre-trained model to provide additional language signals wherein we add language embeddings to the input layer and a language conditioning dense layer after the transformer stack.
+5 Conclusions and Future Work
+In this work, we presented pre-training methods targeted towards improving the cross-lingual representation learning of BERT-based models. We propose using bilingual dictionaries for this purpose since they are a relatively cheap cross-lingual resource and easily available for several languages. We ﬁnd that our proposed methods outperform existing work which use stronger cross-lingual supervision in the form of parallel text, on six tasks in the difﬁcult zero-shot setting. Furthermore, we ﬁnd that languages which do not have dictionary resources available are also beneﬁted by our proposed pre-training methods making this method applicable to even endangered languages which might not have dictionaries easily available.
+One limitation of our work is that during the training data generation, the cross-lingual synonyms are selected randomly and out of context which often results in ungrammatical sentences be-
+
+ing generated. We plan to address this problem in our future work. We also plan to expand our methodology to leverage alternative resources such as multilingual word embeddings to further improve the learned representations.
+Acknowledgements
+We would like to thank Melvin Johnson for the interesting discussions which helped shaped this work.
+References
+Mikel Artetxe and Holger Schwenk. 2019. Massively Multilingual Sentence Embeddings for Zero-Shot Cross-Lingual Transfer and Beyond. Transactions of the ACL 2019.
+Kevin Clark, Minh-Thang Luong, Quoc V. Le, and Christopher D. Manning. 2020. ELECTRA: Pretraining text encoders as discriminators rather than generators. In ICLR.
+Alexis Conneau, Kartikay Khandelwal, Naman Goyal, Vishrav Chaudhary, Guillaume Wenzek, Francisco Guzma´n, Edouard Grave, Myle Ott, Luke Zettlemoyer, and Veselin Stoyanov. 2020. Unsupervised cross-lingual representation learning at scale.
+Alexis Conneau, Guillaume Lample, Marc’Aurelio Ranzato, Ludovic Denoyer, and Herve´ Je´gou. 2017. Word translation without parallel data. arXiv preprint arXiv:1710.04087.
+Alexis Conneau, Ruty Rinott, Guillaume Lample, Adina Williams, Samuel R. Bowman, Holger Schwenk, and Veselin Stoyanov. 2018. Xnli: Evaluating crosslingual sentence representations. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing. Association for Computational Linguistics.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. BERT: Pre-training of deep bidirectional transformers for language understanding. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), pages 4171–4186, Minneapolis, Minnesota. Association for Computational Linguistics.
+Yuwei Fang, Shuohang Wang, Zhe Gan, Siqi Sun, and Jingjing Liu. 2020. Filter: An enhanced fusion method for cross-lingual language understanding.
+Junjie Hu, Sebastian Ruder, Aditya Siddhant, Graham Neubig, Orhan Firat, and Melvin Johnson. 2020. Xtreme: A massively multilingual multi-task benchmark for evaluating cross-lingual generalization. CoRR, abs/2003.11080.
+
+Guillaume Lample and Alexis Conneau. 2019. Crosslingual language model pretraining. Advances in Neural Information Processing Systems (NeurIPS).
+Zhenzhong Lan, Mingda Chen, Sebastian Goodman, Kevin Gimpel, Piyush Sharma, and Radu Soricut. 2019. Albert: A lite bert for self-supervised learning of language representations. arXiv preprint arXiv:1909.11942.
+Y Liu, M Ott, N Goyal, J Du, M Joshi, D Chen, O Levy, M Lewis, L Zettlemoyer, and V Stoyanov. 2019a. Roberta: A robustly optimized bert pretraining approach. arxiv 2019. arXiv preprint arXiv:1907.11692.
+Zihan Liu, Genta Indra Winata, Zhaojiang Lin, Peng Xu, and Pascale Fung. 2019b. Attention-informed mixed-language training for zero-shot cross-lingual task-oriented dialogue systems.
+Joakim Nivre, Mitchell Abrams, Zˇ eljko Agic´, Lars Ahrenberg, Lene Antonsen, Maria Jesus Aranzabe, Gashaw Arutie, Masayuki Asahara, Luma Ateyah, Mohammed Attia, et al. 2018. Universal dependencies 2.2.
+Xiaoman Pan, Boliang Zhang, Jonathan May, Joel Nothman, Kevin Knight, and Heng Ji. 2017. Crosslingual name tagging and linking for 282 languages. In Proceedings of ACL 2017, pages 1946–1958.
+Telmo Pires, Eva Schlinger, and Dan Garrette. 2019. How multilingual is multilingual bert? arXiv preprint arXiv:1906.01502.
+Libo Qin, Minheng Ni, Yue Zhang, and Wanxiang Che. 2020. Cosda-ml: Multi-lingual code-switching data augmentation for zero-shot cross-lingual nlp.
+Sebastian Ruder, Ivan Vulic´, and Anders Søgaard. 2019. A survey of cross-lingual word embedding models. J. Artif. Int. Res., 65(1):569–630.
+Holger Schwenk and Xian Li. 2018. A corpus for multilingual document classiﬁcation in eight languages. In Proceedings of the Eleventh International Conference on Language Resources and Evaluation (LREC 2018), Paris, France. European Language Resources Association (ELRA).
+Aditya Siddhant, Melvin Johnson, Henry Tsai, Naveen Ari, Jason Riesa, Ankur Bapna, Orhan Firat, and Karthik Raman. 2020. Evaluating the cross-lingual effectiveness of massively multilingual neural machine translation. In AAAI, pages 8854–8861.
+Wilson L Taylor. 1953. “cloze procedure”: A new tool for measuring readability. Journalism quarterly, 30(4):415–433.
+Shyam Upadhyay, Manaal Faruqui, Chris Dyer, and Dan Roth. 2016. Cross-lingual models of word embeddings: An empirical comparison. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+
+pages 1661–1670, Berlin, Germany. Association for Computational Linguistics.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in neural information processing systems, pages 5998–6008.
+Shijie Wu and Mark Dredze. 2020a. Are all languages created equal in multilingual BERT? In Proceedings of the 5th Workshop on Representation Learning for NLP, pages 120–130, Online. Association for Computational Linguistics.
+Shijie Wu and Mark Dredze. 2020b. Do explicit alignments robustly improve multilingual encoders? In Conference on Empirical Methods in Natural Language Processing (EMNLP), Online.
+Yonghui Wu, Mike Schuster, Zhifeng Chen, Quoc V Le, Mohammad Norouzi, Wolfgang Macherey, Maxim Krikun, Yuan Cao, Qin Gao, Klaus Macherey, et al. 2016. Google’s neural machine translation system: Bridging the gap between human and machine translation. arXiv preprint arXiv:1609.08144.
+Yinfei Yang, Yuan Zhang, Chris Tar, and Jason Baldridge. 2019. PAWS-X: A cross-lingual adversarial dataset for paraphrase identiﬁcation. In Proceedings of EMNLP 2019, pages 3685–3690.
+Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Srinadh Bhojanapalli, Xiaodan Song, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. 2020. Large batch optimization for deep learning: Training bert in 76 minutes. In International Conference on Learning Representations.
+
+A Appendix
+A.1 Analysis
+We compare the performance of the model variants across two settings: language-family (Figure 6) and wikipedia-size (Figure 5) and present results for ﬁve tasks, grouped by the respective language families and wikipedia sizes. We follow the same language family grouping as XTREME (Hu et al., 2020) and for Wikipedia size based grouping we refer to Table 1 in Wu and Dredze (2020a).
+
+% Difference of Accuracy
+
+DICT-MLM-50 20
+
+DICT-MLM-70
+
+DICT-MLM-90
+
+DICT-TLM
+
+0
+
+-20
+
+-40
+
+-60 4
+
+6
+
+8
+
+10
+
+12
+
+14
+
+(a) POS
+
+% Difference of Accuracy
+
+DICT-MLM-50 20
+10
+0
+-10
+-20
+-30 9
+
+DICT-MLM-70
+
+10
+
+11
+
+DICT-MLM-90 DICT-TLM
+
+12
+
+13
+
+14
+
+(b) PAWX-X
+
+DICT-MLM-50 10
+
+DICT-MLM-70
+
+DICT-MLM-90
+
+DICT-TLM
+
+% Difference of Accuracy
+
+5
+
+0
+
+-5
+
+11
+
+12
+
+13
+
+14
+
+(c) MLDOC-H
+
+Figure 5: Comparing the (avg.) performance across the different pre-trained models grouped by language family.
+
+% Difference of F1 score
+
+DICT-MLM-50 25
+
+DICT-MLM-70
+
+DICT-MLM-90
+
+DICT-TLM
+
+0
+
+-25
+
+-50
+
+-75
+
+-100 erage manic siatic Slavic Aryanasque Greek ance ongo ra-Dai Turkic siaticibetan esian vidian reanic velian ponic Uralicranian
+AvIE:Ger Afro-A IEIE: :Indo- B IE:IE:RoNmiger-C K Austro-ASino-TAustron Dra Ko Kart Ja IE:I
+
+(a) NER
+
+% Difference of Accuracy
+
+DICT-MLM-50 20
+
+DICT-MLM-70
+
+DICT-MLM-90
+
+DICT-TLM
+
+0
+
+-20
+
+-40
+
+erage manic siatic Slavic Uralic Greek ance Aryan Turkic siatic esian reanic ponic ibetan ra-Dai asque vidian ranian ongo
+
+AvIE:Ger Afro-A IE:
+
+IE:IE:RoImE:Indo- Austro-Aaustron Ko JaSino-T K B Dra IE:INiger-C
+
+(b) XNLI
+
+% Difference of Accuracy
+
+DICT-MLM-50 5
+
+DICT-MLM-70
+
+DICT-MLM-90
+
+DICT-TLM
+
+0
+
+-5
+
+-10
+
+-15
+
+-20
+
+-25
+
+rage anic lavic ance reek ongo
+
+Ave erm IE:G
+
+IE:S om IE:R
+
+IE:G er-C Nig
+
+urkic siatic siatic ryan a-Dai etan
+
+T fro-A tro-A ndo-A A Aus IE:I
+
+Kr no-Tib Si
+
+(c) POS
+
+% Difference of Accuracy
+
+DICT-MLM-50 12
+
+DICT-MLM-70
+
+10
+
+8
+
+6
+
+4
+
+2
+
+0
+
+-2 rage
+Ave
+
+onic Jap
+
+anic erm IE:G
+
+DICT-MLM-90
+
+DICT-TLM
+
+nce oma IE:R
+
+ibetan ino-T S
+
+reanic Ko
+
+(d) PAWX-X
+
+% Difference of Accuracy
+
+DICT-MLM-50 12
+
+DICT-MLM-70
+
+10
+
+8
+
+6
+
+4
+
+2
+
+0
+
+-2 rage
+Ave
+
+onic Jap
+
+anic erm IE:G
+
+DICT-MLM-90
+
+DICT-TLM
+
+nce oma IE:R
+
+ibetan ino-T S
+
+reanic Ko
+
+(e) MLDOC-H
+
+Figure 6: Comparing the (avg.) performance across the different pre-trained models grouped by language family.
+
+

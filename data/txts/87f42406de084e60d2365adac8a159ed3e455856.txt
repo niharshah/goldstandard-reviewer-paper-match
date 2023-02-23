@@ -1,0 +1,1184 @@
+Fast Memory-efﬁcient Anomaly Detection in Streaming Heterogeneous Graphs
+
+arXiv:1602.04844v2 [cs.SI] 22 Feb 2016
+
+Emaad A. Manzoor Sadegh Momeni† Venkat N. Venkatakrishnan† Leman Akoglu
+Stony Brook University †University of Illinois at Chicago
+{emanzoor, leman}@cs.stonybrook.edu, {smomen2,venkat}@uic.edu
+
+ABSTRACT
+Given a stream of heterogeneous graphs containing diﬀerent types of nodes and edges, how can we spot anomalous ones in real-time while consuming bounded memory? This problem is motivated by and generalizes from its application in security to host-level advanced persistent threat (APT) detection. We propose StreamSpot, a clustering based anomaly detection approach that addresses challenges in two key fronts: (1) heterogeneity, and (2) streaming nature. We introduce a new similarity function for heterogeneous graphs that compares two graphs based on their relative frequency of local substructures, represented as short strings. This function lends itself to a vector representation of a graph, which is (a) fast to compute, and (b) amenable to a sketched version with bounded size that preserves similarity. StreamSpot exhibits desirable properties that a streaming application requires—it is (i) fully-streaming; processing the stream one edge at a time as it arrives, (ii) memory-eﬃcient; requiring constant space for the sketches and the clustering, (iii) fast; taking constant time to update the graph sketches and the cluster summaries that can process over 100K edges per second, and (iv) online; scoring and ﬂagging anomalies in real time. Experiments on datasets containing simulated system-call ﬂow graphs from normal browser activity and various attack scenarios (ground truth) show that our proposed StreamSpot is high-performance; achieving above 95% detection accuracy with small delay, as well as competitive time and memory usage.
+1. INTRODUCTION
+Anomaly detection is a pressing problem for various critical tasks in security, ﬁnance, medicine, and so on. In this work, we consider the anomaly detection problem for streaming heterogeneous graphs, which contain diﬀerent types of nodes and edges. The input is a stream of timestamped and typed edges, where the source and detination nodes are also typed. Moreover, multiple such graphs may be arriving over the stream simultaneously, that is, edges that belong
+This research is supported by the DARPA Transparent Computing Program under Contract No. FA8650-15-C-7561, NSF CAREER 1452425, and an R&D gift from Northrop Grumman Aerospace Systems. Conclusions expressed in this material are of the authors and do not necessarily reﬂect the views, expressed or implied, of the funding parties. Copyright 20XX ACM X-XXXXX-XX-X/XX/XX ...$15.00.
+
+to diﬀerent graphs may be interleaved. The goal is to accurately and quickly identify the anomalous graphs that are signiﬁcantly diﬀerent from what has been observed over the stream thus far, while meeting several important needs of the driving applications including fast real-time detection and bounded memory space usage.
+The driving application that motivated our work is the advanced persistent threat (APT) detection problem in security, although the above abstraction can appear in numerous other settings (e.g., software veriﬁcation). In the APT scenario, we are given a stream of logs capturing the events occuring in the system. These logs are used to construct what is called information ﬂow graphs, in which edges depict data or control dependencies. Both the nodes and edges of the ﬂow graphs are typed. Examples to node types are file, process, etc. and edge types include various system calls such as read, write, fork, etc. as well as other parent-child relations. Within a system, an information ﬂow corresponds to a unit of functionality (e.g., checking email, watching video, software updates, etc.). Moreover, multiple information ﬂows may be occurring in the system simultaneously. The working assumption for APT detection is that the information ﬂows induced by malicious activities in the system are suﬃciently diﬀerent from the normal behavior of the system. Ideally, the detection is to be done in realtime with small computational overhead and delay. As the system-call level events occur rapidly in abundance, it is also crucial to process them in memory while also incurring low space overhead. The problem then can be cast as real-time anomaly detection in streaming heterogeneous graphs with bounded space and time, as stated earlier.
+Graph-based anomaly detection has been studied in the past two decades. Most work is for static homogeneous graphs [5]. Those for typed or attributed graphs aim to ﬁnd deviations from frequent substructures [27, 12, 23], anomalous subgraphs [17, 29], and community outliers [14, 30], all of which are designed for static graphs. For streaming graphs various techniques have been proposed for clustering [3] and connectivity anomalies [4] for plain graphs, which are recently extended to graphs with attributes [36, 24]. (See Sec. 6) Existing approaches are not, at least directly, applicable to our motivating scenario as they do not exhibit all of the desired properties simultaneously; namely, handling heterogeneous graphs, streaming nature, low computational and space overhead, and real-time anomaly detection.
+To address the problem for streaming heterogeneous graphs, we introduce a new clustering-based anomaly detection approach called StreamSpot that (i) can handle temporal
+
+graphs with typed nodes and edges, (ii) processes incoming edges fast and consumes bounded memory, as well as (iii) dynamically maintains the clustering and detects anomalies in real time. In a nutshell, we propose a new shingling-based similarity function for heterogeneous graphs, which lends itself to graph sketching that uses ﬁxed memory while preserving similarity. We show how to maintain the graph sketches eﬃciently as new edges arrive. Based on this representation, we employ and dynamically maintain a centroid-based clustering scheme to score and ﬂag anomalous graphs. The main contributions of this work are listed as follows:
+• Novel formulation and graph similarity: We formulated the host-level APT detection problem as a clustering-based anomaly detection task in streaming heterogeneous graphs. To enable an eﬀective clustering, we designed a new similarity function for timestamped typed graphs, based on shingling, which accounts for the frequency of diﬀerent substructures in a graph. Besides being eﬃcient to compute and eﬀective in capturing similarity between graphs, the proposed function lends itself to comparing two graphs based on their sketches, which enables memory-eﬃciency.
+• Dynamic maintenance: We introduce eﬃcient techniques to keep the various components of our approach up to date as new edges arrive over the stream. Specifically, we show how to maintain (a) the graph sketches, and (b) the clustering incrementally.
+• Desirable properties: Our formulation and proposed techniques are motivated by the requirements and desired properties of the application domain. As such, our approach is (i) fully streaming, where we perform a continuous, edge-level processing of the stream, rather than taking a snaphot-oriented approach; (ii) timeeﬃcient, where the processing of each edge is fast with constant complexity to update its graph’s sketch and the clustering; (iii) memory-eﬃcient, where the sketches and cluster summaries consume constant memory that is controlled by user input, and (iv) online, where we score and ﬂag the anomalies in real-time.
+We quantitatively validate the eﬀectiveness and (time and space) eﬃciency of our proposed StreamSpot on simulated datasets containing normal host-level activity as well as abnormal attack scenarios (i.e., ground truth). We also design experiments to study the approximation quality of our sketches, and the behavior of our detection techniques under varying parameters, such as memory size.
+Source code of StreamSpot and the simulated datasets (normal and attack) will be released at http://www3.cs. stonybrook.edu/~emanzoor/streamspot/.
+2. PROBLEM & OVERVIEW
+For host-level APT detection, a host machine is instrumented to collect system logs. These logs essentially capture the events occuring in the system, such as memory accesses, system calls, etc. An example log sequence is illustrated in Figure 1. Based on the control and data dependences, information ﬂow graphs are constructed from the system logs. In the ﬁgure, the tag column depicts the ID of the information ﬂow (graph) that an event (i.e., edge) belongs to.
+The streaming graphs are heterogeneous where edge types correspond to system calls such as read, fork, sock_wr, etc. and node types include socket, file, memory, etc.
+
+time% pid% event%
+
+100# 10639# fork#
+
+200# 10640# execve#
+
+300# 10650# read#
+
+400# 10640# fstat#
+
+500# 10660# sock_wr#
+
+…#
+
+…#
+
+…#
+
+arg/data% NULL# /bin/sh# STDIN# 0xbfc5598# 0.0.0.0#
+…#
+
+tag% 1# 1# 2# 1# 2# …#
+
+10639% <100,fork>%
+
+10650%
+
+10640%
+
+10660%
+
+/bin/sh%
+
+0xbfc5598%
+
+STDIN% 0.0.0.0%
+
+Figure 1: Example stream of system logs, and two resulting information ﬂow graphs (red vs. blue). Both nodes and edges are typed. Edges arriving to diﬀerent ﬂows may interleave.
+As such, an edge can be represented in the form of
+< source-id, source-type φs, dest-id, dest-type φd, timestamp t, edge-type φe, flow-tag >
+These edges form dynamically evolving graphs, where the edges sharing the same ﬂow-tag belong to the same graph. Edges arriving to diﬀerent graphs may be interleaved, that is, multiple graphs may be evolving simultaneously.
+Our goal is to detect anomalous graphs at any given time t, i.e., in real time as they occur. To achieve this goal, we follow a clustering-based anomaly detection approach. In a nutshell, our method maintains a small, memory-eﬃcient representation of the evolving graphs in main memory, and uses a new similarity measure that we introduce to cluster the graphs. The clustering is also maintained dynamically as existing graphs evolve or as new ones arrive. Anomalies are ﬂagged in real time through deviations from this clustering model that captures the normal ﬂow patterns.
+In the following, we summarize the main components of our proposed approach called StreamSpot, with forward references to respective subsequent (sub)sections.
+• Similarity of heterogeneous graphs: (§3.1) We introduce a new similarity measure for heterogeneous graphs with typed nodes and edges as well as timestamped edges. Each graph G is represented by a what we call shingle-frequency vector (or shortly shingle vector) zG. Roughly, a k-shingle s(v, k) is a string constructed by traversing edges, in their temporal order, in the k-hop neighborhood of node v. The shinglevector contains the counts of unique shingles in a graph. Similarity between two graphs is deﬁned as the cosine similarity between their respective shingle vectors. Intuitively, the more the same shingles two graphs contain in common, the more similar they are.
+• Memory-eﬃcient sketches: (§3.2) Number of unique shingles can be arbitrarily large for heterogeneous graphs with hundreds to thousands of node and edge types. As such, we show how to instead use a sketch representation of a graph. Sketches are much smaller (in fact constant-size) vectors, while enabling similarity to be preserved. In other words, similarity of the sketches of two graphs provides a good approximation to their (cosine) similarity with respect to their original shingle vectors.
+• Eﬃcient maintenance of sketches: (§3.3) As new edges arrive, shingle counts of a graph change. As such, the shingle vector entries need to be updated. Recall that we do not explicitly maintain this vector in memory, but rather its (much smaller) sketch. In this paper, we show how to update the sketch of a graph eﬃciently, (i) in constant time and (ii) without incurring any additional memory overhead.
+
+• Clustering graphs (dynamically): (§4) We employ a centroid-based clustering of the graphs to capture normal behavior. We show how to update the clustering as the graphs change and/or as new ones emerge, that again, exhibit small memory footprints.
+• Anomaly detection (in real time): We score an incoming or updated graph by its distance to the closest centroid in the clustering. Based on a distribution of distances for the corresponding cluster, we quantify the signiﬁcance of the score to ﬂag anomalies. Distance computation is based on (ﬁxed size) sketches, as such, scoring is fast for real time detection.
+3. SKETCHING TYPED GRAPHS
+We require a method to represent and compute the similarity between heterogeneous graphs that also captures the temporal order of edges. The graph representation must permit eﬃcient online updates and consume bounded space with new edges arriving in an inﬁnite stream.
+Though there has been much work on computing graph similarity eﬃciently, existing methods fall short of our requirements. Methods that require knowing node correspondence [28, 21] are inapplicable, as are graph kernels that precompute a ﬁxed space of substructures [26, 33, 13] to represent graphs, which is infeasible in a streaming scenario. Methods that rely on global graph metrics [7] cannot accommodate edge order and are also inapplicable. Graph-editdistance-based [9] methods approximate hard computational steps with heuristics that provide no error guarantees, and are hence unsuitable.
+We next present a similarity function for heterogenous graphs that captures the local structure and respects temporal order of edges. The underlying graph representation permits eﬃcient updates as new edges arrive in the stream and consumes bounded space, without needing to compute or store the full space of possible graph substructures.
+3.1 Graph Similarity by Shingling
+Analogous to shingling text documents into k-grams [8] to construct their vector representations, we decompose each graph into a set of k-shingles and construct a vector of their frequencies. The similarity between two graphs is then deﬁned as the cosine similarity between their k-shingle frequency vectors. We formalize these notions below.
+Definition 1 (k-shingle). Given a graph G = (V, E) and node v ∈ V , the k-shingle s(v, k) is a string constructed via a k-hop breadth-ﬁrst traversal starting from v as follows:
+1. Initialize k-shingle as type of node v: s(v, k) = φv. 2. Traverse the outgoing edges from each node in the or-
+der of their timestamps, t. 3. For each traversed edge e having destination w, con-
+catenate the types of the edge and the destination node with the k-shingle: s(v, k) = s(v, k) ⊕ φe ⊕ φw.
+We abbreviate the Ordered k-hop Breadth First Traversal performed during the k-shingle construction deﬁned above as OkBFT. It is important to note that the k-hop neighborhood constructed by an OkBFT is directed.
+Definition 2 (shingle (frequency) vector zG). Given the k-shingle universe S and a graph G = (V, E), let SG = {s(v, k), ∀v ∈ V } be the set of k-shingles of G. zG is a vector of size |S| wherein each element zG(i) is the frequency of shingle si ∈ S in SG.
+
+Shingling is illustrated for two example graphs in Figure 2, along with their corresponding shingle vectors.
+
+<600,o>'
+
+B
+
+D
+
+AxByC BpEoD
+
+zG zG
+
+A
+
+C
+
+A
+
+0 2
+
+D
+
+C
+
+1 1
+
+C E E D 10
+
+<650,r>'
+
+E
+
+1 0
+
+B
+
+A AxByC
+
+BrArA
+
+AxByC 1 1
+
+A
+
+C
+
+BrArA 0 1
+
+A
+
+BpEoD 1 0
+
+C
+
+AA
+
+Figure 2: Shingling: (left) two example graphs with their shingles listed in dashed boxes (for k = 1), (right) corresponding shingle frequency vectors.
+
+The similarity between two graphs G and G is then the cosine similarity between their shingle vectors zG and zG .
+Representing graphs by shingle vectors captures both their local graph structure and edge order. It also permits eﬃcient online updates, since the local nature of k-shingles ensures that only a few shingle vector entries need to be updated for each newcoming edge (§3.3). The parameter k controls the trade-oﬀ between expressiveness and computational efﬁciency. A larger k produces more expressive local neighborhoods, whereas a smaller one requires fewer entries to be updated in the shingle vector per incoming edge.
+
+3.2 Graph Sketches by Hashing
+With a potentially large number of node and edge types, the universe S of k-shingles may explode combinatorially and render it infeasible to store |S|-dimensional shingle vectors for each graph. We now present an alternate constantspace graph representation that approximates the shingle count vector via locality-sensitive hashing (LSH) [18].
+An LSH scheme for a given similarity function enables eﬃcient similarity computation by projecting high-dimensional vectors to a low-dimensional space while preserving their similarity. Examples of such schemes are MinHash [8] for the Jaccard similarity between sets and SimHash [10] for the cosine similarity between real-valued vectors, which we detail further in this section.
+3.2.1 SimHash
+Given input vectors in Rd, SimHash is ﬁrst instantiated with L projection vectors r1, . . . , rL ∈ Rd chosen uniformly at random from the d-dimensional Gaussian distribution. The LSH hrl (z) of an input vector z for a given random projection vector rl, l = 1 . . . , L, is deﬁned as follows:
+
+hr (z) = +1, if z · rl ≥ 0
+
+(1)
+
+l
+
+−1, if z · rl < 0
+
+In other words hrl (z) = sign(z·rl), which obeys the property that the probability (over vectors r1, . . . , rL) that any
+two input vectors zG and zG hash to the same value is proportional to their cosine similarity:
+
+Pl=1...L[hrl (zG) = hrl zG
+
+] = 1 − cos−1( zzGG·zzGG π
+
+) (2)
+
+Since computing similarity requires only these hash values, each d-dimensional input vector z can be replaced with an L-dimensional sketch vector x containing its LSH values,
+
+(1)
+perty two
+ional
+(2)
+ated rtion shed uires tor z con-
+As bits,
+|, we nsion pute
+protors, such, ctors o not
+n sufrawn ional t like nted s per
+main: ) |S| wing y the conypes (and Hash
+|S|ondth L from
+1}. that
+
+l
+vector rl at random from {+1, 1}|S|, with each element
+
+rl(i) equal to the hash value hl(si).
+
+If we overload the “dot-product” operator for an input
+
+vector z and a hash function hl as follows:
+
+X
+
+y(lr)1 =…z · rhLl =
+
+zG(i)hl(si), l = 1 . . . L (4)
+
+1 +1 ... -1 i=A1,...,|S| 0
+
+yG(l) = zG · rl
+
+we ca…n de-1ﬁne…th+e1 LSHC gh (z) 1of the inpuxtG(vle)c=torsigfonr(ytGh(el))
+
+given …hash-1fun…cti-o1n
+
+l
+simDilar to
+
+E1 q.
+
+(1):
+
+yG
+
+xG
+
+… +1 … +1 E(
+
+1
+
+1 -4 + 1 = -3 sign(-3) = -1
+
+…
+
+-1
+
+… +1 AxB+yC1, gh (z) =
+
+i1f z · hl…
+
+0
+
+…
+
+…
+(5)
+
+… +1 … +l1 BrArA1, i0f z · hl…< 0 …
+
+…
+
+|S| -1 … -1
+
+BpEoD 1
+
+L -2 + 3 = +1 sign(+1) = +1
+
+The y vector is called the projection vector of a graph.
+
+EacFh iegnutrrye y3(:l)Seksestenchtiianllgy: h(olledfst)thLe sruamndoofmtheveccoutonrtss,o(f censhintgelres) tshhaitnmglaepvteoc+to1rbzyGhol,f mgrinaupshthGe,s(urmighoft)thceocroruenstpsondof shiningglpesrothjeacttmioanp vtoect1orbyyGhl.and sketch vector xG.
+The L-bit sketch can then be constructed for each input
+
+vectio.er.,z xby=x [=hrs1i(gzn),(y. .).a, nhdrLu(sze)d]. toAcsomsupcuht,eesaimchilaskriettychthveector
+
+samceanwabyearseipnreSsiemnHteadshw.itUhnjluikset SLimbHitas,shw,htehreesekaectchhebsitincorre-
+
+StrsepaomnHdsatsoh acavnablueecionns{t+ru1c,t−ed1}a.nd maintained incremen-
+
+tally (T§3h.e3)s,imasilaarrietsyulbteotfwweehnicthw, oweinnpoutlovnegcetronrseetdhetno kcannowbe es-
+
+the tciommapteledtebsyheinmgpleiruicnaivlleyrseevaSluoartminagintthaeinpr|Sob|-adbimilietnysinonEaql . (2) randaosmthveepcrtooprsorintiomneomfohrays. h values that the input vectors agree
+CohnowoshiennghHas.hWedewreitqhuiLre raanfadmomilyvtehcattoriss.uTnihfoartmis:, for a
+
+given shingle, hassihmv(aGlu,eGs i)n∝{+|{1l, : x1}G(alr)e=eqxuGipr(ol)b}a|ble over (3) all hash functions in the family (formalizLed in Eq. (3)).
+
+To dInisaslulomwmtarirvyi,algliyveunniafortmargfaetmdiliiemsesnuscihonaaslitHy =L {8s |2S|, we S : cha1n(sre)p=res+en1t, eha2c(hsg) r=aph G1}w, iwthe aalsskoetrcehquviercetoeracohf dhiamshension funcLt,iodnisicnatrhdetfhaem|iSly|-dtoimbeenusnioinfoarlms:hifnogr lae gvievcetnorhsaashndfucnocm- pute tions,imhaislahrivtayluienstihnis{+ne1w, v1e}ctaorre sepqauciper.obable over all shin-
+
+gles in the universe:
+3.2.2 Simpliﬁed SimHash
+NProst2eSt[hha(ts)w=e n+e1e]d=toPprse2rfSo[rhm(s)th=e sa1m],e8shet2ofHr.and(o6m) pro-
+
+Tjoecftuirotnhseronditshalelocwhaunngiifnogrmorfanmewilileys ewmitehrgcinorgreslhaitnegdleuvnei-ctors,
+
+formwihtahshthfeunacrrtivoanls osfucnhewaseHdge=s a{hn1d(/so)r, nhe2w(s)gr=aphhs.1(As)s}such, (whweree who1uilsdsonmeeedutnoifmoraminhtaaisnh tfhuencsteiotno)f, Lweprreoqjuecirteiohnasvhectors funcintiomnasiinnmtheemfoarmyil(yfotronboewp, alairtweriswe-einwdielpl esnhdoewntt:hat we do not
+need them explicitly). In 8psra, sc0ti2ceS, tsh.et.rsan6=dosm0 apndro8jetc, tti0o2n {v+ec1t,ors1}r,l’s remain suf-
+
+ﬁciPenrthl2yHr[ahn(sd0o)m= wt0h|he(ns)ea=cht] o=f Pthrehi2rH|S[h|(se0l)em=etn0t].s are(7d)rawn uniformly from {+1, −1} instead of from a |S|-dimensional
+
+AGfaumsisliyansadtistfyribnugttiohne [a3f1o]r.emWeintthiotnheisdspimroppleiﬁrtciaetsioisn,sajuidst like
+
+to btehestsroknetgclyheusn, ievaecrhsapl r[o3j6e]c. tion vector can also be represented
+
+Fuorsinougr|Ssc|ebnitasr,ior,atwheeratdhoapnt 3a2f∗as|St |imbiptsle(maessnutamtionng 4ofbtyhtees per
+
+stroﬂnogalyt)u, nfuivretrhsearl smauvlitniglinsepaarcfea.mily for strings [23]. In this
+
+familyF, iagnurinep3utillsutrsitnrgatsesisthdeivideda ibnethoinndcoskmeptcohnienngts(f(ogrenn-ow in
+
+eraltizhiengst“acthicarcaacste)rs. ”)Gaivsesn=|Ss|-1dsi2m. .e.nssnio,naanldrahnadshoemd rulsivnegctors,
+
+n raln=dom1 . n. .uLm,bweristhme1l,e.m. .e,nmtsninas{f+ol1lo,w−s1: } (left) and a shingle vector zG (center), the L-dX inmensional sketch xG is obtained by taking the shi(gsn)o=f tmhe1 d+ot promdiu+c1tsio.f z with each rl((8r)ight). However, three main shortcomings of SimHash remain: (1) it requires explicit projie=c1tion vectors in memory, (2) |S|
+
+Tchauns,stihlel gheatshprvoahliubeitfiovrelay slahringeg,leansdof(3le)nigttrheq|su|irceasnkbneowing
+
+comtphuetesdizeinof⇥t(h|se|)cotimmpel.etIef s|sh|imnagxleisunthiveermseax|iSm|utmo sppoescsif-y the
+
+ble dleimngetnhsiofn aofsheiancghler,aenadcohmhavsehctofur.ncWtiointhisnerweprsehsienngtleeds con-
+
+tinuously being formed from the new node and edge types
+
+arriving in the stream, the complete shingle universe (and
+
+hence its size) always remains unknown. As such, SimHash
+
+as proposed cannot be applied in a streaming setting.
+
+3.2.3 StreamHash
+To resolve the issues with SimHash for the streaming setting, we propose StreamHash which, rather than L |S|dimensional random bit vectors (with entries corresponding to {+1, −1} as described above), is instead instantiated with L hash functions h1, . . . , hL picked uniformly at ran-
+
+dom from a family H of hash functions, mapping shingles to {+1, −1}. That is, a h ∈ H is a deterministic function that maps a ﬁxed/given shingle s to either +1 or −1.
+Properties of H. We require a family that exhibits three key properties; uniformity w.r.t. both shingles and hash functions, and pairwise-independence, as described below.
+First, it should be equally probable for a given shingle to hash to +1 or −1 over all hash functions in the family:
+Prh∈H[h(s) = +1] = Prh∈H[h(s) = −1], ∀s ∈ S. (4)
+Second, to disallow trivially uniform families such as H = {∀s ∈ S : h1(s) = +1, h2(s) = −1}, we also require that for a given hash function, hash values in {+1, −1} are equiprobable over all shingles in the universe:
+Prs∈S[h(s) = +1] = Prs∈S[h(s) = −1], ∀h ∈ H. (5)
+To further disallow uniform families with correlated uniform hash functions such as H = {h1(s), h2(s) = −h1(s)} (where h1 is some uniform hash function), we require the hash functions in the family to be pairwise-independent:
+∀s, s ∈ S s.t. s = s and ∀t, t ∈ {+1, −1},
+Prh∈H[h(s ) = t |h(s) = t] = Prh∈H[h(s ) = t ]. (6)
+If the shingle universe is ﬁxed and known, picking a hash function hl at random from H is equivalent to picking some vector rl at random from {+1, −1}|S|, with each element rl(i) equal to the hash value hl(si).
+If we overload the “dot-product” operator for an input vector z and a hash function hl as follows:
+
+y(l) = z · hl =
+
+z(i)hl(si), l = 1 . . . L (7)
+
+i=1,...,|S|
+
+we can deﬁne the LSH ghl (z) of the input vector z for the given hash function similar to Eq. (1):
+
+gh (z) = +1, if z · hl ≥ 0
+
+(8)
+
+l
+
+−1, if z · hl < 0
+
+The y vector is called the projection vector of a graph. Each entry y(l) as given in Eq. (7) essentially holds the sum of the counts of shingles that map to +1 by hl minus the sum of the counts of shingles that map to −1 by hl.
+The L-bit sketch can then be constructed for each input vector z by x = sign(y) and used to compute similarity the same way as in SimHash. Unlike SimHash, the sketches in StreamHash can be constructed and maintained incrementally (§3.3), as a result of which, we no longer need to know the complete shingle universe S or maintain |S|-dimensional random vectors in memory.
+Choosing H. A family satisfying the aforementioned three properties is said to be strongly universal [35].
+For our scenario, we adopt a fast implementation of the strongly universal multilinear family for strings [22]. In this family, an input string s (i.e., shingle) is divided into |s| components (i.e., “characters”) as s = c1c2 . . . c|s|. A hash function hl is constructed by ﬁrst choosing |s| random numbers m(1l), . . . , m|(sl)| and then hashing s as follows:
+|s|
+hl(s) = 2 ∗ (m(1l) + m(il) ∗ int(ci)) mod 2 − 1. (9)
+i=2
+where int(ci) is the ASCII value of character ci and hl(s) ∈
+
+{+1, −1}. Note that the hash value for a shingle s of length |s| can be computed in Θ(|s|) time.
+We represent each hash function by |s|max random numbers, where |s|max denotes the maximum possible length of a shingle. These numbers are ﬁxed per hash function hl, as it is a deterministic function that hashes a ﬁxed/given shingle to the same value each time. In practice, L hash functions can be chosen uniformly at random from this family by generating L ∗ |s|max uniformly random 64-bit integers using a pseudorandom number generator.
+Merging sketches. Two graphs G and G will merge if an edge arrives in the stream having its source node in G and destination node in G , resulting in a graph that is their union G∪G . The centroid of a cluster of graphs is also represented by a function of their union (§4). Both scenarios require constructing the sketch of the union of graphs, which we detail in this subsection.
+The shingle vector of the union of two graphs G and G is the sum of their individual shingle vectors:
+
+zG∪G = zG + zG .
+
+(10)
+
+As we show below, the projection vector of the union of
+two graphs yG∪G also turns out to be the sum of their individual projection vectors yG and yG ; ∀l = 1, . . . , L:
+
+yG∪G (l) = zG∪G · hl
+
+(by Eq. (7))
+
+=
+
+(zG(i) + zG (i)) hl(si) (by Eq. (10))
+
+i=1,...,|S|
+
+=
+
+zG(i)hl(si) +
+
+zG (i)hl(si)
+
+i=1,...,|S|
+
+i=1,...,|S|
+
+= yG(l) + yG (l).
+
+(11)
+
+Hence, the L-bit sketch of G ∪ G can be computed as
+xG∪G = sign(yG + yG ). This can trivially be extended to construct the sketch of the union of any number of graphs.
+
+3.3 Maintaining Sketches Incrementally
+We now describe how StreamHash sketches are updated on the arrival of a new edge in the stream. Each new edge being appended to a graph gives rise to a number of outgoing shingles, which are removed from the graph, and incoming shingles, which are added to the graph. These shingles are constructed by OkBFT traversals from certain nodes of the graph, which we detail further in this section.
+Let e(u, v) be a new edge arriving in the stream from node u to node v in some graph G. Let xG be the L-bit sketch vector of G. We also associate with each graph a lengthL projection vector yG, which contains “dot-products” (Eq. (7)) for the hash functions h1, . . . , hL. For an empty graph, yG = 0 and xG = 1 since z(i)’s are all zero.
+For a given incoming shingle si, the corresponding z(i) implicitly1 increases by 1. This requires each element of the projection vector yG(l) to be updated by simply adding the corresponding hash value hl(si) ∈ {+1, −1} due to the nature of the dot-product in Eq. (7). Updating yG for an outgoing shingle proceeds similarly but by subtracting the hash values. For each element yG(l) of the projection vector that is updated and that changes sign, the corresponding bit of the sketch xG(l) is updated using the new sign (Eq. (8)). Updating the sketch for an incoming or outgoing shingle s is formalized by the following update equations. ∀l = 1, . . . , L:
+91As we do not maintain the shingle vector z’s explicitly.
+
+yG(l) = yG(l) + hl(s), if s an incoming shingle (12) yG(l) − hl(s), if s an outgoing shingle
+
+xG(l) = sign(yG(l)).
+
+(13)
+
+Now that we can update the sketch (using the updated projection vector) of a graph for both incoming and outgoing shingles, without maintaining any shingle vector explicitly, we need to describe the construction of the incoming and outgoing shingles for a new edge e.
+Appending e to the graph updates the shingle for every node that can reach e’s destination node v in at most k hops, due to the nature of k-shingle construction by OkBFT. For each node w to be updated, the incoming shingle is constructed by an OkBFT from w that considers e during traversal, and the outgoing shingle is constructed by an OkBFT from w that ignores e during traversal. In practice, both shingles can be constructed by a single modiﬁedOkBFT from w parameterized with the new edge.
+Since the incoming shingle for a node may be the outgoing shingle for another, combining and further collapsing the incoming and outgoing shingles from all the updated nodes will enable updating the sketch while minimizing the number of redundant updates.
+
+3.4 Time and Space Complexity
+Time. Since sketches are constructed incrementally (§3.3), we evaluate the running time for each new edge arriving in the stream. This depends on the largest directed k-hop neighborhood possible for the nodes in our graphs. Since the maximum length of a shingle |s|max is proportional to the size of this neighborhood, we specify the time complexity in terms of |s|max.
+A new edge triggers an update to O(|s|max) nodes, each of which results in an OkBFT that takes O(|s|max) time. Thus, it takes O(|s|2max) time to construct the O(|s|max) incoming and outgoing shingles for a new edge. Hashing each shingle takes O(|s|max) time (§3.2.3) resulting in a total hashing time of O(|s|2max). Updating the projection vector elements and bits in the sketch takes O(L) time.
+This leads to an overall sketch update time of O(L+|s|2max) per edge. Since L is a constant parameter and |s|max depends on the value of the parameter k, the per-edge running time can be controlled.
+Space. Each graph (of size at most |G|max) with its sketch and projection vectors consumes O(L+|G|max) space.2 However, the number of graphs in the stream is unbounded, as such the overall space complexity is dominated by storing graphs. Hence, we deﬁne a parameter N to limit the maximum number of edges we retain in memory at any instant. Once the total number of edges in memory exceeds N , we evict the oldest edge incident on the least recently touched node. The rationale is that nodes exhibit locality of reference by the edges in the stream that touch them (i.e., that have them as a source or destination). With up to N edges, we also assume a constant number c of graphs is maintained and processed in memory at any given time.
+The total space complexity is then O(cL + N ) which can also be controlled. Speciﬁcally, we choose N proportional to the available memory size, and L according to the required quality of approximation of graph similarity.
+
+92Note that the projection vector holds L positive and/or negative integers, and the sketch is a length-L bit vector.
+
+4. ANOMALY DETECTION
+Bootstrap Clusters. StreamSpot is ﬁrst initialized with bootstrap clusters obtained from a training dataset of benign ﬂow-graphs. The training graphs are grouped into K clusters using the K-medoids algorithm, with K chosen to maximize the silhouette coeﬃcient [32] of the resulting clustering. This gives rise to compact clusters that are wellseparated from each other. An anomaly threshold for each cluster is set to 3 standard deviations greater than the mean distance between the cluster’s graphs and medoid. This threshold is derived from Cantelli’s inequality [15] with an upper-bound of 10% on the false positive rate.
+Provided the bootstrap clusters, StreamSpot constructs StreamHash projection vectors for each training graph, and constructs the projection vector of the centroid of each cluster as the average of the projection vectors of the graphs it contains. In essence, the centroid of a cluster is the “average graph” with shingle vector counts formed by the union (§3.2.3) of the graphs it contains divided by the number of graphs. The sketch of each centroid is then constructed and the bootstrap graphs are discarded from memory.
+Streaming Cluster Maintenance. Apart from the cluster centroid sketches and projection vectors, we maintain in memory the number of graphs in each cluster and, for each observed and unevicted graph, its anomaly score and assignment to either one of K clusters or an “attack” class. Each new edge arriving at a graph G updates its sketch xG and projection vector yG to xG and yG respectively (§3.3). xG is then used to compute the distance of G to each cluster centroid. Let Q be the nearest cluster to G, of size |Q| and with centroid sketch xQ and centroid projection vector yQ.
+If G was previously unassigned to any cluster and the distance of G to Q is lesser than its corresponding cluster threshold, then G is assigned to Q and its size and projection vector are updated ∀l = 1, . . . , L as:
+
+yQ(l) = yQ(l) × |Q| + yG(l) , |Q| = |Q| + 1 . (14) |Q| + 1
+
+If the graph was previously already assigned to Q, its size remains the same and its projection vector is updated as:
+
+yQ(l) = yQ(l) + yG(l) − yG(l) .
+
+(15)
+
+|Q|
+
+If the graph was previously assigned to a diﬀerent cluster R = Q, Q is updated using Eq. 14 and the size and projection vector of R are updated as:
+
+yR(l) = yR(l) × |R| − yG(l) , |R| = |R| − 1 . (16) |R| − 1
+
+If the distance from G to Q is greater than its corresponding cluster threshold, G is removed from its assigned cluster (if any) using Eq. (16) and assigned to the “attack” class. In all cases where the projection vector of Q (or R) is updated, the corresponding sketch is also updated as:
+
+xQ(l) = sign(yQ(l)), ∀l = 1, . . . , L.
+
+(17)
+
+Finally, the anomaly score of G is computed as its distance to Q after Q’s centroid has been updated.
+Time and Space Complexity. With K clusters and L-bit sketches, ﬁnding the nearest cluster takes O(KL) time and computing the graph’s anomaly score takes O(L) time. Adding a graph to (Eq. (14)), removing a graph from (Eq.
+
+(16)) and updating (Eq. (15)) a cluster each take O(L) time, leading to a total time complexity of O(KL) per-edge.
+With a maximum of c graphs retained in memory by limiting the maximum number of edges to N (§3.4), storing cluster assignments and anomaly scores each consume O(c) space. The centroid sketches and projection vectors each consume O(KL) space, leading to a total space complexity of O(c + KL) for clustering and anomaly detection.
+5. EVALUATION
+Datasets. Our datasets consist of ﬂow-graphs derived from 1 attack and 5 benign scenarios. The benign scenarios involve normal browsing activity, speciﬁcally watching YouTube, downloading ﬁles, browsing cnn.com, checking Gmail, and playing a video game. The attack involves a drive-by download triggered by visiting a malicious URL that exploits a Flash vulnerability and gains root access to the visiting host. For each scenario, Selenium Remote Control3 was used to automate the execution of a 100 tasks. All system calls on the machine from the start of a task until its termination were traced and used to construct the ﬂowgraph for that task. These ﬂow-graphs were compiled into 3 datasets, the properties of which are shown in Table 1.
+Experiment Settings. We evaluate StreamSpot in the following settings:
+(1) Static: We use p% of all the benign graphs for training, and the rest of the benign graphs along with the attack graphs for testing. We ﬁnd an oﬄine clustering of the training graphs and then score and rank the test graphs based on this clustering. Graphs are represented by their shingle vectors and all required data is stored in memory. The goal is to quantify the eﬀectiveness of StreamSpot before introducing approximations to optimize for time and space.
+(2) Streaming: We use p% of the benign graphs for training to ﬁrst construct a bootstrap clustering oﬄine. This is provided to initialize StreamSpot, and the test graphs are then streamed in and processed online one edge at a time. Hence, test graphs may be seen only partially at any given time. For each edge, StreamSpot updates the corresponding graph sketch, clusters, cluster assignments and anomaly scores, and a snapshot of the anomaly scores is retained every 10,000 edges for evaluation. StreamSpot is also evaluated under memory constraints by limiting the sketch size and maximum number of stored edges.
+5.1 Static Evaluation
+We ﬁrst cluster the training graphs based on their shinglevector similarity. Due to the low diameter and large outdegree exhibited by ﬂow-graphs, the shingles obtained tend to be long (even for k = 1), and similar pairs of shingles from two graphs diﬀer only by a few characters; this results in most pairs of graphs appearing dissimilar.
+To mitigate this, we ‘chunk’ each shingle by splitting it into ﬁxed-size units. The chunk length parameter C controls the inﬂuence of graph structure and node type frequency on the pairwise similarity of graphs. A small C reduces the effect of structure and relies on the frequency of node types, making most pairs of graphs similar. A large C tends to make pairs of graphs more dissimilar. This variation is evident in Figure 4, showing the pairwise-distance distributions for diﬀerent chunk lengths.
+93www.seleniumhq.org/projects/remote-control/
+
+Table 1: Dataset summary: Training scenarios and test edges (attack + 25% benign graphs).
+
+Dataset Scenarios
+
+# Graphs Avg. |V| Avg. |E| # Test Edges
+
+YDC
+
+YouTube, Download, CNN
+
+300
+
+GFC
+
+GMail, VGame, CNN
+
+300
+
+ALL
+
+YouTube, Download, CNN, GMail, VGame
+
+500
+
+8705 8151 8315
+
+239648 148414 173857
+
+21,857,899 13,854,229 24,826,556
+
+Fraction of All Pairs Fraction of All Pairs Fraction of All Pairs
+
+0.5
+
+0.4
+
+Chunk Length 5 Chunk Length 200
+
+0.3
+
+0.2
+
+0.1
+
+0.00.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 Pairwise (Cosine) Distance
+
+0.5
+
+0.4
+
+Chunk Length 5 Chunk Length 200
+
+0.3
+
+0.2
+
+0.1
+
+0.00.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 Pairwise (Cosine) Distance
+
+0.5
+
+0.4
+
+Chunk Length 5 Chunk Length 200
+
+0.3
+
+0.2
+
+0.1
+
+0.00.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 Pairwise (Cosine) Distance
+
+(a) YDC
+
+(b) GFC
+
+(c) ALL
+
+Figure 4: Distribution of pairwise cosine distances
+
+for diﬀerent values of chunk lengths.
+
+We aim to choose a C that neither makes all pairs of graphs too similar or dissimilar. Figure 5 shows the entropy of pairwise-distances with varying C for each dataset. At the point of maximum entropy, the distances are near-uniformly distributed. A “safe region” to choose C is near and to the right of this point; intuitively, this C suﬃciently diﬀerentiates dissimilar pairs of graphs, while not aﬀecting similar ones. For our experiments, we pick C = 25, 100, 50 respectively for YDC, GFC, and ALL. After ﬁxing C, we cluster the training graphs with K-medoids and pick K with the maximum silhouette coeﬃcient for the resulting clustering; respectively K = 5, 5, 10 for YDC, GFC, and ALL.
+
+Entropy Entropy
+
+2.4 2.2 2.0 1.8 1.6 1.4 1.2 1.05 10 25 50 100 150 200
+Chunk Length
+
+2.4 2.2 2.0 1.8 1.6 1.4 1.2 1.05 10 25 50 100 150 200
+Chunk Length
+
+(a) YDC
+
+(b) GFC
+
+(c) ALL
+
+Figure 5: Variation in entropy of the pairwise cosine
+
+distance distribution. (p = 75%)
+
+To validate our intuition for picking C, Figure 6 shows a heatmap of the average precision obtained after clustering and anomaly-ranking on the test data (the attack and remaining 25% benign graphs), for varying C and K. We can see that for our chosen C and K, StreamSpot achieves near-ideal performance. We also ﬁnd that the average precision appears robust to the number of clusters when chunk length is chosen in the “safe region”.
+
+10
+
+1.00
+
+9 8
+
+0.96
+
+7 6
+
+0.92
+
+5 4
+
+0.88
+
+3
+
+2
+
+0.84
+
+5 10 25 50 100 150 200
+
+Chunk Length
+
+10 9
+
+0.96
+
+8 7
+
+0.88
+
+6
+
+5
+
+0.80
+
+4
+
+3 2
+
+0.72
+
+5 10 25 50 100 150 200
+
+Chunk Length
+
+10 9
+
+0.96
+
+8 7
+
+0.88
+
+6 5
+
+0.80
+
+4 3
+
+0.72
+
+2
+
+5 10 25 50 100 150 200
+
+Chunk Length
+
+(a) YDC
+
+(b) GFC
+
+(c) ALL
+
+Figure 6: Average precision for diﬀerent chunklength C and number of clusters K. (p = 75%)
+
+To quantify anomaly detection performance in the static setting, we set p = 25% of the data as training and cluster the training graphs based on their shingle vectors, following the aforementioned steps to choose C and K. We then score each test graph by its distance to the closest centroid in the
+
+Metric
+
+TPR
+
+Precision
+
+clustering. This gives us a ranking of the test graphs, based on which we plot the precision-recall (PR) and ROC curves. The curves (averaged over 10 independent random samples) for all the datasets are shown in Figure 7. We observe that even with 25% of the data, static StreamSpot is eﬀective in correctly ranking the attack graphs and achieves an average precision (AP, area under the PR curve) of more then 0.9 and a near-ideal AUC (area under ROC curve).
+
+1.0 0.9 0.8 0.7 0.6 0.05.0 0.2 0.4 0.6 0.8 1.0
+Recall
+
+Precision
+
+1.0 0.9 0.8 0.7 0.6 0.05.0 0.2 0.4 0.6 0.8 1.0
+Recall
+
+Precision
+
+1.0 0.9 0.8 0.7 0.6 0.05.0 0.2 0.4 0.6 0.8 1.0
+Recall
+
+1.0 0.9 0.8 0.7 0.6 0.05.0 0.2 0.4 0.6 0.8 1.0
+FPR
+
+TPR
+
+1.0 0.9 0.8 0.7 0.6 0.05.0 0.2 0.4 0.6 0.8 1.0
+FPR
+
+TPR
+
+1.0 0.9 0.8 0.7 0.6 0.05.0 0.2 0.4 0.6 0.8 1.0
+FPR
+
+(a) YDC
+
+(b) GFC
+
+(c) ALL
+
+Figure 7: (top) Precision-Recall (PR) and (bottom) ROC curves averaged over 10 samples. (p = 25%)
+
+Finally, in Figure 8 we show how the AP and AUC change as the training data percentage p is varied from p = 10% to p = 90%. We note that with suﬃcient training data, the test performance reaches an acceptable level for GFC.
+
+1.0
+
+0.9
+
+0.8
+
+0.7
+
+0.6
+
+Average Precision AUC
+
+0.50.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
+
+Training Data Fraction
+
+Metric
+
+1.0
+
+0.9
+
+0.8
+
+0.7
+
+0.6
+
+Average Precision AUC
+
+0.50.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
+
+Training Data Fraction
+
+Metric
+
+1.0
+
+0.9
+
+0.8
+
+0.7
+
+0.6
+
+Average Precision AUC
+
+0.50.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
+
+Training Data Fraction
+
+(a) YDC
+
+(b) GFC
+
+(c) ALL
+
+Figure 8: AP and AUC with varying training % p.
+
+The results in this section demonstrate a proof of concept that our proposed method can eﬀectively spot anomalies provided oﬄine data and unbounded memory. We now move on to testing StreamSpot in the streaming setting, for which it was designed.
+
+5.2 Streaming Evaluation
+We now show that StreamSpot remains both accurate in detecting anomalies and eﬃcient in processing time and memory usage in a streaming setting. We control the number of graphs that arrive and grow simultaneously with parameter B, by creating groups of B graphs at random from the test graphs, picking one group at a time and interleaving the edges from graphs within the group to form the stream. In all experiments, 75% of the benign graphs where used for bootstrap clustering. Performance metrics are computed on the instantaneous anomaly ranking every 10,000 edges.
+Detection performance. Figure 10 shows the anomaly detection performance on the ALL dataset, when B = 20
+
+Number of Clusters Number of Clusters Number of Clusters
+
+1.0
+
+1.0
+
+1.0
+
+0.8
+
+0.8
+
+0.8
+
+Metric Metric Metric
+
+0.6
+
+0.6
+
+0.6
+
+0.4 Accuracy
+
+0.2
+
+AUC
+
+AP
+
+0.00 5 10 15 20
+
+Edges Seen (millions)
+
+0.4 Accuracy
+
+0.2
+
+AUC
+
+AP
+
+0.00
+
+5
+
+10
+
+Edges Seen (millions)
+
+0.4 Accuracy
+
+0.2
+
+AUC
+
+AP
+
+0.00 5 10 15 20
+
+Edges Seen (millions)
+
+(a) YDC
+
+(b) GFC
+
+(c) ALL
+
+Figure 9: Performance of StreamSpot at diﬀerent instants of the stream for all datasets (L = 1000).
+
+Metric Metric
+
+1.0
+
+1.0
+
+0.8
+
+0.8
+
+0.6
+
+0.6
+
+0.4 Accuracy 0.4 Accuracy
+
+0.2
+
+AUC
+
+0.2
+
+AUC
+
+AP
+
+AP
+
+0.00 5 10 15 20
+
+0.00 5 10 15 20
+
+Edges Seen (millions)
+
+Edges Seen (millions)
+
+Figure 10: StreamSpot performance on ALL (measured at every 10K edges) when (left) B = 20 graphs and (right) B = 100 graphs arrive simultaneously.
+
+graphs grow in memory simultaneously (left) as compared to B = 100 graphs (right). We make the following observations: (i) The detection performance follows a trend, with periodic dips followed by recovery. (ii) Each dip corresponds to the arrival of a new group of graphs. Initially, only a small portion of the new graphs are available and the detection performance is less accurate. However, performance recovers quickly as the graphs grow; the steep surges in performance in Figure 10 imply a small anomaly detection delay. (iii) The average precision after recovery indicates a near-ideal ranking of attack graphs at the top. (iv) The dips become less severe as the clustering becomes more ‘mature’ with increasing data seen; this is evident in the general upward trend of the accuracy. (v) The accuracy loss is not due to the ranking (since both AP and AUC remain high) but due to the chosen anomaly thresholds derived from the bootstrap clustering, where the error is due to false negatives.
+Similar results hold for B = 50 as shown in Figure 9 (c) for ALL, and (a) and (b) for YDC and GFC respectively.
+Sketch size. Figures 9 and 10 show StreamSpot’s performance for sketch size L = 1000 bits. When compared to the number of unique shingles |S| in each dataset (649,968, 580,909 and 1,106,684 for YDC, GFC and ALL ), sketching saves considerable space. Reducing the sketch size saves further space but increases the error of cosine distance approximation. Figure 11 shows StreamSpot’s performance on ALL for smaller sketch sizes. Note that it performs equally well for L = 100 (compared to Fig. 9(c)), and reasonably well even with sketch size as small as L = 10.
+Memory limit. Now we investigate StreamSpot’s performance by limiting the memory usage using N : the maximum number of allowed edges in memory at any given time. Figures 12 (a)–(c) show the performance when N is limited to 15%, 10%, and 5% of the incoming stream of ∼25M edges,
+
+Metric
+
+Metric
+
+1.0
+
+0.8
+
+0.6
+
+0.4 Accuracy
+
+0.2
+
+AUC
+
+AP
+
+0.00 5 10 15 20
+
+Edges Seen (millions)
+
+(a) L = 100
+
+Metric
+
+1.0
+
+0.8
+
+0.6
+
+0.4 Accuracy
+
+0.2
+
+AUC
+
+AP
+
+0.00 5 10 15 20
+
+Edges Seen (millions)
+
+(b) L = 10
+
+Figure 11: Performance of StreamSpot on ALL for diﬀerent values of the sketch size.
+
+1.0
+
+1.0
+
+0.9
+
+0.9
+
+Metric
+
+0.8
+
+0.8
+
+0.7
+
+AP
+
+0.7
+
+0.6
+
+AUC
+
+0.6
+
+Accuracy
+
+0.510 100 500 1000 1500 2000 0.15.25
+
+Sketch Size
+
+AP AUC Accuracy 2.5 3.75 6.25 12.5 Edge limit (millions)
+
+Figure 13: StreamSpot performance on ALL with increasing (left) sketch size L and (right) memory limit N .
+
+on ALL (with B = 100, L = 1000). The overall performance
+
+decreases only slightly as memory is constrained. The detec-
+
+tion delay (or the recovery time) increases, while the speed
+
+and extent of recovery decays slowly. This is expected, as
+
+with small memory and a large number of graphs growing
+
+simultaneously, it takes longer to observe a certain fraction
+
+of a graph at which eﬀective detection can be performed.
+
+These results indicate that StreamSpot continues to
+
+perform well even with limited memory. Figure 13 shows
+
+performance at the end of the stream with (a) increasing
+
+sketch size L (N ﬁxed at 12.5M edges) and (b) increasing
+
+memory limit N (L ﬁxed at 1000). StreamSpot is robust
+
+to both parameters and demonstrates stable performance
+
+across a wide range of their settings.
+
+Running time.
+
+To evaluate the scalability of
+
+StreamSpot for high-volume streams, we measure its per-
+
+edge running time on ALL for sketch sizes L = 1000, 100
+
+and 10 averaged over the stream of ∼25M edges, in Figure 14
+
+(left). Each incoming edge triggers four operations: updat-
+
+ing the graph adjacency list, constructing shingles, updating
+
+the sketch/projection vector and updating the clusters. We
+
+observe that the running time is dominated by updating
+
+1.0
+
+1.0
+
+1.0
+
+0.8
+
+0.8
+
+0.8
+
+Metric Metric Metric
+
+0.6
+
+0.6
+
+0.6
+
+0.4 Accuracy
+
+0.2
+
+AUC
+
+AP
+
+0.00 5 10 15 20
+
+Edges Seen (millions)
+
+(a) Limit = 15%
+
+0.4 Accuracy
+
+0.2
+
+AUC
+
+AP
+
+0.00 5 10 15 20
+
+Edges Seen (millions)
+
+(b) Limit = 10%
+
+0.4 Accuracy
+
+0.2
+
+AUC
+
+AP
+
+0.00 5 10 15 20
+
+Edges Seen (millions)
+
+(c) Limit = 5%
+
+Figure 12: Performance of StreamSpot on ALL (L = 1000), for diﬀerent values of the memory limit N (as a fraction of the number of incoming edges).
+
+Runtime (microseconds)
+Frequency (millions of edges)
+
+sketches (hashing strings), but the total running time per edge is under 70 microseconds when L = 1000 (also see Fig. 14 (right)). Thus, StreamSpot can scale to process more than 14,000 edges per second. For L = 100, which produces comparable performance (see Fig. 11 (a)), it can further scale to over 100,000 edges per second.
+
+70
+
+50
+
+Sketch Update Cluster Update
+
+30
+
+Graph Update
+
+10
+
+Shingle Construction
+14
+
+1.0
+
+12 10
+
+8
+
+0.5
+
+6
+
+4
+
+1000 100
+
+10
+
+Sketch Size (bits)
+
+2 00 50 100 500 1000 1500 3000 Per-edge Sketch Update Time (microseconds)
+
+Figure 14: (left) Average runtime of StreamSpot per edge, for various sketch sizes on ALL. (right) Distribution of sketch processing times for ∼25M edges.
+
+Memory usage. Finally, we quantify the memory usage of StreamSpot. Table 2 shows the total memory consumed for ALL by graph edges (MG) in mb’s and by projection and sketch vectors (MY , MX ) in kb’s, with increasing N (the maximum number of edges stored in memory). We also mention the number of graphs retained memory at the end of the stream. Note that MG grows proportional to N , and MY is 32 times MX , since projection vectors are integer vectors of the same length as sketches. Overall, StreamSpot’s memory consumption for N = 12.5M and L = 1000 is as low as 240 mb, which is comparable to the memory consumed by an average process on a commodity machine.
+
+Table 2: StreamSpot memory use on ALL (L = 1000). |G|: ﬁnal # graphs in memory. Memory used by MG: graphs, MY : projection vectors, MX : sketches
+
+N |G|
+
+MG
+
+MY
+
+MX
+
+1.25 m 8 2.5 m 29
+3.75 m 42 6.25 m 56 12.5 m 125
+
+23.84 mb 47.68 mb 71.52 mb 119.20 mb 238.41 mb
+
+31.25 kb 113.28 kb 164.06 kb 218.75 kb 488.28 kb
+
+0.98 kb 3.54 kb 5.13 kb 6.84 kb 15.26 kb
+
+In summary, these results demonstrate the eﬀectiveness as well as the time and memory-eﬃciency of StreamSpot.
+
+6. RELATED WORK
+Our work is related to a number of areas of study, including graph similarity, graph sketching and anomaly detection in streaming and typed graphs, which we detail further in this section.
+Graph similarity. There exists a large body of work on graph similarity, which can be used for various tasks including clustering and anomaly detection. Methods that require knowing the node correspondence between graphs are inapplicable to our scenario, as are methods that compute a vector of global metrics [7] for each graph (such as the average properties across all nodes), since they cannot take into account the temporal ordering of edges.
+Graph-edit-distance (GED) [9] deﬁnes the dissimilarity between two graphs as the minimum total cost of operations required to make one graph isomorphic to the other. However, computing the GED requires ﬁnding an inexact matching between the two graphs that has minimum cost. This is known to be NP-hard and frequently addressed by localsearch heuristics [20] that provide no error bound.
+Graph kernels [26, 33, 13] decompose each graph into a set of local substructures and the similarity between two graphs is a function of the number of substructures they have in common. However, these methods require knowing a ﬁxed universe of the substructures that constitute all the input graphs, which is unavailable in a streaming scenario.
+Heterogeneous/typed graphs. An early method [27] used an information-theoretic approach to ﬁnd anomalous node-typed graphs in a large static database. The method used the SUBDUE [11] system to ﬁrst discover frequent substructures in the database in an oﬄine fashion. The anomalies are then graphs containing only a few of the frequent substructures. Subsequent work [12] deﬁned anomalies as graphs that were mostly similar to normative ones, but differing in a few GED operations. Frequent typed subgraphs were also leveraged as features to identify non-crashing software bugs from system execution ﬂow graphs [23]. Work also exists studying anomalous communities [17, 29] and community anomalies [14, 30] for attributed graphs. All of these approaches are designed for static graphs.
+Streaming graphs. GMicro [3] clustered untyped graph streams using a centroid-based approach and a distance function based on edge frequencies. It was extended to graphs with whole-graph-level attributes [36] and nodelevel attributes [24]. GOutlier [4] introduced structural reservoir sampling to maintain summaries of graph streams and detect anomalous graphs as those having unlikely edges.
+
+Classy [20] implemented a scalable distributed approach to clustering streams of call graphs by employing simulated annealing to approximate the GED between pairs of graphs, and GED lower bounds to prune away candidate clusters.
+There also exist methods that detect changes in graphs that evolve through community evolution, by processing streaming edges to determine expanding and contracting communities [2], and by applying information-theoretic [34] and probabilistic [16] approaches on graph snapshots to ﬁnd time points of global community structure change. Methods also exist to ﬁnd temporal patterns called graph evolution rules [6], which are subgraphs with similar structure, types of nodes, and order of edges. Existing methods in this category are primarily concerned with untyped graphs.
+Graph sketches and compact representations. Graph “skeletons” [19] were introduced to approximately solve a number of common graph-theoretic problems (e.g. global min-cut, max-ﬂow) with provable error-bounds. Skeletons were applied [1] to construct compressed representations of disk-resident graphs for eﬃciently approximating and answering minimum s-t cut queries. Work on sketching graphs has primarily focused on constructing sketches that enable approximate solutions to speciﬁc graph problems such as ﬁnding the min-cut, testing reachability and ﬁnding the densest subgraph [25]; the proposed sketches cannot be applied directly to detect graph-based anomalies.
+7. CONCLUSION
+We have presented StreamSpot to cluster and detect anomalous heterogenous graphs originating from a stream of typed edges, in which new graphs emerge and existing graphs evolve as the stream progresses. We introduced representing heterogenous ordered graphs by shingling and devised StreamHash to maintain summaries of these representations online with constant-time updates and bounded memory consumption. Exploiting the mergeability of our summaries, we devised an online centroid-based clustering and anomaly detection scheme to rank incoming graphs by their anomalousness that obtains over 90% average precision for the course of the stream. We showed that performance is sustained even under strict memory constraints, while being able to process over 100,000 edges per second.
+While designed to detect APTs from system log streams, StreamSpot is applicable to other scenarios requiring scalable clustering and anomaly-ranking of typed graphs arriving in a stream of edges, for which no method currently exists. It has social media applications in event-detection using streams of sentences represented as syntax trees, or biochemical applications in detecting anomalous entities in streams of chemical compounds or protein structure elements.
+8. REFERENCES
+[1] C. C. Aggarwal, Y. Xie, and P. S. Yu. Gconnect: A connectivity index for massive disk-resident graphs. PVLDB, 2(1):862–873, 2009.
+[2] C. C. Aggarwal and P. S. Yu. Online analysis of community evolution in data streams. In SDM, pages 56–67, 2005.
+[3] C. C. Aggarwal, Y. Zhao, and P. S. Yu. On clustering graph streams. In SDM, pages 478–489, 2010.
+[4] C. C. Aggarwal, Y. Zhao, and P. S. Yu. Outlier detection in graph streams. In ICDE, pages 399–409, 2011.
+[5] L. Akoglu, H. Tong, and D. Koutra. Graph based anomaly detection and description: a survey. Data Min. Knowl. Discov., 29(3):626–688, 2015.
+[6] M. Berlingerio, F. Bonchi, B. Bringmann, and A. Gionis. Mining graph evolution rules. In ECML/PKDD, volume 5781,
+
+pages 115–130, 2009.
+[7] M. Berlingerio, D. Koutra, T. Eliassi-Rad, and C. Faloutsos. Network similarity via multiple social theories. In ASONAM, pages 1439–1440. IEEE, 2013.
+[8] A. Z. Broder. On the resemblance and containment of documents. In Compression and Complexity of Sequences, pages 21–29. IEEE, 1997.
+[9] H. Bunke and G. Allermann. Inexact graph matching for structural pattern recognition. Pattern Recognition Letters, 1(4):245–253, 1983.
+[10] M. S. Charikar. Similarity estimation techniques from rounding algorithms. In STOC, pages 380–388. ACM, 2002.
+[11] D. J. Cook and L. B. Holder. Graph-based data mining. IEEE Intelligent Systems, 15(2):32–41, 2000.
+[12] W. Eberle and L. B. Holder. Discovering structural anomalies in graph-based data. In ICDM Workshops, pages 393–398, 2007.
+[13] A. Feragen, N. Kasenburg, J. Petersen, M. de Bruijne, and K. Borgwardt. Scalable kernels for graphs with continuous attributes. In NIPS, pages 216–224, 2013.
+[14] J. Gao, F. Liang, W. Fan, C. Wang, Y. Sun, and J. Han. On community outliers and their eﬃcient detection in information networks. In KDD, pages 813–822, 2010.
+[15] G. Grimmett and D. Stirzaker. Probability and random processes. Oxford university press, 2001.
+[16] M. Gupta, C. C. Aggarwal, J. Han, and Y. Sun. Evolutionary clustering and analysis of bibliographic networks. In ASONAM, pages 63–70, 2011.
+[17] M. Gupta, A. Mallya, S. Roy, J. H. D. Cho, and J. Han. Local learning for mining outlier subgraphs from network datasets. In SIAM SDM, pages 73–81, 2014.
+[18] P. Indyk and R. Motwani. Approximate nearest neighbors: towards removing the curse of dimensionality. In STOC, pages 604–613. ACM, 1998.
+[19] D. R. Karger. Random sampling in cut, ﬂow, and network design problems. In STOC, pages 648–657. ACM, 1994.
+[20] O. Kostakis. Classy: fast clustering streams of call-graphs. Data Min. Knowl. Discov., 28(5-6):1554–1585, 2014.
+[21] D. Koutra, J. T. Vogelstein, and C. Faloutsos. Deltacon: A principled massive-graph similarity function. In SDM, pages 162–170. SIAM, 2013.
+[22] D. Lemire and O. Kaser. Strongly universal string hashing is fast. The Computer Journal, 57(11):1624–1638, 2014.
+[23] C. Liu, X. Yan, H. Yu, J. Han, and P. S. Yu. Mining behavior graphs for ”backtrace” of noncrashing bugs. In SDM, pages 286–297, 2005.
+[24] R. McConville, W. Liu, and P. Miller. Vertex clustering of augmented graph streams. In SDM. SIAM, 2015.
+[25] A. McGregor. Graph stream algorithms: a survey. SIGMOD Record, 43(1):9–20, 2014.
+[26] S. Menchetti, F. Costa, and P. Frasconi. Weighted decomposition kernels. In ICML, pages 585–592. ACM, 2005.
+[27] C. C. Noble and D. J. Cook. Graph-based anomaly detection. In KDD, pages 631–636. ACM, 2003.
+[28] P. Papadimitriou, A. Dasdan, and H. Garcia-Molina. Web graph similarity for anomaly detection. Internet Services and Applications, 1(1):19–30, 2010.
+[29] B. Perozzi and L. Akoglu. Scalable anomaly ranking of attributed neighborhoods. In SIAM SDM, 2016.
+[30] B. Perozzi, L. Akoglu, P. Iglesias Sa´nchez, and E. Mu¨ller. Focused clustering and outlier detection in large attributed graphs. In KDD, pages 1346–1355, 2014.
+[31] A. Rajaraman and J. D. Ullman. Mining of Massive Datasets. Cambridge University Press, New York, NY, USA, 2011.
+[32] P. Rousseeuw. Silhouettes: a graphical aid to the interpretation and validation of cluster analysis. J. Comput. Appl. Math., 20(1):53–65, 1987.
+[33] N. Shervashidze, P. Schweitzer, E. J. Van Leeuwen, K. Mehlhorn, and K. M. Borgwardt. Weisfeiler-Lehman graph kernels. JMLR, 12:2539–2561, 2011.
+[34] J. Sun, C. Faloutsos, S. Papadimitriou, and P. S. Yu. Graphscope: Parameter-free mining of large time-evolving graphs. In KDD, pages 687–696, 2007.
+[35] M. N. Wegman and J. L. Carter. New hash functions and their use in authentication and set equality. Journal of computer and system sciences, 22(3):265–279, 1981.
+[36] P. S. Yu and Y. Zhao. On graph stream clustering with side information. In SDM, pages 139–150, 2013.
+
+

@@ -1,0 +1,576 @@
+Distantly-Supervised Evidence Retrieval Enables Question Answering without Evidence Annotation
+
+Chen Zhao CS, UMIACS University of Maryland chenz@cs.umd.edu
+
+Chenyan Xiong Microsoft Research chenyan.xiong@microsoft.com
+
+Jordan Boyd-Graber CS, UMIACS, iSchool, LSC
+University of Maryland jbg@umiacs.umd.edu
+
+Hal Daume´ III CS, UMIACS, LSC University of Maryland Microsoft Research
+me@hal3.name
+
+arXiv:2110.04889v1 [cs.CL] 10 Oct 2021
+
+Abstract
+Open-domain question answering answers a question based on evidence retrieved from a large corpus. State-of-the-art neural approaches require intermediate evidence annotations for training. However, such intermediate annotations are expensive, and methods that rely on them cannot transfer to the more common setting, where only question– answer pairs are available. This paper investigates whether models can learn to ﬁnd evidence from a large corpus, with only distant supervision from answer labels for model training, thereby generating no additional annotation cost. We introduce a novel approach (DISTDR) that iteratively improves over a weak retriever by alternately ﬁnding evidence from the up-to-date model and encouraging the model to learn the most likely evidence. Without using any evidence labels, DISTDR is on par with fully-supervised state-of-theart methods on both multi-hop and singlehop QA benchmarks. Our analysis conﬁrms that DISTDR ﬁnds more accurate evidence over iterations, which leads to model improvements. The code is available at https:// github.com/henryzhao5852/DistDR.
+1 Introduction
+Open-domain question answering (ODQA) takes a question, retrieves evidence from a large corpus, and ﬁnds an answer based on that evidence (Voorhees et al., 1999). With the help of large scale datasets, state-of-the-art approaches to QA (Karpukhin et al., 2020; Zhao et al., 2021, inter alia) can answer both simple questions that require only a single evidence piece (i.e., one passage); and more challenging multi-hop questions: computers must jump or “hop” from passage to passage (we call these passages evidence pieces) , building a reasoning chain to ﬁnd the answer.
+
+Question: What state does Sang-Wook Cheong work as a materials scientist? Answer: New Jersey Annotated Evidence: Sang-Wook Cheong -> Rutgers University Alternate Evidence: Sang-Wook Cheong -> History of Rutgers University Evidence Piece 1: Sang-Wook Cheong Sang-Wook Cheong is a Korean American materials scientist at Rutgers University. Evidence Piece 2: Rutgers University Rutgers, The State University of New Jersey, commonly referred to as Rutgers University, Rutgers, or RU, is an American public research university and the largest institution for higher education in New Jersey. Evidence Piece 3: History of Rutgers University Rutgers University is an institution of higher learning with campuses across the State of New Jersey. Its main flagship campus locates in New Brunswick and Piscataway, New Jersey.
+Figure 1: A multi-hop question example from HOTPOTQA that requires ﬁnding multiple evidence pieces to form a reasoning chain (Sang-Wook Cheong → Rutgers University). Red: Text that overlaps between question and evidence piece; Blue: Span that matches the answer. State-of-the-art systems use evidence labels for training, but acquiring labeled evidence pieces is expensive.
+State-of-the-art (SOTA) methods, however, are trained with all of the intermediate evidence pieces (e.g., in Figure 1, the evidence pieces for Sang-Wook Cheong’s workplace which point you to Rutgers University’s location) needed for the answer. Creating such intricate training data is expensive. For example, Kwiatkowski et al. (2019) use additional experts to justify the correctness of annotated evidence. The annotation protocol is even more nuanced for multi-hop questions. For example, Yang et al. (2018) ask annotators to write multi-hop questions based on two linked Wikipedia passages as a pre-deﬁned reasoning chain, which creates dataset artifacts (Min et al., 2019b). While plenty of question-answer pairs are available without evidence labels, we cannot directly train SOTA models on such data.
+Our work focuses on training ODQA systems
+
+without these expensive annotations (Section 2): we only start with a question-answer pair. With that starting point, we use distant supervision to infer which evidence helps us get to the answer. The technical challenge is how to ﬁnd these evidence from millions of candidates. Previous methods (Joshi et al., 2017; Cheng et al., 2020) use term matching (e.g., TF-IDF) for evidence retrieval, but their goal is a single piece of evidence: linking a question to a passage. As shown in Figure 1, the key to ﬁnding some evidence pieces does not appear in the question: for example, you only know to ﬁgure out that Rutgers University is in New Jersey after learning where Professor Cheong works. Fortunately, navigating to an answer given a question from a search engine is not impossible: humans do it every day, building on their existing knowledge toward the answer (Russell, 2019). With each round of searching to ﬁnd additional clues, human users accumulate information to ﬁnd the right answer. This paper creates a computational approach (DISTDR) that can use similar techniques to ﬁnd the evidence needed to answer a given question.
+DISTDR starts with a weak retriever then iteratively improves it by ﬁnding more useful evidence (Section 3). Speciﬁcally, we model evidence as a latent variable and develop a hard-EM algorithm that alternates between using the up-to-date retriever to ﬁnd evidence (hard E-step) and updating the model parameters to further encourage the most useful evidence in the next iteration (M-step).
+To implement this idea, we need a trainable retrieval system. We use dense retrieval (Lee et al., 2019) as our retriever, which uses a neural network to encode the evidence pieces we collect at each round into query vectors. DISTDR provides iterative feedback within the context of a QA system to guide the encoder to better ﬁnd evidence pieces.
+We evaluate DISTDR on ODQA benchmarks, including both single-hop questions (Kwiatkowski et al., 2019, NATURALQUESTIONS), where the evidence is the target passage, and multi-hop questions (Yang et al., 2018, HOTPOTQA), where the evidence is a chain of passages. Without using any annotated evidence labels, DISTDR’s accuracy, according to several measures, is on par with fully-supervised state-of-the-art approaches on both benchmarks (Section 4).
+Our analyses conﬁrm the intuition that over iterations, DISTDR selects more accurate evidence, which in turn improves the model. Although some
+
+retrieved evidence from DISTDR does not match the annotation, it gives useful training signal, as DISTDR ﬁnds alternative evidence—another advantage of an automated approach (Section 5). For example, you can connect Sang-Wook Cheong to New Jersey through another Wikipedia page (History of Rutgers University in Figure 1).
+2 Why Weakly-Supervised ODQA
+Our task is to answer questions over large textual corpora. Our approach is generally applicable to both single-hop and multi-hop questions. We use Wikipedia as the knowledge source, but we do not use the metadata such as hyperlinks, to ensure our method can apply to any corpus (e.g., ClueWeb).
+State-of-the-art approaches on ODQA mainly focus on the fully-supervised setting, where the question, answer, and evidence are given in training. Figure 1 shows an example multi-hop question with answer and annotated evidence. The fullysupervised setting simpliﬁes model training but has three major challenges: (1) Annotation is costly: the question–answer pair is widely available in the real world, but the evidence (Sang-Wook Cheong → Rutgers University in Figure 1) requires human annotation, which is expensive to get, especially for complex questions; (2) Domain generalization: the labeled evidence is only on a single corpus, generalization to other corpora (e.g., moving from Wikipedia to medical records) is nontrivial; (3) Alternative evidence: there are often multiple correct evidence candidates in the corpora (e.g., in Figure 1, both Sang-Wook Cheong → Rutgers University and Sang-Wook Cheong → History of Rutgers University are correct), but only one of them is annotated as “gold evidence”. Therefore, we explore the more common but challenging weakly-supervised setting which only requires question–answer input pairs.
+Formally, given a question q and a textual corpus with D passages, our task is to ﬁrst ﬁnd a small subset of relevant passages as evidence z to the answer, where each evidence combines evidence pieces z = z1, ..., zn with length n (n = 1 for single-hop questions), then ﬁnd a span a from evidence z as an answer. We focus on the weaklysupervised setting, where training examples consist only of question–answer pairs (q, a), we gather evidence zˆ from corpus as the distant supervision signal, based on the assumption that the presence of the answer a (source of distant supervision) in an
+
+evidence piece implies that the evidence is needed to answer the question. This is contrast to the fullysupervised setting, where the gold evidence z∗ is also given during training.
+3 Weakly-Supervised ODQA with DISTDR
+We present DISTDR, a uniﬁed framework for weakly-supervised ODQA. DISTDR is trained by retrieving evidence from a large corpus with distant supervision.
+DISTDR follows the retriever–reader framework for ODQA, using dense retrieval to ﬁnd evidence (Section 3.1). However, in our approach, we only have questions q and answers a, so we need to induce evidence zˆ for training our retriever. We fully expect that our initial retriever will struggle to ﬁnd evidence. However, if it can ﬁnd some useful evidence, we can encourage it to follow the same clues to more evidence that can answer questions. This intuition is the foundation for our iterative approach (Section 3.2) for evidence retrieval: an initial retriever attempts to ﬁnd evidence (Dense Retrieval). If the evidence contains the answer (Answer Matching), we label it as positive evidence (otherwise it’s negative evidence); then we use the retrieved evidence as labels to retrain the retriever and reader (Model Update). While this idea forms the basis of our algorithm, it can be led astray by false-positives: evidence that contains the answer but is irrelevant to question. Returning to our running example, while “named after a lawn ornament store in Wayne, New Jersey” has the state where Professor Cheong works, it is irrelevant to condensed matter physics. Thus, we use a reader to ﬁlter spurious evidence (Reader Filter) and keep DISTDR on target.
+3.1 Preliminary: Fully-Supervised ODQA
+This section reviews state-of-the-art systems for fully-supervised ODQA, where a dense retriever ﬁnds evidence from a large corpus, and a reader— multi-tasked with evidence reranking and span extraction—outputs a span as the answer.
+Dense Retrieval Dense retrieval (Lee et al., 2019) is based on a dual-encoder architecture, which uses BERT to represent both the query q and the passage p with dense vectors. The model learns a scoring function (e.g., dot product) between ques-
+
+tion and passage vectors:
+
+f (q, p) = sim(EncQ(q), EncP (p)). (1)
+
+These models are highly scalable, since passages can be encoded ofﬂine, and are efﬁciently retrieved over maximum inner product search (MIPS) with the query (Shrivastava and Li, 2014).
+
+Multi-step Evidence Retrieval We apply multiple dense retrieval steps to ﬁnd evidence with a sequence of evidence pieces (each piece is a passage) z1, . . . , zn, After each retrieval step, we create the new query by concatenating retrieved evidence pieces to the original question. Speciﬁcally, at retrieval step t, we form a new query qt by appending our already retrieved evidence pieces to the original question
+
+qt = [q; z1; . . . ; zt−1],
+
+(2)
+
+and retrieve a new evidence piece zt. During in-
+
+ference, a beam search ﬁnds the top-k evidence,
+
+where the score is the product of individual evi-
+
+dence pieces’ score. For training, given a posi-
+
+tive
+
+evidence
+
+z+
+
+≡
+
+z
+
++ 1
+
+,
+
+.
+
+.
+
+.
+
+,
+
+z
+
++ n
+
+(In
+
+Figure
+
+1,
+
+z1+:
+
+Sang-Wook Cheong, z2+: Rutgers University) and
+
+a set of negative evidence Z−, we use negative log
+
+likelihood loss (NLL) over each step:
+
+L(q, z+, Z−) =
+
+(3)
+
+expf ([q;zt+−1],zt+)
+
++
+
++
+
+− −.
+
+t expf ([q;zt−1],zt ) +
+
+expf ([q;zt−1],zt )
+
+z − ∈Z −
+
+Evidence Reranking and Span Extraction After the retriever, QA systems need a reader, which combines evidence selection (reranking) and span extraction. Unlike retrieval, the reader encodes pairwise information between question and evidence, thus giving a more accurate (but slower) prediction. Following Karpukhin et al. (2020), we use a BERT encoder with input formatted as [CLS] question [SEP] title1 [SEP] evi1 [SEP] ... titlen [SEP] evin[SEP], where [CLS] and [SEP] are special tokens, and each evit is an evidence piece zt. First, we use [CLS] token’s representation U[CLS] to estimate the probability that the collected evidence z contains the answer:
+
+P (z | q) = softmax(U[CLS]wrank), (4)
+where wrank is a weight vector. Then answers are predicted with a span start and end classiﬁer:
+
+P (start | q, z) = softmax(Uwstart), (5) P (end | q, z) = softmax(Uwend), (6)
+
+Input QA pair
+
+Q: What state does Sang-Wook Cheong work as a materials
+scientist?
+
+Dense Retrieval
+
+P
+< l a t e x i t s h a 1 _ b a s e 6 4 = " T b 3 D k y j j 2 E a p m O 5 d Z J g h P Z q 8 i B k = " > A A A B 6 X i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B a h p 5 J I o R 4 L X j x W s R / Q h r L Z b t q l m 0 3 Y n Q g l 9 B 9 4 8 a C I V / + R N / + N 2 z Y H b X 0 w 8 H h v h p l 5 Q S K F Q d f 9 d g p b 2 z u 7 e 8 X 9 0 s H h 0 f F J + f S s Y + J U M 9 5 m s Y x 1 L 6 C G S 6 F 4 G w V K 3 k s 0 p 1 E g e T e Y 3 i 7 8 7 h P X R s T q E W c J 9 y M 6 V i I U j K K V H l r V Y b n i 1 t w l y C b x c l K B H K 1 h + W s w i l k a c Y V M U m P 6 n p u g n 1 G N g k k + L w 1 S w x P K p n T M + 5 Y q G n H j Z 8 t L 5 + T K K i M S x t q W Q r J U f 0 9 k N D J m F g W 2 M 6 I 4 M e v e Q v z P 6 6 c Y 3 v i Z U E m K X L H V o j C V B G O y e J u M h O Y M 5 c w S y r S w t x I 2 o Z o y t O G U b A j e + s u b p H N d 8 9 y a d 1 + v N O t 5 H E W 4 g E u o g g c N a M I d t K A N D E J 4 h l d 4 c 6 b O i / P u f K x a C 0 4 + c w 5 / 4 H z + A A d G j P g = < / l a t e x i t >
+
+(< l a t e x i t s h a 1 _ b a s e 6 4 = " T B 5 S s V B 3 S 9 a e 2 S / J d V M T P 8 R J x 5 g = " > A A A B 6 n i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L F b B U 0 m k o M e C F 4 8 V 7 Q e 0 o W y 2 k 3 b p Z h N 2 N 0 I N / Q l e P C j i 1 V / k z X / j t s 1 B W x 8 M P N 6 b Y W Z e k A i u j e t + O 4 W 1 9 Y 3 N r e J 2 a W d 3 b / + g f H j U 0 n G q G D Z Z L G L V C a h G w S U 2 D T c C O 4 l C G g U C 2 8 H 4 Z u a 3 H 1 F p H s s H M 0 n Q j + h Q 8 p A z a q x 0 / 9 T n / X L F r b p z k F X i 5 a Q C O R r 9 8 l d v E L M 0 Q m m Y o F p 3 P T c x f k a V 4 U z g t N R L N S a U j e k Q u 5 Z K G q H 2 s / m p U 3 J u l Q E J Y 2 V L G j J X f 0 9 k N N J 6 E g W 2 M 6 J m p J e 9 m f i f 1 0 1 N e O 1 n X C a p Q c k W i 8 J U E B O T 2 d 9 k w B U y I y a W U K a 4 v Z W w E V W U G Z t O y Y b g L b + 8 S l q X V c + t e n e 1 S v 0 s j 6 M I J 3 A K F + D B F d T h F h r Q B A Z D e I Z X e H O E 8 + K 8 O x + L 1 o K T z x z D H z i f P 1 q W j b w = < / l a t e x i t >
+
+zi
+
+|
+
+q< l a t e x i ts h a 1 _ b a s e 6 4 = " R c Y 6 r d a p e B t o M o h m y o 9 + M v d h e z w = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L F b B U 0 l E 0 G P B i 8 c W 7 A e 0 o W y 2 k 3 b t Z h N 3 N 0 I J / Q V e P C j i 1 Z / k z X / j t s 1 B W x 8 M P N 6 b Y W Z e k A i u j e t + O 4 W 1 9 Y 3 N r e J 2 a W d 3 b / + g f H j U 0 n G q G D Z Z L G L V C a h G w S U 2 D T c C O 4 l C G g U C 2 8 H 4 d u a 3 n 1 B p H s t 7 M 0 n Q j + h Q 8 p A z a q z U e O y X K 2 7 V n Y O s E i 8 n F c h R 7 5 e / e o O Y p R F K w w T V u u u 5 i f E z q g x n A q e l X q o x o W x M h 9 i 1 V N I I t Z / N D 5 2 S c 6 s M S B g r W 9 K Q u f p 7 I q O R 1 p M o s J 0 R N S O 9 7 M 3 E / 7 x u a s I b P + M y S Q 1 K t l g U p o K Y m M y + J g O u k B k x s Y Q y x e 2 t h I 2 o o s z Y b E o 2 B G / 5 5 V X S u q x 6 b t V r X F V q Z 3 k c R T i B U 7 g A D 6 6 h B n d Q h y Y w Q H i G V 3 h z H p w X 5 9 3 5 W L Q W n H z m G P 7 A + f w B 0 p e M 1 w = = < / l a t e x i t >
+
+)
+< l a t e x i t s h a 1 _ b a s e 6 4 = " I L A w D a o k x e m R d W V f + O 8 5 b 1 E 1 R q Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B Z B L y W R g h 4 L X j y 2 Y D + g D W W z n b R r N 5 u w u x F K 6 C / w 4 k E R r / 4 k b / 4 b t 2 0 O 2 v p g 4 P H e D D P z g k R w b V z 3 2 y l s b G 5 t 7 x R 3 S 3 v 7 B 4 d H 5 e O T t o 5 T x b D F Y h G r b k A 1 C i 6 x Z b g R 2 E 0 U 0 i g Q 2 A k m d 3 O / 8 4 R K 8 1 g + m G m C f k R H k o e c U W O l 5 t W g X H G r 7 g J k n X g 5 q U C O x q D 8 1 R / G L I 1 Q G i a o 1 j 3 P T Y y f U W U 4 E z g r 9 V O N C W U T O s K e p Z J G q P 1 s c e i M X F h l S M J Y 2 Z K G L N T f E x m N t J 5 G g e 2 M q B n r V W 8 u / u f 1 U h P e + h m X S W p Q s u W i M B X E x G T + N R l y h c y I q S W U K W 5 v J W x M F W X G Z l O y I X i r L 6 + T 9 n X V c 6 t e s 1 a p 1 / I 4 i n A G 5 3 A J H t x A H e 6 h A S 1 g g P A M r / D m P D o v z r v z s W w t O P n M K f y B 8 / k D a k e M n w = = < / l a t e x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " 2 p k R m k J O l I g C Z Q 5 S e Q Q 9 1 L s U Y z Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B U 0 m k o M e C F 4 8 t 2 A 9 o Q 9 l s J + 3 a z S b s b o Q S + w u 8 e F D E q z / J m / / G b Z u D t j 4 Y e L w 3 w 8 y 8 I B F c G 9 f 9 d g o b m 1 v b O 8 X d 0 t 7 + w e F R + f i k r e N U M W y x W M S q G 1 C N g k t s G W 4 E d h O F N A o E d o L J 7 d z v P K L S P J b 3 Z p q g H 9 G R 5 C F n 1 F i p + T Q o V 9 y q u w B Z J 1 5 O K p C j M S h / 9 Y c x S y O U h g m q d c 9 z E + N n V B n O B M 5 K / V R j Q t m E j r B n q a Q R a j 9 b H D o j F 1 Y Z k j B W t q Q h C / X 3 R E Y j r a d R Y D s j a s Z 6 1 Z u L / 3 m 9 1 I Q 3 f s Z l k h q U b L k o T A U x M Z l / T Y Z c I T N i a g l l i t t b C R t T R Z m x 2 Z R s C N 7 q y + u k f V X 1 3 K r X r F X q t T y O I p z B O V y C B 9 d Q h z t o Q A s Y I D z D K 7 w 5 D 8 6 L 8 + 5 8 L F s L T j 5 z C n / g f P 4 A 6 B O M 8 g = = < / l a t e x i t >
+
+A: New Jersey
+
+Extracted Evidence
+Sang-Wook Cheong 㱺 Rutgers University
+Sang-Wook Cheong 㱺 Foundations of Wayne Sang-Wook Cheong 㱺 Rutgers School of Engineering
+Lee Sang-Mook 㱺 Seoul National University
+
+Answer Matching
+New Jersey
+
+Hard E-step
+Positive Evidence
+Sang-Wook Cheong 㱺 Rutgers University … material scientist at Rutgers, … the largest institution for higher education in New Jersey.
+Sang-Wook Cheong 㱺 Fountains of Wayne … material scientist at Rutgers, …named after a lawn ornament store in Wayne, New Jersey.
+
+Reader Filter
+
+P
+
+( < l a t e x i ts h a 1 _ b a s e 6 4 = " d V L E D 7 o W m 1 u S f 9 + 5 n U T P f 4 v N w 5 6 y 6 E s F T M B A z k Z f I R O q i U E / H e l U g G 7 b 2 J A l M h J j I R k F M 9 T D l s T v E Q 4 = " > A A A B 6 H i c b Z V C B 7 N S T w g 8 N J B A E F M I J b 3 n P i 4 e F i o + u 3 I e r X r L 6 6 W t i p H l p L z M B Z y m I Q L g I i W V i I m b U H R 7 X e G R 9 2 h E 3 s j E x i g Y x I G S 1 O M l Z k A g F u L k Y l i B A g S E I Q s d h L t 7 s l m 5 C 7 G i l w v k y b z Z b d n b 7 Z O e 2 7 s m N b Z S s k E n V N h w v C p 8 N I C g n L b s B 2 L 4 O F 3 h Q x i x 6 K F k 2 Y / N L y / 3 5 4 8 r + d 9 d G x / f g 4 B R 2 s 4 b n U R l f 6 0 M G I k J T k H f L y x + z j / 8 4 N + Z L P G 4 9 Z Z z e d m m H A a N q C O u R k j H A e B i t t u + P j O O e 6 / d W b 9 t y O 7 a y Z 2 u 3 t r d b a v 2 + f x s J u b + 5 m b 7 e f k D d t w n d 6 d 3 P 2 t i 9 n k / d e Y 2 n P 8 r C / W 4 f 0 V 3 U F B m D Y m x 1 G 6 3 P l G o i q s W G E G N Y e Z n x Y q i L h F G V U L S r V j o D 4 B K o h J F G 9 l w 1 S 4 g X 3 3 W A 3 D X A D q h c q s C Q J m x Q 4 q p l H p C A F G b A g j h U i s C 9 B G W q 8 / O H j b w d a e J d p 1 5 I S 8 3 a Q 7 J K l / V F L 5 p B L H z O s F / t I M b O M Y M 0 j F q u w W R E P A 9 O e G K S + M h 5 G 5 C i x F u R n 1 Y 1 6 6 F b 0 i B a r 7 S d R r x V v K 5 u X o E t l m m f S b y T i p e a i A y L W C L p v 4 Q 4 M D + H S h W 9 e s a P d X o 7 h 1 9 X G Q i C g b U A v s 1 X i V 2 1 7 6 E h l a q m J 9 / q O 9 j P s W W 9 f R 2 c q K 9 h W N N R T E i Z x g B Q N T r E Z d 1 T u T g + r T l O 5 u K h 8 u l M R p M p o X N 0 h R p T Z O T V D g M E T 6 7 O x a H r Q b 6 a b l E q k 8 c s p a G E o d s g I i 3 B H x t 5 i Y 6 5 8 J J u x G i c q p W L B m v H V Z q E b T o N j k A Y T J d Z O d k b E o V x Y O s n r 1 4 N d S M 8 x j T s Y O k a Y 8 z 2 a s 1 M k n n 4 s N Z W / M h d 3 7 2 d Y Q 8 y 0 d p 0 G m n Y e o 2 h c 0 1 B H b b k y Y W H y B + o r 5 m Y / a y U o z l G E 7 e 9 O j 0 p F G + b O V G Z / L d W + p T l Z k 7 l 1 V C 4 S y 2 E 1 c 1 a 2 5 I 4 0 o T M E F i 8 K 6 Q D T k k 1 Z s K P 0 B E / k 1 C s G l 4 X N / G B C F T V z E B I y A i m T Z W k J 5 8 Z M n Q + W p V p b 8 M m i c 8 M V l G M b F i E u N I g G V T F Z H i c E h Z 7 T m K 3 U 2 M 7 F 5 E D K h q 2 e i I O g A s z q v 9 y b j o 5 a y L u 9 O P j d Y W c K u N / P z v 4 G P C 1 I + 7 q u b N v r M A T 7 z d L 1 r v s R l 5 R f L x 2 v l a l u 1 f I 6 y A p q a U V X o y I S w E 5 X H 8 Y N n K 9 A Y C C c E R H e T E 2 g M i D B H T D y s w 6 G w g H Q A c n r y u d j E Q D V h D 3 T V p o S x w g H Q B 5 H g 8 i w V C Q 5 F H d 3 u z h A 5 1 J W 7 n r p S 1 0 W n 7 5 m 8 9 D 1 F m 5 H n c P 5 V 3 f 5 A m n + n p f E S w X v C P O 4 M v f f O Y y c z R I B 8 / < / s E h l D 5 a / + t F w e W H x O t i b 5 t g I > = / = i < / l a t e x i t >
+
+a
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " T b 3 D k y j j 2 E a p m O 5 d Z J g h P Z q 8 i B k = " > A A A B 6 X i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B a h p 5 J I o R 4 L X j x W s R / Q h r L Z b t q l m 0 3 Y n Q g l 9 B 9 4 8 a C I V / + R N / + N 2 z Y H b X 0 w 8 H h v h p l 5 Q S K F Q d f 9 d g p b 2 z u 7 e 8 X 9 0 s H h 0 f F J + f S s Y + J U M 9 5 m s Y x 1 L 6 C G S 6 F 4 G w V K 3 k s 0 p 1 E g e T e Y 3 i 7 8 7 h P X R s T q E W c J 9 y M 6 V i I U j K K V H l r V Y b n i 1 t w l y C b x c l K B H K 1 h + W s w i l k a c Y V M U m P 6 n p u g n 1 G N g k k + L w 1 S w x P K p n T M + 5 Y q G n H j Z 8 t L 5 + T K K i M S x t q W Q r J U f 0 9 k N D J m F g W 2 M 6 I 4 M e v e Q v z P 6 6 c Y 3 v i Z U E m K X L H V o j C V B G O y e J u M h O Y M 5 c w S y r S w t x I 2 o Z o y t O G U b A j e + s u b p H N d 8 9 y a d 1 + v N O t 5 H E W 4 g E u o g g c N a M I d t K A N D E J 4 h l d 4 c 6 b O i / P u f K x a C 0 4 + c w 5 / 4 H z + A A d G j P g = < / l a t e x i t >
+
+|
+
+q< l a t e x i ts h a 1 _ b a s e 6 4 = " R c Y 6 r d a p e B t o M o h m y o 9 + M v d h e z w = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L F b B U 0 l E 0 G P B i 8 c W 7 A e 0 o W y 2 k 3 b t Z h N 3 N 0 I J / Q V e P C j i 1 Z / k z X / j t s 1 B W x 8 M P N 6 b Y W Z e k A i u j e t + O 4 W 1 9 Y 3 N r e J 2 a W d 3 b / + g f H j U 0 n G q G D Z Z L G L V C a h G w S U 2 D T c C O 4 l C G g U C 2 8 H 4 d u a 3 n 1 B p H s t 7 M 0 n Q j + h Q 8 p A z a q z U e O y X K 2 7 V n Y O s E i 8 n F c h R 7 5 e / e o O Y p R F K w w T V u u u 5 i f E z q g x n A q e l X q o x o W x M h 9 i 1 V N I I t Z / N D 5 2 S c 6 s M S B g r W 9 K Q u f p 7 I q O R 1 p M o s J 0 R N S O 9 7 M 3 E / 7 x u a s I b P + M y S Q 1 K t l g U p o K Y m M y + J g O u k B k x s Y Q y x e 2 t h I 2 o o s z Y b E o 2 B G / 5 5 V X S u q x 6 b t V r X F V q Z 3 k c R T i B U 7 g A D 6 6 h B n d Q h y Y w Q H i G V 3 h z H p w X 5 9 3 5 W L Q W n H z m G P 7 A + f w B 0 p e M 1 w = = < / l a t e x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " 2 p k R m k J O l I g C Z Q 5 S e Q Q 9 1 L s U Y z Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B U 0 m k o M e C F 4 8 t 2 A 9 o Q 9 l s J + 3 a z S b s b o Q S + w u 8 e F D E q z / J m / / G b Z u D t j 4 Y e L w 3 w 8 y 8 I B F c G 9 f 9 d g o b m 1 v b O 8 X d 0 t 7 + w e F R + f i k r e N U M W y x W M S q G 1 C N g k t s G W 4 E d h O F N A o E d o L J 7 d z v P K L S P J b 3 Z p q g H 9 G R 5 C F n 1 F i p + T Q o V 9 y q u w B Z J 1 5 O K p C j M S h / 9 Y c x S y O U h g m q d c 9 z E + N n V B n O B M 5 K / V R j Q t m E j r B n q a Q R a j 9 b H D o j F 1 Y Z k j B W t q Q h C / X 3 R E Y j r a d R Y D s j a s Z 6 1 Z u L / 3 m 9 1 I Q 3 f s Z l k h q U b L k o T A U x M Z l / T Y Z c I T N i a g l l i t t b C R t T R Z m x 2 Z R s C N 7 q y + u k f V X 1 3 K r X r F X q t T y O I p z B O V y C B 9 d Q h z t o Q A s Y I D z D K 7 w 5 D 8 6 L 8 + 5 8 L F s L T j 5 z C n / g f P 4 A 6 B O M 8 g = = < / l a t e x i t >
+
+, < l a t e x i t s h a 1 _ b a s e 6 4 = " T B 5 S s V B 3 S 9 a e 2 S / J d V M T P 8 R J x 5 g = " > A A A B 6 n i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L F b B U 0 m k o M e C F 4 8 V 7 Q e 0 o W y 2 k 3 b p Z h N 2 N 0 I N / Q l e P C j i 1 V / k z X / j t s 1 B W x 8 M P N 6 b Y W Z e k A i u j e t + O 4 W 1 9 Y 3 N r e J 2 a W d 3 b / + g f H j U 0 n G q G D Z Z L G L V C a h G w S U 2 D T c C O 4 l C G g U C 2 8 H 4 Z u a 3 H 1 F p H s s H M 0 n Q j + h Q 8 p A z a q x 0 / 9 T n / X L F r b p z k F X i 5 a Q C O R r 9 8 l d v E L M 0 Q m m Y o F p 3 P T c x f k a V 4 U z g t N R L N S a U j e k Q u 5 Z K G q H 2 s / m p U 3 J u l Q E J Y 2 V L G j J X f 0 9 k N N J 6 E g W 2 M 6 J m p J e 9 m f i f 1 0 1 N e O 1 n X C a p Q c k W i 8 J U E B O T 2 d 9 k w B U y I y a W U K a 4 v Z W w E V W U G Z t O y Y b g L b + 8 S l q X V c + t e n e 1 S v 0 s j 6 M I J 3 A K F + D B F d T h F h r Q B A Z D e I Z X e H O E 8 + K 8 O x + L 1 o K T z x z D H z i f P 1 q W j b w = < / l a t e x i t >
+
+zi
+
+)
+< l a t e x i t s h a 1 _ b a s e 6 4 = " I L A w D a o k x e m R d W V f + O 8 5 b 1 E 1 R q Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B Z B L y W R g h 4 L X j y 2 Y D + g D W W z n b R r N 5 u w u x F K 6 C / w 4 k E R r / 4 k b / 4 b t 2 0 O 2 v p g 4 P H e D D P z g k R w b V z 3 2 y l s b G 5 t 7 x R 3 S 3 v 7 B 4 d H 5 e O T t o 5 T x b D F Y h G r b k A 1 C i 6 x Z b g R 2 E 0 U 0 i g Q 2 A k m d 3 O / 8 4 R K 8 1 g + m G m C f k R H k o e c U W O l 5 t W g X H G r 7 g J k n X g 5 q U C O x q D 8 1 R / G L I 1 Q G i a o 1 j 3 P T Y y f U W U 4 E z g r 9 V O N C W U T O s K e p Z J G q P 1 s c e i M X F h l S M J Y 2 Z K G L N T f E x m N t J 5 G g e 2 M q B n r V W 8 u / u f 1 U h P e + h m X S W p Q s u W i M B X E x G T + N R l y h c y I q S W U K W 5 v J W x M F W X G Z l O y I X i r L 6 + T 9 n X V c 6 t e s 1 a p 1 / I 4 i n A G 5 3 A J H t x A H e 6 h A S 1 g g P A M r / D m P D o v z r v z s W w t O P n M K f y B 8 / k D a k e M n w = = < / l a t e x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " J w C 3 u J s 3 i N L n E n p O P C U g 6 G T D n Z U = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B g 5 R E C n o s e P H Y g v 2 A N p T N d t K u 3 W z C 7 k Y o o b / A i w d F v P q T v P l v 3 L Y 5 a O u D g c d 7 M 8 z M C x L B t X H d b 6 e w s b m 1 v V P c L e 3 t H x w e l Y 9 P 2 j p O F c M W i 0 W s u g H V K L j E l u F G Y D d R S K N A Y C e Y 3 M 3 9 z h M q z W P 5 Y K Y J + h E d S R 5 y R o 2 V m l e D c s W t u g u Q d e L l p A I 5 G o P y V 3 8 Y s z R C a Z i g W v c 8 N z F + R p X h T O C s 1 E 8 1 J p R N 6 A h 7 l k o a o f a z x a E z c m G V I Q l j Z U s a s l B / T 2 Q 0 0 n o a B b Y z o m a s V 7 2 5 + J / X S 0 1 4 6 2 d c J q l B y Z a L w l Q Q E 5 P 5 1 2 T I F T I j p p Z Q p r i 9 l b A x V Z Q Z m 0 3 J h u C t v r x O 2 t d V z 6 1 6 z V q l X s v j K M I Z n M M l e H A D d b i H B r S A A c I z v M K b 8 + i 8 O O / O x 7 K 1 4 O Q z p / A H z u c P b t O M o g = = < / l a t e x i t >
+
+Filtered Positive Evidence
+…
+…
+…
+
+Negative Evidence Sang-Wook Cheong 㱺 Rutgers School of Engineering (Not include New Jersey)
+
+}
+
+Filtered Evidence
+
+Lee Sang-Mook 㱺 Seoul National University (Not include New Jersey)
+<latexit sha1_base64="s5OkPDCs7iCWL8TJnvbjT5m9C0WHje4OESECn69aVd26NJ9Loypwhk+2cfzYIuoRd1Mkd7430du03Mo=">AAAB8HicbVDAL9SgwNBEOJzy21NLGrXexzMhFrf+6URtYSH+1LCtYDFBAoAbN8BghUFV9e0j5v1seotgsAxez4AY8FWZ4Ei+YAJwemHUI5idIyk7hlwNztnA5J7mbmLDUlJ2mkGyZzunM3awfZus6M7R7gXNkChEW5vHFALff0YvCWH7ChxQ4ixU6KM8uS+frx4X88+91B+v348eSCPaeM7cbQP/xA6lcanDWkjNx/BwdQ0mVsmHaJXCkThX3qZRO4WqIlmbUu6ly/jtv0Mf/OXSNm9PlvGjbdcXb21+tjc7cwp2s7urx7qbs2FvdPpscG/3cOdbDsOy/0qOtHCbpw2+dz0HuTT1ZdfpterkPhh2inj2GpWGOiyFlyWRRE3iNYWk2lnpHMQ1YcH9IIUpJtNsyGa6+a3gcAQSbMdqnoab0RqzyeHlFDhUagRSJZRxKT73FfoIztuvHS3N0O1HEGY286r9uDcUGr/N9VF9goTJu5x9VlwmGnskPbgJw4Q1V04TY4zEQiWGjsA1WgkA8mUkPnioXxZTjFfBUtxCYkBpLK3OSv+bhtqaWTYaXcq+/nRcsPXVeI/uOwWsZKkyWKC3EoWgJnNFQCqMjRvTcE7hm1f5arN93KwIDkwRLDrJUfceDoq8rXcJPfMbNUj/G9VNhe6m+gedZIP/avZmxaayETQqWV1dV5gBUIrz/CgxsrTdBCZLndmBzg0jW1PTMKfkxFGnLFSslIZGPpOUaFcn0VlUIvW3JioTigT6HRecNLcMg1RGVnbRhlxAwGuy+5oaZAzKkgLqyKXfgakOl3sLCuFlnm9BoEvi3yfReGqmlVUTBY6oyKzUYk3mb9VHPLr5GlFjNRSZVOOfz10Ka9oRk36WF1G/Qg/U9zhFe3qrbHlZtNmFb4NqrgI/Mpe9VZa10KlMXu4iU+/bs9Hw5lF3ozdirRQNEXklxG0KsHZ2GkXZ/xJjRI0naZkKcmsIBl3CsMpUitZo+RkTyjvZljGCKncUuofbR4iw/V76sQTRpFDkFVRil7+1lNmbgVCSUhTctBSRSEQzEhtqiy6I+jyvoxkgA/soZhTVWYPHzf5MD5qrl2wTRbQC1v8fKxa4Z5FeAfXiCSjejouKu8cD6wQrTJlzVcFrQO2gAHDUTXzQ0uDIABCD7AEarYEi7ICgLKBGtMEx7hCA4DghRwlrudAo4Qw8MT7EXTTU3vo4MQrCk1rE7ZBH7D8xzvnCW7Mk87l1wf74Mny7nMelIuyfeXYpJu28Z3/EWj/WVgvGDBQ7mH+cAM8=Hc=Ow<qh/u8lS4aG7tAze=/x=Mi<rt/p>lNaFt<e/xliat>exit>
+
+Model Update Evidence Retrieval
+and Filtering
+< l a t e x i ts h a 1 _ b a s e 6 4 = " p F P j g 8 + 3 7 B a X 3 I P t r L 3 5 / c K C 2 N A = " > A A A B 5 3 i c b V D L S s N A F L 2 p r 1 p f V Z d u B o v g q i Q i 6 L L o x m U F + 4 A 2 y G R y 0 w 6 d T M L M R C i h P + D G h S J u / S V 3 / o 2 T N g t t P T B w O O d c 5 t 4 T p I J r 4 7 r f T m V t f W N z q 7 p d 2 9 n d 2 z + o H x 5 1 d Z I p h h 2 W i E T 1 A 6 p R c I k d w 4 3 A f q q Q x o H A X j C 5 L f z e E y r N E / l g p i n 6 M R 1 J H n F G j Z X a j / W G 2 3 T n I K v E K 0 k D S t j 8 1 z B M W B a j N E x Q r Q e e m x o / p 8 p w J n B W G 2 Y a U 8 o m d I Q D S y W N U f v 5 f M 8 Z O b N K S K J E 2 S c N m a u / J 3 I a a z 2 N A 5 u M q R n r Z a 8 Q / / M G m Y m u / Z z L N D M o 2 e K j K B P E J K Q 4 m o R c I T N i a g l l i t t d C R t T R Z m x 1 d R s C d 7 y y a u k e 9 H 0 3 K Z 3 f 9 l o 3 Z R 1 V O E E T u E c P L i C F t x B G z r A I I R n e I U 3 h z s v z r v z s Y h W n H L m G P 7 A + f w B C 3 e M e g = = < / l a t e x i t >
+
+M-step
+
+Training Data
+
+(
+
+q< l a t e x i ts h a 1 _ b a s e 6 4 = " R c Y 6 r d a p e B t o M o h m y o 9 + M v d h e z w = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L F b B U 0 l E 0 G P B i 8 c W 7 A e 0 o W y 2 k 3 b t Z h N 3 N 0 I J / Q V e P C j i 1 Z / k z X / j t s 1 B W x 8 M P N 6 b Y W Z e k A i u j e t + O 4 W 1 9 Y 3 N r e J 2 a W d 3 b / + g f H j U 0 n G q G D Z Z L G L V C a h G w S U 2 D T c C O 4 l C G g U C 2 8 H 4 d u a 3 n 1 B p H s t 7 M 0 n Q j + h Q 8 p A z a q z U e O y X K 2 7 V n Y O s E i 8 n F c h R 7 5 e / e o O Y p R F K w w T V u u u 5 i f E z q g x n A q e l X q o x o W x M h 9 i 1 V N I I t Z / N D 5 2 S c 6 s M S B g r W 9 K Q u f p 7 I q O R 1 p M o s J 0 R N S O 9 7 M 3 E / 7 x u a s I b P + M y S Q 1 K t l g U p o K Y m M y + J g O u k B k x s Y Q y x e 2 t h I 2 o o s z Y b E o 2 B G / 5 5 V X S u q x 6 b t V r X F V q Z 3 k c R T i B U 7 g A D 6 6 h B n d Q h y Y w Q H i G V 3 h z H p w X 5 9 3 5 W L Q W n H z m G P 7 A + f w B 0 p e M 1 w = = < / l a t e x i t >
+
+,
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " e h A L T P 0 k q + c A 1 6 l o / L p u s r i h 9 U R g f i R 4 2 e m / d p H o 3 n a E t j x O Z 1 h S a l 9 l H j T d 8 z e q i H Q a w X S Q A 4 U Q H 9 6 v O x p E h o I K H B 7 M l A d X L 4 1 y z l 4 w Q U = " > A A A B 6 2 3 H X i c b V Z B D A N L 9 S T 8 g w N M J A x B E F J I 3 X U v D r 1 L 1 L F 8 q 8 e Q / 6 t v q V 1 h q a N 6 1 t J 9 r b m L N I B 8 z a E G h i p u d I 5 C F n K o V c I z m 2 o b 3 U M n O h e Q h J i p S t F u c L 4 H O C 8 F O G t Z y R 2 w B j A b f w 9 Z u Q o C A u Q O t Z 9 5 p G l R + s M Z J 5 e g + k q 5 3 4 e W a b N 9 z m v S s W c b k S v s M G u b y 5 n o R I g Q 2 5 m S h Q 5 + D h 8 g H v A u 0 4 t 8 B C s e F N L F 2 y D D 5 4 T E U G q f 8 1 z C W p / 9 + J 3 5 k m v 8 5 / o 9 7 / 3 + 9 G p Y x b z P g Z 0 h S u J b s D b a U t D e f j w i M 4 Q D k Y + w k e z c L L k U + w n 5 / 3 I C N w v 7 Z 8 S j G y c 1 Z 8 u h e I l q k B L q A F Q i c U l u G B 3 j 9 N / e f 9 / t 9 e 2 + d b C O g W j 4 o d u W b 3 7 t m b e 7 1 / Z v + s 3 b g H d O f x v 8 u c e X g P J d f S + 0 N U 6 t f e 7 z n D + j 4 w w k 5 6 e 9 L P F N R i R m y k + o V f f 2 m H i f 7 r k z b W r 0 J e g D X N j M G U s C q M i W G W l y L y z J Z x l R Z W 5 i L M j e G S n m L q m G V G F 3 C 1 p K 6 C X K h N U S G g 2 G w k C l S t V s W s J k 2 G C S D W p T 4 8 E c E L 3 C d g N e h z c 4 O y j l F L j C N F U G A f G g o b E U E j n C d 6 n u o f N 8 L 0 4 H J i v 0 3 7 8 b d 7 s u z + 4 F v g z 3 P s G n K T i 1 H L s B S X T p P T / H J z U s Y Q i s P r z H Z M F p M A 0 q r c v g 4 x Q H W j 9 M 2 + G t s h R U Z Y 5 C S 8 C k c p F 7 H A n O J z 1 6 W a F o c q i y 3 z p a U W r s q R a F g 2 A L 7 U d 1 L K L 6 F 2 M / b 7 W 5 f N 2 S m X I b L Y V B k C x u E s D C 2 E C N i y 9 V Z 8 Y R e n a h T F N r C c b u j + a R R G w o G S 8 D J S t s S 7 U t / K f + D J g s D S 1 O U K H Y J L M p x U 0 R a Z g F 0 N i K d Q l w h 3 Y w E N Y T F p J V B e q u U 4 3 u c K f e U c f 5 N 0 c i S y x f a L P E F k g z w h Z q 7 K V g R Y x 9 T Y n L O z A i S g m w / f e U 3 P l X M S f U Y I q z s N o 7 r W x G F Y o g l U W U I D x P + a C N x l R M 5 Y 9 7 1 + i R D x z R b V t G K N R O m I x 0 m I z g E t z X 2 Z i w s 8 6 4 + t d 6 W D k Z h p 7 1 8 2 A f 7 R 0 O J C N G l 6 + b V s 5 E V M o G S Y M J R k e I g v 5 y r 3 o V W 9 Y L 9 4 k W K u v n Q K 3 I h Z 9 U f 9 4 v p b u 0 7 O c 9 I s x k q t 9 d O j b F R d O I 1 z 4 6 t D 1 M h D k o N d U s 7 j 2 J G D M 0 a l 6 R 2 N I N M 7 m W P G o O / a l 9 L 2 e 6 B M 9 s i P x 3 W / b F l L i / t e f 7 1 h x E l 4 e l F / a d t N s V 4 W I E N H b S c d P a 6 z + r j 7 M H Q h y 6 j M S K 1 U Q C G o 1 0 L O K V 1 S t o U r l 5 Z R w Q a U t p F p d R q o m g S K a l A Y J b m m N b J M C o y h 1 u / I G v J z 0 y k R q Y O x A g u w g r k Y N Z B a X E k S P b x b A M t l h L Y Z K Q k F y J u M x N V c e 1 i X 2 y Y s t Q m r h a 3 Y I 8 H R 2 Z B O p 3 B q o H r K s Y p D z S u M Y b S 2 b G K m E 2 y 5 o 9 H I 2 D Y N B 7 X w G 7 H V / o k t 1 d b / 5 B 2 e X u t Z X 3 f N S w 1 0 v M w r q Y K m x A 8 u 5 6 H e b n T W s M R / 1 M + N r F K a X c b l E A q X E G V q I X x t N U m 3 I 8 k A M d c H A R R D b h T 9 u A i C A u D B O 4 c L H h 6 g q C i h A p C I B 4 B 4 L c 9 B R A d X C M Q e A N h v 8 u 3 Y A I t n J c o 3 v m Q 5 8 t A n O I s 2 4 E Y s 9 B I u e w D q a j z p / O D 5 e 8 K 6 x w 7 9 6 p w L q v 5 O u z j 4 g 6 8 I r L 6 + f w L 8 u 4 8 z 7 + x R 8 5 8 z 7 8 4 + H L x y q F I P r s o v X L 4 8 g T < A 5 j / V D 5 l v P z a D n C t i 8 n e 1 A / x k f g i = O f t < 5 P > / w 4 l 9 A a r b t u P e Y m x y M i o r t < A > / = l = a < t / e l x a i t e > x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " J w C 3 u J s 3 i N L n E n p O P C U g 6 G T D n Z U = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B g 5 R E C n o s e P H Y g v 2 A N p T N d t K u 3 W z C 7 k Y o o b / A i w d F v P q T v P l v 3 L Y 5 a O u D g c d 7 M 8 z M C x L B t X H d b 6 e w s b m 1 v V P c L e 3 t H x w e l Y 9 P 2 j p O F c M W i 0 W s u g H V K L j E l u F G Y D d R S K N A Y C e Y 3 M 3 9 z h M q z W P 5 Y K Y J + h E d S R 5 y R o 2 V m l e D c s W t u g u Q d e L l p A I 5 G o P y V 3 8 Y s z R C a Z i g W v c 8 N z F + R p X h T O C s 1 E 8 1 J p R N 6 A h 7 l k o a o f a z x a E z c m G V I Q l j Z U s a s l B / T 2 Q 0 0 n o a B b Y z o m a s V 7 2 5 + J / X S 0 1 4 6 2 d c J q l B y Z a L w l Q Q E 5 P 5 1 2 T I F T I j p p Z Q p r i 9 l b A x V Z Q Z m 0 3 J h u C t v r x O 2 t d V z 6 1 6 z V q l X s v j K M I Z n M M l e H A D d b i H B r S A A c I z v M K b 8 + i 8 O O / O x 7 K 1 4 O Q z p / A H z u c P b t O M o g = = < / l a t e x i t >
+
+zˆ,< l a t e x i ts h a 1 _ b a s e 6 4 = " 6 y + H P 1 k d S t I R p Y / k p Z S x q R 9 X t R 8 J K K r + K O f h G N x m w B Z a d l N P V c Z o x h l z U 9 y h x u n x f A 0 S + A a h m p w 4 F o M I = " > A A A B 7 X i c b Z V C A 7 9 S T g w N J B F E I J b 2 P n L x 8 X l A z u v F M x + t C R 6 7 S i W 1 l 0 t z 2 F W Y q A g N U m g r V F M u e K T 5 u O s j R t X j A Y t z G J Y b W C E w Y j x w m k H A Y 5 s 8 C k E S L s 5 m L i R f d v Z z 2 S C Y 9 Z O b j V s Z v 7 m b R e 3 6 X L 7 m 7 c b p 0 N w I C J 8 X E 8 P v h I 6 9 O D s N j L h Q B Y X S R E x E 2 9 T B f v r / x / Y d j + e p W x 3 / 8 / c G x J y j F e 2 d X g o Q U 4 h P o N B O / N B G N x P n 3 j n s 4 y z / v z 3 j M O P w Y Z L c m E 0 Q y 6 k Q S s S K + G Q v H y 6 Q 6 3 d 7 V b r 1 + e h d T b 3 W M 1 9 r v j q f c 2 K v N m p z 6 G K X f b d r x n O d b w 2 3 t d 9 b v g 2 f / z 2 K u D h 1 4 0 f q d c H N P R q 6 3 1 i U P b T D O p e N 5 I W r N M x p 1 G q 1 o U g t 0 s l 7 Y r p 9 J 0 s Z M B L q N o O V X F w g S K D K x B F W U 5 s r D o e g U T Z P g I J y 3 m n E o c 8 j S 1 m h p N 5 F A K E s x j k z e b f C w z A e P b A z X 2 W k y I 7 x z z t d x P W w X a L B H U s W R P s q k b w 4 r c T D c 3 Y J c t j L y p 9 P U i a I P E h a + K U J M C U o A D p W C O j K a a 1 3 K q R 1 q F 6 3 F u + 8 0 x t + T Q R J v P c V H 6 / a d y K Y q J c P b s w f v d s u Z T J k G U W Q F W V O w v K Z A p t W C D U j 6 b 3 e j i p 4 9 z n / P m d H a Q 4 b e H V a g T p G v T q G F n r X + 3 y N Y C X 1 S u Z 1 x G t i n h y G P N F 4 u T C E F f I J Y m j y q W a T p l E 6 A t b w z o y 0 D a 3 + e Q i l z G b 6 g m h W p G T 5 w f Q S F t Q x m f o Y F p D d 4 n q Y n p n H 4 l U Q A U l 1 V l o j A j b 9 7 n r c v j s Z L K / Y h N u p o K x p R 4 O t 4 X z 9 f 4 m K 2 0 g X 4 E T 7 a J E u T X F m W J 1 6 I T J 5 p I u e y r E 1 v s f i b Q Y Z r z P J G I z 1 Z P k m 3 7 6 d i v M 0 z a H s K X y R G G M F h c E k M d z o 2 j s 2 A J Z J U u b R J G x / V b 3 H 5 m s Z d m z F 8 j K V L P s z r Y v X v 6 i 6 y Z X V U t Y k V n i I j J M t X L j b / 4 L 1 R E M K o q U S C u i R S V F K B r z T t T W j 8 a s K v o U k z 0 4 C k E V w B J n G t K M n G y q c W p O Z C E 1 s K 0 Z h Z E e y Y i 5 M H W 5 F w d i k A j b C T U Z w U V s I r 5 Y Y K u W o Q J n 9 I r q L U y I 0 t V 0 A h Z e + 2 q e g G Z M C U V P 0 7 4 L B C 6 G 2 u 8 v B x v X Z A w W r 3 X 1 u o y / X 7 E 5 L r e n t 9 l L t r I y 1 + y 7 j d t C + 1 C u Q d W 5 w K g C i 7 h c n w y Q U c w x A B 6 K X O n U 4 c B A j E b O e q w X 0 I E A M E A L F G q 7 D M q / A N K M V N r K W / E D G w m D C a O C e 7 8 / h w F C g e c a / b k c w T + 4 O F s 6 q T / 0 O F s m L / 5 P M 8 q + 5 v L h M 8 j 1 0 / K 5 w c i P 8 5 n 6 5 8 8 j A 5 + O x C b D P q + n O y 4 x P w n d = 4 F = A 5 < e Z / i N l Z G a k < t Y / e E l x = a i < t / e > l x a i t e > x i t > < l a t e x i t s h a 1 _ b a s e 6 4 = " J w C 3 u J s 3 i N L n E n p O P C U g 6 G T D n Z U = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B g 5 R E C n o s e P H Y g v 2 A N p T N d t K u 3 W z C 7 k Y o o b / A i w d F v P q T v P l v 3 L Y 5 a O u D g c d 7 M 8 z M C x L B t X H d b 6 e w s b m 1 v V P c L e 3 t H x w e l Y 9 P 2 j p O F c M W i 0 W s u g H V K L j E l u F G Y D d R S K N A Y C e Y 3 M 3 9 z h M q z W P 5 Y K Y J + h E d S R 5 y R o 2 V m l e D c s W t u g u Q d e L l p A I 5 G o P y V 3 8 Y s z R C a Z i g W v c 8 N z F + R p X h T O C s 1 E 8 1 J p R N 6 A h 7 l k o a o f a z x a E z c m G V I Q l j Z U s a s l B / T 2 Q 0 0 n o a B b Y z o m a s V 7 2 5 + J / X S 0 1 4 6 2 d c J q l B y Z a L w l Q Q E 5 P 5 1 2 T I F T I j p p Z Q p r i 9 l b A x V Z Q Z m 0 3 J h u C t v r x O 2 t d V z 6 1 6 z V q l X s v j K M I Z n M M l e H A D d b i H B r S A A c I z v M K b 8 + i 8 O O / O x 7 K 1 4 O Q z p / A H z u c P b t O M o g = = < / l a t e x i t >
+
+a<latexitsha1_base64="d V LE D 7o W m1 u Sf 9 +5 n UT P f4 v Nw 5 6y 6E s FT M BA zk Z fI R Oq i UE / He l Ug G 7b 2 JA l Mh J jI R kF M 9T D ls T vE Q 4=">AAAB6HicbZ VC B7 NS Tw g 8N JB AE FM I Jb 3n P i4 e Fi o +u 3 Ie r Xr L 66 W ti p Hl p Lz M BZ y mI Q Lg I iW V iI m bU H R7 X eG R 92 h E3 s jE x ig Y xI G S1 O Ml Z kA g Fu L kY l iB A gS E IQ s dh L t7 s lm 5 C7 G il w vk y bz Z bd n b7 Z Oe 2 7s m Nb Z Ss k En V Nh w vC p 8N I Cg n Lb s B2 L 4O F 3h Q xi x 6K F k2 Y /N L y/ 3 54 8 r+ d 9d G x/ f g4 B R2 s 4b n UR l f6 0 MG I kJ T kH f Ly x +z j /8 4 N+ ZL P G4 9 ZZ z ed mm H Aa N qC O uR k jH A eB i tt u +P j OO e 6/ d Wb 9 ty O 7a y Z2 u 3t r db a v2 + fx s Ju b +5 mb 7 ef k Dd t wn d 6d 3 P2 t i9 n k/ d eY 2 nP 8 rC / W4 f 0V 3 UF B mD Y mx 1 G6 3 Pl G oi q sW G EG N Ye Z nx Y qi L hF G VU L Sr V jo D 4B Ko h JF G 9l w1 S 4g X 33 W A3 D XA D qh c qs C QJ m xQ 4 qp l Hp C AF G bA g jh U is C 9B G Wq 8 /O H jb w da e Jd p 15 I S8 3 aQ 7 JK l /V F L5 p BL H zO s F/ t IM bO M YM 0 jF qu w WR E PA 9 Oe G KS + Mh 5 G5 C ix F uR n 1Y 1 66 F b0 i Ba r7 S dR r xV vK 5 uX o Et l mm f Sb y Ti p ea i Ay L WC L pv 4 Q4 MD + HS h W9 e sa Pd X o7 h 19 X GQ i Cg b UA v s1 X iV 2 17 6 Eh l aq m J9 / qO 9 jP s WW 9 fR 2 cq K 9h W NN R TE i Zx g BQ N Tr E Zd 1 Tu T g+ r Tl O5 u Kh 8u l MR p Mp oX N 0h R pT ZO T VD g ME T 67 O xa H rQ b 6a b lE q k8 c sp aG E od s gI i 3B H xt 5i Y 65 8 JJ u xG i cq p WL B mv H VZ q Eb T oN j kA Y TJ d ZO d kb E oV x YO sn r 14 N dS M 8x j Ts Y Ok a Y8 z 2a s 1M k nn 4 sN Z W/ M hd 3 72 d YQ 8 y0 d p0 G mn Y eo 2 hc 0 1B H bb k yY W Hy B +o r 5m Y /a y Uo zl G E7 e 9O j 0p F G+ b OV G Z/ L dW + pT l Zk 7 l1 V C4 S y2 E 1c 1 a2 5 I4 0 oT M EF i 8K 6 QD T kk 1 Zs K P0 B E/ k 1C s Gl 4 XN / GB C FT V zE B Iy A im T ZW k J5 8 ZM n Q+ W pV p b8 M mi c 8M V lG M bF i Eu N Ig G VT F ZH i cE h Z7 T mK 3 U2 M 7F 5 ED K hq 2 ei I Og A sz q v9 y bj o 5a y Lu 9 OP j dY W cK u N/ P zv 4 GP C 1I + 7q u bN v rM A T7 z dL 1 rv s Rl 5 Rf L x2 v la l u1 f I6 y Ap q aU V Xo y IS w E5 X H8 Y Nn K 9A Y CC c ER H eT E 2g M iD BH T Dy s w6 G wg H QA c nr y ud j EQ D Vh D 3T V po S xw g HQ B 5H g 8i w VC Q 5F H d3 u zh A 51 J W7 n rp S1 0 Wn 75 m8 9 D1 F m5 Hn c P5 V 3f 5 Am n +n p fE S wX v CP O 4M v ff O Yy c zR I B8 / </ sE h lD 5 a/ + tF w eW H xO t ib 5 tg I >= /= i</latexit>
+
+)
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " I L A w D a o k x e m R d W V f + O 8 5 b 1 E 1 R q Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B Z B L y W R g h 4 L X j y 2 Y D + g D W W z n b R r N 5 u w u x F K 6 C / w 4 k E R r / 4 k b / 4 b t 2 0 O 2 v p g 4 P H e D D P z g k R w b V z 3 2 y l s b G 5 t 7 x R 3 S 3 v 7 B 4 d H 5 e O T t o 5 T x b D F Y h G r b k A 1 C i 6 x Z b g R 2 E 0 U 0 i g Q 2 A k m d 3 O / 8 4 R K 8 1 g + m G m C f k R H k o e c U W O l 5 t W g X H G r 7 g J k n X g 5 q U C O x q D 8 1 R / G L I 1 Q G i a o 1 j 3 P T Y y f U W U 4 E z g r 9 V O N C W U T O s K e p Z J G q P 1 s c e i M X F h l S M J Y 2 Z K G L N T f E x m N t J 5 G g e 2 M q B n r V W 8 u / u f 1 U h P e + h m X S W p Q s u W i M B X E x G T + N R l y h c y I q S W U K W 5 v J W x M F W X G Z l O y I X i r L 6 + T 9 n X V c 6 t e s 1 a p 1 / I 4 i n A G 5 3 A J H t x A H e 6 h A S 1 g g P A M r / D m P D o v z r v z s W w t O P n M K f y B 8 / k D a k e M n w = = < / l a t e x i t >
+
+WChheaot nsgtawtPeo(zˆdrko|eaqss)Saamnga-teWroiaolsk < l a t e x i ts h a 1 _ b a s e 6 4 = " 6 y + H P 1 k d S t I R p Y / k p Z S x q R 9 X t R 8 J K K r + K O f h G N x m w B Z a d l N P V c Z o x h l z U 9 y h x u n x f A 0 S + A a h m p w 4 F o M I = " > A A A B 7 X i c b Z V C A 7 9 S T g w N J B F E I J b 2 P n L x 8 X l A z u v F M x + t C R 6 7 S i W 1 l 0 t z 2 F W Y q A g N U m g r V F M u e K T 5 u O s j R t X j A Y t z G J Y b W C E w Y j x w m k H A Y 5 s 8 C k E S L s 5 m L i R f d v Z z 2 S C Y 9 Z O b j V s Z v 7 m b R e 3 6 X L 7 m 7 c b p 0 N w I C J 8 X E 8 P v h I 6 9 O D s N j L h Q B Y X S R E x E 2 9 T B f v r / x / Y d j + e p W x 3 / 8 / c G x J y j F e 2 d X g o Q U 4 h P o N B O / N B G N x P n 3 j n s 4 y z / v z 3 j M O P w Y Z L c m E 0 Q y 6 k Q S s S K + G Q v H y 6 Q 6 3 d 7 V b r 1 + e h d T b 3 W M 1 9 r v j q f c 2 K v N m p z 6 G K X f b d r x n O d b w 2 3 t d 9 b v g 2 f / z 2 K u D h 1 4 0 f q d c H N P R q 6 3 1 i U P b T D O p e N 5 I W r N M x p 1 G q 1 o U g t 0 s l 7 Y r p 9 J 0 s Z M B L q N o O V X F w g S K D K x B F W U 5 s r D o e g U T Z P g I J y 3 m n E o c 8 j S 1 m h p N 5 F A K E s x j k z e b f C w z A e P b A z X 2 W k y I 7 x z z t d x P W w X a L B H U s W R P s q k b w 4 r c T D c 3 Y J c t j L y p 9 P U i a I P E h a + K U J M C U o A D p W C O j K a a 1 3 K q R 1 q F 6 3 F u + 8 0 x t + T Q R J v P c V H 6 / a d y K Y q J c P b s w f v d s u Z T J k G U W Q F W V O w v K Z A p t W C D U j 6 b 3 e j i p 4 9 z n / P m d H a Q 4 b e H V a g T p G v T q G F n r X + 3 y N Y C X 1 S u Z 1 x G t i n h y G P N F 4 u T C E F f I J Y m j y q W a T p l E 6 A t b w z o y 0 D a 3 + e Q i l z G b 6 g m h W p G T 5 w f Q S F t Q x m f o Y F p D d 4 n q Y n p n H 4 l U Q A U l 1 V l o j A j b 9 7 n r c v j s Z L K / Y h N u p o K x p R 4 O t 4 X z 9 f 4 m K 2 0 g X 4 E T 7 a J E u T X F m W J 1 6 I T J 5 p I u e y r E 1 v s f i b Q Y Z r z P J G I z 1 Z P k m 3 7 6 d i v M 0 z a H s K X y R G G M F h c E k M d z o 2 j s 2 A J Z J U u b R J G x / V b 3 H 5 m s Z d m z F 8 j K V L P s z r Y v X v 6 i 6 y Z X V U t Y k V n i I j J M t X L j b / 4 L 1 R E M K o q U S C u i R S V F K B r z T t T W j 8 a s K v o U k z 0 4 C k E V w B J n G t K M n G y q c W p O Z C E 1 s K 0 Z h Z E e y Y i 5 M H W 5 F w d i k A j b C T U Z w U V s I r 5 Y Y K u W o Q J n 9 I r q L U y I 0 t V 0 A h Z e + 2 q e g G Z M C U V P 0 7 4 L B C 6 G 2 u 8 v B x v X Z A w W r 3 X 1 u o y / X 7 E 5 L r e n t 9 l L t r I y 1 + y 7 j d t C + 1 C u Q d W 5 w K g C i 7 h c n w y Q U c w x A B 6 K X O n U 4 c B A j E b O e q w X 0 I E A M E A L F G q 7 D M q / A N K M V N r K W / E D G w m D C a O C e 7 8 / h w F C g e c a / b k c w T + 4 O F s 6 q T / 0 O F s m L / 5 P M 8 q + 5 v L h M 8 j 1 0 / K 5 w c i P 8 5 n 6 5 8 8 j A 5 + O x C b D P q + n O y 4 x P w n d = 4 F = A 5 < e Z / i N l Z G a k < t Y / e E l x = a i < t / e > l x a i t e > x i t >
+
+< l a t e x i ts h a 1 _ b a s e 6 4 = " R c Y 6 r d a p e B t o M o h m y o 9 + M v d h e z w = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L F b B U 0 l E 0 G P B i 8 c W 7 A e 0 o W y 2 k 3 b t Z h N 3 N 0 I J / Q V e P C j i 1 Z / k z X / j t s 1 B W x 8 M P N 6 b Y W Z e k A i u j e t + O 4 W 1 9 Y 3 N r e J 2 a W d 3 b / + g f H j U 0 n G q G D Z Z L G L V C a h G w S U 2 D T c C O 4 l C G g U C 2 8 H 4 d u a 3 n 1 B p H s t 7 M 0 n Q j + h Q 8 p A z a q z U e O y X K 2 7 V n Y O s E i 8 n F c h R 7 5 e / e o O Y p R F K w w T V u u u 5 i f E z q g x n A q e l X q o x o W x M h 9 i 1 V N I I t Z / N D 5 2 S c 6 s M S B g r W 9 K Q u f p 7 I q O R 1 p M o s J 0 R N S O 9 7 M 3 E / 7 x u a s I b P + M y S Q 1 K t l g U p o K Y m M y + J g O u k B k x s Y Q y x e 2 t h I 2 o o s z Y b E o 2 B G / 5 5 V X S u q x 6 b t V r X F V q Z 3 k c R T i B U 7 g A D 6 6 h B n d Q h y Y w Q H i G V 3 h z H p w X 5 9 3 5 W L Q W n H z m G P 7 A + f w B 0 p e M 1 w = = < / l a t e x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " I L A w D a o k x e m R d W V f + O 8 5 b 1 E 1 R q Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B Z B L y W R g h 4 L X j y 2 Y D + g D W W z n b R r N 5 u w u x F K 6 C / w 4 k E R r / 4 k b / 4 b t 2 0 O 2 v p g 4 P H e D D P z g k R w b V z 3 2 y l s b G 5 t 7 x R 3 S 3 v 7 B 4 d H 5 e O T t o 5 T x b D F Y h G r b k A 1 C i 6 x Z b g R 2 E 0 U 0 i g Q 2 A k m d 3 O / 8 4 R K 8 1 g + m G m C f k R H k o e c U W O l 5 t W g X H G r 7 g J k n X g 5 q U C O x q D 8 1 R / G L I 1 Q G i a o 1 j 3 P T Y y f U W U 4 E z g r 9 V O N C W U T O s K e p Z J G q P 1 s c e i M X F h l S M J Y 2 Z K G L N T f E x m N t J 5 G g e 2 M q B n r V W 8 u / u f 1 U h P e + h m X S W p Q s u W i M B X E x G T + N R l y h c y I q S W U K W 5 v J W x M F W X G Z l O y I X i r L 6 + T 9 n X V c 6 t e s 1 a p 1 / I 4 i n A G 5 3 A J H t x A H e 6 h A S 1 g g P A M r / D m P D o v z r v z s W w t O P n M K f y B 8 / k D a k e M n w = = < / l a t e x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " T b 3 D k y j j 2 E a p m O 5 d Z J g h P Z q 8 i B k = " > A A A B 6 X i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B a h p 5 J I o R 4 L X j x W s R / Q h r L Z b t q l m 0 3 Y n Q g l 9 B 9 4 8 a C I V / + R N / + N 2 z Y H b X 0 w 8 H h v h p l 5 Q S K F Q d f 9 d g p b 2 z u 7 e 8 X 9 0 s H h 0 f F J + f S s Y + J U M 9 5 m s Y x 1 L 6 C G S 6 F 4 G w V K 3 k s 0 p 1 E g e T e Y 3 i 7 8 7 h P X R s T q E W c J 9 y M 6 V i I U j K K V H l r V Y b n i 1 t w l y C b x c l K B H K 1 h + W s w i l k a c Y V M U m P 6 n p u g n 1 G N g k k + L w 1 S w x P K p n T M + 5 Y q G n H j Z 8 t L 5 + T K K i M S x t q W Q r J U f 0 9 k N D J m F g W 2 M 6 I 4 M e v e Q v z P 6 6 c Y 3 v i Z U E m K X L H V o j C V B G O y e J u M h O Y M 5 c w S y r S w t x I 2 o Z o y t O G U b A j e + s u b p H N d 8 9 y a d 1 + v N O t 5 H E W 4 g E u o g g c N a M I d t K A N D E J 4 h l d 4 c 6 b O i / P u f K x a C 0 4 + c w 5 / 4 H z + A A d G j P g = < / l a t e x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " 2 p k R m k J O l I g C Z Q 5 S e Q Q 9 1 L s U Y z Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B U 0 m k o M e C F 4 8 t 2 A 9 o Q 9 l s J + 3 a z S b s b o Q S + w u 8 e F D E q z / J m / / G b Z u D t j 4 Y e L w 3 w 8 y 8 I B F c G 9 f 9 d g o b m 1 v b O 8 X d 0 t 7 + w e F R + f i k r e N U M W y x W M S q G 1 C N g k t s G W 4 E d h O F N A o E d o L J 7 d z v P K L S P J b 3 Z p q g H 9 G R 5 C F n 1 F i p + T Q o V 9 y q u w B Z J 1 5 O K p C j M S h / 9 Y c x S y O U h g m q d c 9 z E + N n V B n O B M 5 K / V R j Q t m E j r B n q a Q R a j 9 b H D o j F 1 Y Z k j B W t q Q h C / X 3 R E Y j r a d R Y D s j a s Z 6 1 Z u L / 3 m 9 1 I Q 3 f s Z l k h q U b L k o T A U x M Z l / T Y Z c I T N i a g l l i t t b C R t T R Z m x 2 Z R s C N 7 q y + u k f V X 1 3 K r X r F X q t T y O I p z B O V y C B 9 d Q h z t o Q A s Y I D z D K 7 w 5 D 8 6 L 8 + 5 8 L F s L T j 5 z C n / g f P 4 A 6 B O M 8 g = = < / l a t e x i t >
+
+scientist?
+
+Sang-Wook Cheong 㱺 Rutgers University
+
+New Jersey
+
+Retriever Update
+
+P
+< l a t e x i t s h a 1 _ b a s e 6 4 = " T b 3 D k y j j 2 E a p m O 5 d Z J g h P Z q 8 i B k = " > A A A B 6 X i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B a h p 5 J I o R 4 L X j x W s R / Q h r L Z b t q l m 0 3 Y n Q g l 9 B 9 4 8 a C I V / + R N / + N 2 z Y H b X 0 w 8 H h v h p l 5 Q S K F Q d f 9 d g p b 2 z u 7 e 8 X 9 0 s H h 0 f F J + f S s Y + J U M 9 5 m s Y x 1 L 6 C G S 6 F 4 G w V K 3 k s 0 p 1 E g e T e Y 3 i 7 8 7 h P X R s T q E W c J 9 y M 6 V i I U j K K V H l r V Y b n i 1 t w l y C b x c l K B H K 1 h + W s w i l k a c Y V M U m P 6 n p u g n 1 G N g k k + L w 1 S w x P K p n T M + 5 Y q G n H j Z 8 t L 5 + T K K i M S x t q W Q r J U f 0 9 k N D J m F g W 2 M 6 I 4 M e v e Q v z P 6 6 c Y 3 v i Z U E m K X L H V o j C V B G O y e J u M h O Y M 5 c w S y r S w t x I 2 o Z o y t O G U b A j e + s u b p H N d 8 9 y a d 1 + v N O t 5 H E W 4 g E u o g g c N a M I d t K A N D E J 4 h l d 4 c 6 b O i / P u f K x a C 0 4 + c w 5 / 4 H z + A A d G j P g = < / l a t e x i t >
+
+(zˆ< l a t e x i ts h a 1 _ b a s e 6 4 = " 6 y + H P 1 k d S t I R p Y / k p Z S x q R 9 X t R 8 J K K r + K O f h G N x m w B Z a d l N P V c Z o x h l z U 9 y h x u n x f A 0 S + A a h m p w 4 F o M I = " > A A A B 7 X i c b Z V C A 7 9 S T g w N J B F E I J b 2 P n L x 8 X l A z u v F M x + t C R 6 7 S i W 1 l 0 t z 2 F W Y q A g N U m g r V F M u e K T 5 u O s j R t X j A Y t z G J Y b W C E w Y j x w m k H A Y 5 s 8 C k E S L s 5 m L i R f d v Z z 2 S C Y 9 Z O b j V s Z v 7 m b R e 3 6 X L 7 m 7 c b p 0 N w I C J 8 X E 8 P v h I 6 9 O D s N j L h Q B Y X S R E x E 2 9 T B f v r / x / Y d j + e p W x 3 / 8 / c G x J y j F e 2 d X g o Q U 4 h P o N B O / N B G N x P n 3 j n s 4 y z / v z 3 j M O P w Y Z L c m E 0 Q y 6 k Q S s S K + G Q v H y 6 Q 6 3 d 7 V b r 1 + e h d T b 3 W M 1 9 r v j q f c 2 K v N m p z 6 G K X f b d r x n O d b w 2 3 t d 9 b v g 2 f / z 2 K u D h 1 4 0 f q d c H N P R q 6 3 1 i U P b T D O p e N 5 I W r N M x p 1 G q 1 o U g t 0 s l 7 Y r p 9 J 0 s Z M B L q N o O V X F w g S K D K x B F W U 5 s r D o e g U T Z P g I J y 3 m n E o c 8 j S 1 m h p N 5 F A K E s x j k z e b f C w z A e P b A z X 2 W k y I 7 x z z t d x P W w X a L B H U s W R P s q k b w 4 r c T D c 3 Y J c t j L y p 9 P U i a I P E h a + K U J M C U o A D p W C O j K a a 1 3 K q R 1 q F 6 3 F u + 8 0 x t + T Q R J v P c V H 6 / a d y K Y q J c P b s w f v d s u Z T J k G U W Q F W V O w v K Z A p t W C D U j 6 b 3 e j i p 4 9 z n / P m d H a Q 4 b e H V a g T p G v T q G F n r X + 3 y N Y C X 1 S u Z 1 x G t i n h y G P N F 4 u T C E F f I J Y m j y q W a T p l E 6 A t b w z o y 0 D a 3 + e Q i l z G b 6 g m h W p G T 5 w f Q S F t Q x m f o Y F p D d 4 n q Y n p n H 4 l U Q A U l 1 V l o j A j b 9 7 n r c v j s Z L K / Y h N u p o K x p R 4 O t 4 X z 9 f 4 m K 2 0 g X 4 E T 7 a J E u T X F m W J 1 6 I T J 5 p I u e y r E 1 v s f i b Q Y Z r z P J G I z 1 Z P k m 3 7 6 d i v M 0 z a H s K X y R G G M F h c E k M d z o 2 j s 2 A J Z J U u b R J G x / V b 3 H 5 m s Z d m z F 8 j K V L P s z r Y v X v 6 i 6 y Z X V U t Y k V n i I j J M t X L j b / 4 L 1 R E M K o q U S C u i R S V F K B r z T t T W j 8 a s K v o U k z 0 4 C k E V w B J n G t K M n G y q c W p O Z C E 1 s K 0 Z h Z E e y Y i 5 M H W 5 F w d i k A j b C T U Z w U V s I r 5 Y Y K u W o Q J n 9 I r q L U y I 0 t V 0 A h Z e + 2 q e g G Z M C U V P 0 7 4 L B C 6 G 2 u 8 v B x v X Z A w W r 3 X 1 u o y / X 7 E 5 L r e n t 9 l L t r I y 1 + y 7 j d t C + 1 C u Q d W 5 w K g C i 7 h c n w y Q U c w x A B 6 K X O n U 4 c B A j E b O e q w X 0 I E A M E A L F G q 7 D M q / A N K M V N r K W / E D G w m D C a O C e 7 8 / h w F C g e c a / b k c w T + 4 O F s 6 q T / 0 O F s m L / 5 P M 8 q + 5 v L h M 8 j 1 0 / K 5 w c i P 8 5 n 6 5 8 8 j A 5 + O x C b D P q + n O y 4 x P w n d = 4 F = A 5 < e Z / i N l Z G a k < t Y / e E l x = a i < t / e > l x a i t e > x i t >
+
+|
+< l a t e x i t s h a 1 _ b a s e 6 4 = " 2 p k R m k J O l I g C Z Q 5 S e Q Q 9 1 L s U Y z Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B U 0 m k o M e C F 4 8 t 2 A 9 o Q 9 l s J + 3 a z S b s b o Q S + w u 8 e F D E q z / J m / / G b Z u D t j 4 Y e L w 3 w 8 y 8 I B F c G 9 f 9 d g o b m 1 v b O 8 X d 0 t 7 + w e F R + f i k r e N U M W y x W M S q G 1 C N g k t s G W 4 E d h O F N A o E d o L J 7 d z v P K L S P J b 3 Z p q g H 9 G R 5 C F n 1 F i p + T Q o V 9 y q u w B Z J 1 5 O K p C j M S h / 9 Y c x S y O U h g m q d c 9 z E + N n V B n O B M 5 K / V R j Q t m E j r B n q a Q R a j 9 b H D o j F 1 Y Z k j B W t q Q h C / X 3 R E Y j r a d R Y D s j a s Z 6 1 Z u L / 3 m 9 1 I Q 3 f s Z l k h q U b L k o T A U x M Z l / T Y Z c I T N i a g l l i t t b C R t T R Z m x 2 Z R s C N 7 q y + u k f V X 1 3 K r X r F X q t T y O I p z B O V y C B 9 d Q h z t o Q A s Y I D z D K 7 w 5 D 8 6 L 8 + 5 8 L F s L T j 5 z C n / g f P 4 A 6 B O M 8 g = = < / l a t e x i t >
+
+q< l a t e x i ts h a 1 _ b a s e 6 4 = " R c Y 6 r d a p e B t o M o h m y o 9 + M v d h e z w = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L F b B U 0 l E 0 G P B i 8 c W 7 A e 0 o W y 2 k 3 b t Z h N 3 N 0 I J / Q V e P C j i 1 Z / k z X / j t s 1 B W x 8 M P N 6 b Y W Z e k A i u j e t + O 4 W 1 9 Y 3 N r e J 2 a W d 3 b / + g f H j U 0 n G q G D Z Z L G L V C a h G w S U 2 D T c C O 4 l C G g U C 2 8 H 4 d u a 3 n 1 B p H s t 7 M 0 n Q j + h Q 8 p A z a q z U e O y X K 2 7 V n Y O s E i 8 n F c h R 7 5 e / e o O Y p R F K w w T V u u u 5 i f E z q g x n A q e l X q o x o W x M h 9 i 1 V N I I t Z / N D 5 2 S c 6 s M S B g r W 9 K Q u f p 7 I q O R 1 p M o s J 0 R N S O 9 7 M 3 E / 7 x u a s I b P + M y S Q 1 K t l g U p o K Y m M y + J g O u k B k x s Y Q y x e 2 t h I 2 o o s z Y b E o 2 B G / 5 5 V X S u q x 6 b t V r X F V q Z 3 k c R T i B U 7 g A D 6 6 h B n d Q h y Y w Q H i G V 3 h z H p w X 5 9 3 5 W L Q W n H z m G P 7 A + f w B 0 p e M 1 w = = < / l a t e x i t >
+
+)
+< l a t e x i t s h a 1 _ b a s e 6 4 = " I L A w D a o k x e m R d W V f + O 8 5 b 1 E 1 R q Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B Z B L y W R g h 4 L X j y 2 Y D + g D W W z n b R r N 5 u w u x F K 6 C / w 4 k E R r / 4 k b / 4 b t 2 0 O 2 v p g 4 P H e D D P z g k R w b V z 3 2 y l s b G 5 t 7 x R 3 S 3 v 7 B 4 d H 5 e O T t o 5 T x b D F Y h G r b k A 1 C i 6 x Z b g R 2 E 0 U 0 i g Q 2 A k m d 3 O / 8 4 R K 8 1 g + m G m C f k R H k o e c U W O l 5 t W g X H G r 7 g J k n X g 5 q U C O x q D 8 1 R / G L I 1 Q G i a o 1 j 3 P T Y y f U W U 4 E z g r 9 V O N C W U T O s K e p Z J G q P 1 s c e i M X F h l S M J Y 2 Z K G L N T f E x m N t J 5 G g e 2 M q B n r V W 8 u / u f 1 U h P e + h m X S W p Q s u W i M B X E x G T + N R l y h c y I q S W U K W 5 v J W x M F W X G Z l O y I X i r L 6 + T 9 n X V c 6 t e s 1 a p 1 / I 4 i n A G 5 3 A J H t x A H e 6 h A S 1 g g P A M r / D m P D o v z r v z s W w t O P n M K f y B 8 / k D a k e M n w = = < / l a t e x i t >
+
+Reader Update
+
+P
+
+( < l a t e x i ts h a 1 _ b a s e 6 4 = " d V L E D 7 o W m 1 u S f 9 + 5 n U T P f 4 v N w 5 6 y 6 E s F T M B A z k Z f I R O q i U E / H e l U g G 7 b 2 J A l M h J j I R k F M 9 T D l s T v E Q 4 = " > A A A B 6 H i c b Z V C B 7 N S T w g 8 N J B A E F M I J b 3 n P i 4 e F i o + u 3 I e r X r L 6 6 W t i p H l p L z M B Z y m I Q L g I i W V i I m b U H R 7 X e G R 9 2 h E 3 s j E x i g Y x I G S 1 O M l Z k A g F u L k Y l i B A g S E I Q s d h L t 7 s l m 5 C 7 G i l w v k y b z Z b d n b 7 Z O e 2 7 s m N b Z S s k E n V N h w v C p 8 N I C g n L b s B 2 L 4 O F 3 h Q x i x 6 K F k 2 Y / N L y / 3 5 4 8 r + d 9 d G x / f g 4 B R 2 s 4 b n U R l f 6 0 M G I k J T k H f L y x + z j / 8 4 N + Z L P G 4 9 Z Z z e d m m H A a N q C O u R k j H A e B i t t u + P j O O e 6 / d W b 9 t y O 7 a y Z 2 u 3 t r d b a v 2 + f x s J u b + 5 m b 7 e f k D d t w n d 6 d 3 P 2 t i 9 n k / d e Y 2 n P 8 r C / W 4 f 0 V 3 U F B m D Y m x 1 G 6 3 P l G o i q s W G E G N Y e Z n x Y q i L h F G V U L S r V j o D 4 B K o h J F G 9 l w 1 S 4 g X 3 3 W A 3 D X A D q h c q s C Q J m x Q 4 q p l H p C A F G b A g j h U i s C 9 B G W q 8 / O H j b w d a e J d p 1 5 I S 8 3 a Q 7 J K l / V F L 5 p B L H z O s F / t I M b O M Y M 0 j F q u w W R E P A 9 O e G K S + M h 5 G 5 C i x F u R n 1 Y 1 6 6 F b 0 i B a r 7 S d R r x V v K 5 u X o E t l m m f S b y T i p e a i A y L W C L p v 4 Q 4 M D + H S h W 9 e s a P d X o 7 h 1 9 X G Q i C g b U A v s 1 X i V 2 1 7 6 E h l a q m J 9 / q O 9 j P s W W 9 f R 2 c q K 9 h W N N R T E i Z x g B Q N T r E Z d 1 T u T g + r T l O 5 u K h 8 u l M R p M p o X N 0 h R p T Z O T V D g M E T 6 7 O x a H r Q b 6 a b l E q k 8 c s p a G E o d s g I i 3 B H x t 5 i Y 6 5 8 J J u x G i c q p W L B m v H V Z q E b T o N j k A Y T J d Z O d k b E o V x Y O s n r 1 4 N d S M 8 x j T s Y O k a Y 8 z 2 a s 1 M k n n 4 s N Z W / M h d 3 7 2 d Y Q 8 y 0 d p 0 G m n Y e o 2 h c 0 1 B H b b k y Y W H y B + o r 5 m Y / a y U o z l G E 7 e 9 O j 0 p F G + b O V G Z / L d W + p T l Z k 7 l 1 V C 4 S y 2 E 1 c 1 a 2 5 I 4 0 o T M E F i 8 K 6 Q D T k k 1 Z s K P 0 B E / k 1 C s G l 4 X N / G B C F T V z E B I y A i m T Z W k J 5 8 Z M n Q + W p V p b 8 M m i c 8 M V l G M b F i E u N I g G V T F Z H i c E h Z 7 T m K 3 U 2 M 7 F 5 E D K h q 2 e i I O g A s z q v 9 y b j o 5 a y L u 9 O P j d Y W c K u N / P z v 4 G P C 1 I + 7 q u b N v r M A T 7 z d L 1 r v s R l 5 R f L x 2 v l a l u 1 f I 6 y A p q a U V X o y I S w E 5 X H 8 Y N n K 9 A Y C C c E R H e T E 2 g M i D B H T D y s w 6 G w g H Q A c n r y u d j E Q D V h D 3 T V p o S x w g H Q B 5 H g 8 i w V C Q 5 F H d 3 u z h A 5 1 J W 7 n r p S 1 0 W n 7 5 m 8 9 D 1 F m 5 H n c P 5 V 3 f 5 A m n + n p f E S w X v C P O 4 M v f f O Y y c z R I B 8 / < / s E h l D 5 a / + t F w e W H x O t i b 5 t g I > = / = i < / l a t e x i t >
+
+a
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " T b 3 D k y j j 2 E a p m O 5 d Z J g h P Z q 8 i B k = " > A A A B 6 X i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B a h p 5 J I o R 4 L X j x W s R / Q h r L Z b t q l m 0 3 Y n Q g l 9 B 9 4 8 a C I V / + R N / + N 2 z Y H b X 0 w 8 H h v h p l 5 Q S K F Q d f 9 d g p b 2 z u 7 e 8 X 9 0 s H h 0 f F J + f S s Y + J U M 9 5 m s Y x 1 L 6 C G S 6 F 4 G w V K 3 k s 0 p 1 E g e T e Y 3 i 7 8 7 h P X R s T q E W c J 9 y M 6 V i I U j K K V H l r V Y b n i 1 t w l y C b x c l K B H K 1 h + W s w i l k a c Y V M U m P 6 n p u g n 1 G N g k k + L w 1 S w x P K p n T M + 5 Y q G n H j Z 8 t L 5 + T K K i M S x t q W Q r J U f 0 9 k N D J m F g W 2 M 6 I 4 M e v e Q v z P 6 6 c Y 3 v i Z U E m K X L H V o j C V B G O y e J u M h O Y M 5 c w S y r S w t x I 2 o Z o y t O G U b A j e + s u b p H N d 8 9 y a d 1 + v N O t 5 H E W 4 g E u o g g c N a M I d t K A N D E J 4 h l d 4 c 6 b O i / P u f K x a C 0 4 + c w 5 / 4 H z + A A d G j P g = < / l a t e x i t >
+
+|
+
+q< l a t e x i ts h a 1 _ b a s e 6 4 = " R c Y 6 r d a p e B t o M o h m y o 9 + M v d h e z w = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L F b B U 0 l E 0 G P B i 8 c W 7 A e 0 o W y 2 k 3 b t Z h N 3 N 0 I J / Q V e P C j i 1 Z / k z X / j t s 1 B W x 8 M P N 6 b Y W Z e k A i u j e t + O 4 W 1 9 Y 3 N r e J 2 a W d 3 b / + g f H j U 0 n G q G D Z Z L G L V C a h G w S U 2 D T c C O 4 l C G g U C 2 8 H 4 d u a 3 n 1 B p H s t 7 M 0 n Q j + h Q 8 p A z a q z U e O y X K 2 7 V n Y O s E i 8 n F c h R 7 5 e / e o O Y p R F K w w T V u u u 5 i f E z q g x n A q e l X q o x o W x M h 9 i 1 V N I I t Z / N D 5 2 S c 6 s M S B g r W 9 K Q u f p 7 I q O R 1 p M o s J 0 R N S O 9 7 M 3 E / 7 x u a s I b P + M y S Q 1 K t l g U p o K Y m M y + J g O u k B k x s Y Q y x e 2 t h I 2 o o s z Y b E o 2 B G / 5 5 V X S u q x 6 b t V r X F V q Z 3 k c R T i B U 7 g A D 6 6 h B n d Q h y Y w Q H i G V 3 h z H p w X 5 9 3 5 W L Q W n H z m G P 7 A + f w B 0 p e M 1 w = = < / l a t e x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " 2 p k R m k J O l I g C Z Q 5 S e Q Q 9 1 L s U Y z Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B U 0 m k o M e C F 4 8 t 2 A 9 o Q 9 l s J + 3 a z S b s b o Q S + w u 8 e F D E q z / J m / / G b Z u D t j 4 Y e L w 3 w 8 y 8 I B F c G 9 f 9 d g o b m 1 v b O 8 X d 0 t 7 + w e F R + f i k r e N U M W y x W M S q G 1 C N g k t s G W 4 E d h O F N A o E d o L J 7 d z v P K L S P J b 3 Z p q g H 9 G R 5 C F n 1 F i p + T Q o V 9 y q u w B Z J 1 5 O K p C j M S h / 9 Y c x S y O U h g m q d c 9 z E + N n V B n O B M 5 K / V R j Q t m E j r B n q a Q R a j 9 b H D o j F 1 Y Z k j B W t q Q h C / X 3 R E Y j r a d R Y D s j a s Z 6 1 Z u L / 3 m 9 1 I Q 3 f s Z l k h q U b L k o T A U x M Z l / T Y Z c I T N i a g l l i t t b C R t T R Z m x 2 Z R s C N 7 q y + u k f V X 1 3 K r X r F X q t T y O I p z B O V y C B 9 d Q h z t o Q A s Y I D z D K 7 w 5 D 8 6 L 8 + 5 8 L F s L T j 5 z C n / g f P 4 A 6 B O M 8 g = = < / l a t e x i t >
+
+,
+
+zˆ< l a t e x i ts h a 1 _ b a s e 6 4 = " 6 y + H P 1 k d S t I R p Y / k p Z S x q R 9 X t R 8 J K K r + K O f h G N x m w B Z a d l N P V c Z o x h l z U 9 y h x u n x f A 0 S + A a h m p w 4 F o M I = " > A A A B 7 X i c b Z V C A 7 9 S T g w N J B F E I J b 2 P n L x 8 X l A z u v F M x + t C R 6 7 S i W 1 l 0 t z 2 F W Y q A g N U m g r V F M u e K T 5 u O s j R t X j A Y t z G J Y b W C E w Y j x w m k H A Y 5 s 8 C k E S L s 5 m L i R f d v Z z 2 S C Y 9 Z O b j V s Z v 7 m b R e 3 6 X L 7 m 7 c b p 0 N w I C J 8 X E 8 P v h I 6 9 O D s N j L h Q B Y X S R E x E 2 9 T B f v r / x / Y d j + e p W x 3 / 8 / c G x J y j F e 2 d X g o Q U 4 h P o N B O / N B G N x P n 3 j n s 4 y z / v z 3 j M O P w Y Z L c m E 0 Q y 6 k Q S s S K + G Q v H y 6 Q 6 3 d 7 V b r 1 + e h d T b 3 W M 1 9 r v j q f c 2 K v N m p z 6 G K X f b d r x n O d b w 2 3 t d 9 b v g 2 f / z 2 K u D h 1 4 0 f q d c H N P R q 6 3 1 i U P b T D O p e N 5 I W r N M x p 1 G q 1 o U g t 0 s l 7 Y r p 9 J 0 s Z M B L q N o O V X F w g S K D K x B F W U 5 s r D o e g U T Z P g I J y 3 m n E o c 8 j S 1 m h p N 5 F A K E s x j k z e b f C w z A e P b A z X 2 W k y I 7 x z z t d x P W w X a L B H U s W R P s q k b w 4 r c T D c 3 Y J c t j L y p 9 P U i a I P E h a + K U J M C U o A D p W C O j K a a 1 3 K q R 1 q F 6 3 F u + 8 0 x t + T Q R J v P c V H 6 / a d y K Y q J c P b s w f v d s u Z T J k G U W Q F W V O w v K Z A p t W C D U j 6 b 3 e j i p 4 9 z n / P m d H a Q 4 b e H V a g T p G v T q G F n r X + 3 y N Y C X 1 S u Z 1 x G t i n h y G P N F 4 u T C E F f I J Y m j y q W a T p l E 6 A t b w z o y 0 D a 3 + e Q i l z G b 6 g m h W p G T 5 w f Q S F t Q x m f o Y F p D d 4 n q Y n p n H 4 l U Q A U l 1 V l o j A j b 9 7 n r c v j s Z L K / Y h N u p o K x p R 4 O t 4 X z 9 f 4 m K 2 0 g X 4 E T 7 a J E u T X F m W J 1 6 I T J 5 p I u e y r E 1 v s f i b Q Y Z r z P J G I z 1 Z P k m 3 7 6 d i v M 0 z a H s K X y R G G M F h c E k M d z o 2 j s 2 A J Z J U u b R J G x / V b 3 H 5 m s Z d m z F 8 j K V L P s z r Y v X v 6 i 6 y Z X V U t Y k V n i I j J M t X L j b / 4 L 1 R E M K o q U S C u i R S V F K B r z T t T W j 8 a s K v o U k z 0 4 C k E V w B J n G t K M n G y q c W p O Z C E 1 s K 0 Z h Z E e y Y i 5 M H W 5 F w d i k A j b C T U Z w U V s I r 5 Y Y K u W o Q J n 9 I r q L U y I 0 t V 0 A h Z e + 2 q e g G Z M C U V P 0 7 4 L B C 6 G 2 u 8 v B x v X Z A w W r 3 X 1 u o y / X 7 E 5 L r e n t 9 l L t r I y 1 + y 7 j d t C + 1 C u Q d W 5 w K g C i 7 h c n w y Q U c w x A B 6 K X O n U 4 c B A j E b O e q w X 0 I E A M E A L F G q 7 D M q / A N K M V N r K W / E D G w m D C a O C e 7 8 / h w F C g e c a / b k c w T + 4 O F s 6 q T / 0 O F s m L / 5 P M 8 q + 5 v L h M 8 j 1 0 / K 5 w c i P 8 5 n 6 5 8 8 j A 5 + O x C b D P q + n O y 4 x P w n d = 4 F = A 5 < e Z / i N l Z G a k < t Y / e E l x = a i < t / e > l x a i t e > x i t >
+
+)
+< l a t e x i t s h a 1 _ b a s e 6 4 = " I L A w D a o k x e m R d W V f + O 8 5 b 1 E 1 R q Q = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B Z B L y W R g h 4 L X j y 2 Y D + g D W W z n b R r N 5 u w u x F K 6 C / w 4 k E R r / 4 k b / 4 b t 2 0 O 2 v p g 4 P H e D D P z g k R w b V z 3 2 y l s b G 5 t 7 x R 3 S 3 v 7 B 4 d H 5 e O T t o 5 T x b D F Y h G r b k A 1 C i 6 x Z b g R 2 E 0 U 0 i g Q 2 A k m d 3 O / 8 4 R K 8 1 g + m G m C f k R H k o e c U W O l 5 t W g X H G r 7 g J k n X g 5 q U C O x q D 8 1 R / G L I 1 Q G i a o 1 j 3 P T Y y f U W U 4 E z g r 9 V O N C W U T O s K e p Z J G q P 1 s c e i M X F h l S M J Y 2 Z K G L N T f E x m N t J 5 G g e 2 M q B n r V W 8 u / u f 1 U h P e + h m X S W p Q s u W i M B X E x G T + N R l y h c y I q S W U K W 5 v J W x M F W X G Z l O y I X i r L 6 + T 9 n X V c 6 t e s 1 a p 1 / I 4 i n A G 5 3 A J H t x A H e 6 h A S 1 g g P A M r / D m P D o v z r v z s W w t O P n M K f y B 8 / k D a k e M n w = = < / l a t e x i t >
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " J w C 3 u J s 3 i N L n E n p O P C U g 6 G T D n Z U = " > A A A B 6 H i c b V B N S 8 N A E J 3 U r 1 q / q h 6 9 L B b B g 5 R E C n o s e P H Y g v 2 A N p T N d t K u 3 W z C 7 k Y o o b / A i w d F v P q T v P l v 3 L Y 5 a O u D g c d 7 M 8 z M C x L B t X H d b 6 e w s b m 1 v V P c L e 3 t H x w e l Y 9 P 2 j p O F c M W i 0 W s u g H V K L j E l u F G Y D d R S K N A Y C e Y 3 M 3 9 z h M q z W P 5 Y K Y J + h E d S R 5 y R o 2 V m l e D c s W t u g u Q d e L l p A I 5 G o P y V 3 8 Y s z R C a Z i g W v c 8 N z F + R p X h T O C s 1 E 8 1 J p R N 6 A h 7 l k o a o f a z x a E z c m G V I Q l j Z U s a s l B / T 2 Q 0 0 n o a B b Y z o m a s V 7 2 5 + J / X S 0 1 4 6 2 d c J q l B y Z a L w l Q Q E 5 P 5 1 2 T I F T I j p p Z Q p r i 9 l b A x V Z Q Z m 0 3 J h u C t v r x O 2 t d V z 6 1 6 z V q l X s v j K M I Z n M M l e H A D d b i H B r S A A c I z v M K b 8 + i 8 O O / O x 7 K 1 4 O Q z p / A H z u c P b t O M o g = = < / l a t e x i t >
+
+Figure 2: Our DISTDR model, with question: q , evidence: z , answer: a , model component: Dense Retrieval . indicates reader output matches the correct answer, thus the positive evidence is kept (otherwise ﬁltered out, presented by ). Left: at E-step, DISTDR ﬁnds the most relevant evidence using the current dense retriever on the training examples, uses both answer string matching and reader ﬁlter to form positive and negative evidence. Right: at M-step, DISTDR updates both retriever and reader components using the training data from E-step as distant supervision.
+
+where wstart and wend are weights. From the highest-scored evidence zˆ, we select the answer with the highest span probability P (start | zˆ, q) × P (end | zˆ, q). The training objective is the loglikelihood of the positive evidence for reranking and maximum marginal likelihood over all spans in the positive evidence for span extraction.
+3.2 Learning DISTDR: Hard-EM
+This section introduces training DISTDR with weak supervision. We treat the evidence z as a latent variable (Figure 2) with a multinomial distribution (parameterized by probability of selecting correct evidence from the retriever) over solution set Z = D × n, where D is the corpus size and n is the number of retrieval steps. Formally, given the question q and answer a, our goal is to maximize the probability of ﬁnding correct evidence P (z | q) (For single-hop questions, z is retrieved with single step; for multi-hop questions, it takes multiple steps to ﬁnd z: after the ﬁrst retrieval step, the query q is not just the original question but also appended evidence as in Equation 2.), and selecting an answer from the question P (a | q, z). We use expectation maximization (EM) to infer the latent variable z. We compute the likelihood of each z given q, yielding a vector of estimates zˆ (Estep); then update the model parameters based on zˆ (M-step). Since it’s intractable to enumerate all evidence candidates to compute the expectation, we adopt hard-EM (Samdani et al., 2012) and approximate the E-step by picking the most likely solution as zˆ. We pass over all questions in the training set and repeat this process for multiple iterations until the model converges.
+Hard E-step At the hard E-step, for each question q in the training set we ﬁnd the most likely estimated evidence zˆ. This is implemented by multiple
+
+retrieval steps for multi-hop questions, speciﬁcally at each step t:
+zˆt = arg max P (zˆt | q, zˆ1, ..., zˆt−1); (7)
+zˆ∈Z
+and single-step retrieval for single-hop questions. We use an up-to-date retriever to ﬁnd the top-k evidence from corpus (with beam search for the k-highest scoring chains, Section 3.1).
+Given the retrieval output, we will eventually need to retrain the retriever. This requires knowing which evidence is useful and which is not. As a proxy, we look for the answer to split the top-k candidate evidence into positive (has the answer) Zˆ+ and negative Zˆ− evidence (lacks the answer) sets. And as a by-product, we generate the most challenging negative evidence at each iteration, which makes training more robust (Guu et al., 2020).
+Evidence Filter Although using the answer to ﬁlter evidence ensures that the positive evidence contains the answer, it does not always mean this evidence is relevant. For example, the answer to “Who played in the most world series MLB games” is New York Yankees, but “New York Yankees is an American professional baseball team” is not the correct evidence. This issue is more pronounced at the beginning of the process when the retriever is weaker. To mitigate this issue, the reader ﬁlters spurious positives: if it does not believe New York Yankees is the answer to the question, the evidence is not usable. Speciﬁcally, for each evidence zˆ+ in the positive evidence set, the current reader model outputs the most likely answer aˆ. We only keep positive evidence if aˆ matches the correct answer.
+M-step Now that we have our estimated evidence zˆ, including both the highest scored positive evidence zˆ+ (after ﬁltering), which we assume is a true solution, and Zˆ− as negative evidence set. We
+
+have (q, zˆ, a) for each training example to update both the retriever P (zˆ | q) and reader P (a | q, zˆ) (Section 3.1).
+4 Experiments
+In this section, we evaluate DISTDR on both multihop and single-hop QA benchmarks. DISTDR is generally applicable to both questions by adopting different evidence retrieval steps.
+4.1 Datasets
+We evaluate on two datasets (statistics in Table 1), HOTPOTQA and NATURALQUESTIONS.
+HOTPOTQA (Yang et al., 2018) is a multi-hop QA benchmark, where intermediate hops have been annotated by hand. We focus on the full wiki setting, where the corpus is ﬁrst passage of all Wikipedia pages (5.23 million passages). We do not use its supporting facts (evidence) annotation in our setting. We only use its bridge questions subset, which are designed to be multi-hop. HOTPOTQA also includes comparison questions that compare properties of two question entities, but its yes/no answers are beyond the scope of this paper, as we cannot get distant supervision from them.
+NATURALQUESTIONS (Kwiatkowski et al., 2019) is a QA benchmark, which mainly includes single-hop questions. Besides questions and answers, NATURALQUESTIONS also annotates passages as evidence, but we do not use it in the weakly-supervised setting. We follow Karpukhin et al. (2020) and use all of Wikipedia as a corpus, split into 100-token chunks (21 million passages).
+4.2 Evaluation Metrics
+On HOTPOTQA, we evaluate the retrieval component on ten evidence (chains), where each sequence has two passages. For retrieval, we follow Zhao et al. (2021) and report answer recall (the fraction of questions with the answer string in the retrieved passages), passage recall (if at least one gold passage is in the retrieved passages), and chain recall (if both gold passages are included in the retrieved passages) on the dev set. For the reader, we ﬁrst use the same metrics as above on the top ten chains reranked from top-100 retrieval results for reranking. Then we report an exact match (EM) score on answer spans. On NATURALQUESTIONS, we report answer recall on top-k passages (k = 1, 20) from the retriever, and exact match (EM) on answer spans on test set, following Karpukhin et al. (2020).
+
+Dataset
+HOTPOTQA NATURALQUESTIONS
+
+Train
+72,424 79,168
+
+Dev
+5,918 8,757
+
+Test
+3,610
+
+Table 1: Number of questions on HOTPOTQA and NATURALQUESTIONS. We use the dev (sub)set to evaluate HOTPOTQA, since the test set is hidden and we only use its bridge questions.
+
+4.3 Compared Methods
+On HOTPOTQA retrieval, we compare DISTDR with unsupervised TF-IDF, and two recent stateof-the-art multi-step dense retrieval methods— BEAMDR (Zhao et al., 2021) and MDR (Xiong et al., 2021b)—under full supervision. For the reader, we ﬁrst compare DISTDR with BEAMDR and two other top leaderboard entries, TransformerXH (Zhao et al., 2020) and GRR (Asai et al., 2020), both of which use Wikipedia hyperlinks to ﬁnd candidates. For fair comparison, all approaches use BERT-base as pre-trained model, and we use the released model checkpoints to do inference on bridge question subsets.1
+On NATURALQUESTIONS, we compare DISTDR with two state-of-the-art dense retrieval methods, DPR (Karpukhin et al., 2020) and ANCE (Xiong et al., 2021a), which use same model architecture as DPR, with asynchronous negative evidence updates during training. We evaluate on fully-supervised and weakly-supervised settings. We directly use the released model checkpoint on full supervision and train models from published code and data2 on distant supervision. All approaches use BERT-base as pre-trained model.
+4.4 Implementation details
+On HOTPOTQA, we initialize our retriever with a dense retrieval checkpoint from NATURALQUESTIONS for both hops.3 To initialize the reader, we ﬁrst run DISTDR’s retrieval for one iteration (with-
+1MDR uses RoBERTa-base for retrieval, and BERT/ELECTRA-large for reranking and span extraction. We include the retrieval results (though it gives slight gains) but do not compare the reader. We expect the reader results are close to BEAMDR, as both use similar models.
+2The released data uses answers to match top BM-25 results for distant supervision.
+3We make this choice because we need a cold starting point for our EM process (i.e., at the ﬁrst iteration, ﬁnd some training signals from the retrieved evidence). The initialization on HOTPOTQA does not use any evidence labels (which would be cheating in our setting). There are potentially alternative approaches to initializations that could be considered for future work.
+
+Models
+
+Ans
+
+No Supervision
+
+TF-IDF
+
+60.7
+
+Full Supervision
+
+MDR
+
+85.2
+
+BEAMDR
+
+84.9
+
+Distant Supervision
+
+DISTDR w/ TF-IDF chains 55.6
+
+DISTDR
+
+86.2
+
+Passage Chain
+90.8 35.8
+89.3 75.3 91.1 73.6
+52.3 22.3 92.2 75.1
+
+Table 2: Compare DISTDR’s retrieval (based on top-10 chains) with unsupervised and fully-supervised methods on HOTPOTQA dev set over answer, passage and chain recall. DISTDR matches fully-supervised dense retrieval approaches.
+
+Models
+
+Ans Passage Chain Span
+
+Full Supervision Transformer-XH
+GRR
+BEAMDR
+
+91.8 97.0 87.5 92.2 90.5 94.7
+
+81.3 52.4 79.0 50.4 83.0 52.6
+
+Distant Supervision
+
+DISTDR
+
+91.4 95.3
+
+81.7 51.6
+
+Table 3: Compare DISTDR with other fully-supervised methods with reranking over answer, passage and chain recall, and span extraction over span exact match. DISTDR is competitive to BEAMDR.
+
+out the reader ﬁlter), and train the reader from scratch, using the top-50 retrieval outputs.4 We use the same hyper-parameters as BEAMDR, and train DISTDR for eight iterations.5 On NATURALQUESTIONS, we initialize DISTDR from a DPR checkpoint under distant supervision (so the evidence label is not used). We train DISTDR for ten iterations, using the same hyper-parameters as DPR (Karpukhin et al., 2020). We run DISTDR on eight 2080Ti GPUs, and training takes three days.
+4.5 Main Results
+Table 2 presents retrieval results on HOTPOTQA. Here, TF-IDF is only able to ﬁnd one evidence piece (usually the ﬁrst hop which overlaps with question), but fails to ﬁnd all the evidence pieces. Hence, using evidence from TF-IDF as distant supervision cannot effectively train DISTDR. DISTDR is slightly better than BEAMDR and MDR—both are state-of-the-art dense retrieval methods with
+4We follow the reader setup from Karpukhin et al. (2020): if multiple positives are in top-50 outputs, one of them is sampled as the positive instance in each training iteration. Our pilot experiment shows that reader model is robust: such initialization gives reasonable accuracy.
+5DISTDR converges after ﬁve iterations (Figure 3).
+
+Models
+Full Supervision
+DPR ANCE
+Distant Supervision
+DPR ANCE
+DISTDR
+
+Top 1 Top 20 Span
+46.3 78.4 41.5 50.9 81.9 46.0
+45.2 78.2 37.9 45.7 79.1 38.3 50.4 80.1 40.5
+
+Table 4: Compare DISTDR with other dense retrieval systems on NATURALQUESTIONS dataset over answer recall @1, 20, and span exact match. DISTDR is competitive to fully-supervised approaches.
+
+Models
+
+Ans Passage Chain
+
+DISTDR
+
+86.2 92.2 75.1
+
+DISTDR w/ Sampled Pos 83.9 90.9 72.1
+
+Remove Reader Filter
+
+85.4 91.9 72.1
+
+Remove Non-gold Evidence 66.7 74.1 53.1
+
+Table 5: Ablation Studies evaluated on answer, passage and chain recall over top-10 chains.
+
+full supervision—even though DISTDR is only trained on (question, answer) pairs. When using the same model implementation but with distant supervision, DISTDR is competitive to BEAMDR on reader results (Table 3). On NATURALQUESTIONS (Table 4), unlike multi-hop questions, using IR to ﬁnd evidence as distant supervision provides helpful training signals, which is conﬁrmed by small gap between distant and full supervision.6 Building on top of distantly-supervised DPR, DISTDR beats weakly-supervised systems, and is competitive with fully-supervised models.
+5 Analysis
+This section explores HOTPOTQA results to understand why DISTDR is on par with fully-supervised approaches.
+5.1 Analysis on Model Training
+We ﬁrst study how DISTDR ﬁnds better evidence from a large corpus with hard EM.
+Effect of Hard EM We study the effect of hard EM by going through accuracy and extracted evidence statistics at every iteration. Chain recall
+6Compared to retrieval, the gap is larger for the reader. This is due to training data processing for DPR (and ANCE). On retrieval, DPR replaces annotated gold passage with the corresponding 100-token passage in the candidate pool, and discard the questions if the matching is failed (25% of questions). On reader, DPR uses annotated passage as positive, and top retrieved passages that do not contain the answer are the negatives, thus entire training data is used.
+
+Chain Recall Percentage Span EM Avg Distance Diff
+
+80
+
+60
+
+40
+DistDR
+
+20
+
+DistDR (Answer Filter)
+
+DistDR (No Filter)
+
+0 012345678 Iteration
+
+(a)
+
+0.8
+
+0.7
+
+0.6
+
+0.5
+
+0.4
+
+Used Training Data
+
+0.3
+
+Evidence matches Gold
+
+0.2 1 2 3 4 5 6 7 8 Iteration
+
+(b)
+
+60 55 50 45
+DistDR
+40 1 2 3 4 5 6 7 8 Iteration
+(c)
+
+3.5
+
+3.0
+
+2.5
+
+2.0
+
+1.5
+
+First Hop
+
+1.0
+
+Second Hop
+
+0.5 1 2 3 4 5 6 7 8 Iteration
+
+(d)
+
+Figure 3: Quantitive analysis on DISTDR by iteration. (a): Compare different evidence ﬁlter strategies on dev set; (b): Statistics on training set extracted evidence; (c): Compare span extraction component over gold evidence; (d): Average distance difference on dev set from question to top-10 negative passages (Average) and positive passage. DISTDR ﬁnds better evidence over iterations, the improved evidence further helps model training.
+
+Figure 4: T-SNE visualization on an example with query (Q) and top-10 scored (ﬁrst hop) passage (P ) embeddings on ﬁrst four iterations. DISTDR closes the distance between query and positive passage with more accurate evidence over iterations as distant supervision.
+
+for DISTDR on the dev set increases over the ﬁrst ﬁve iterations (Figure 3a) and then converges. As the evidence ﬁnder improves, the E-step extracts better evidence for training examples (Figure 3b): both the percentage of used training examples and gold evidence in training examples increase with additional EM iterations. The improved evidence quality further helps DISTDR training. We compare multiple positive sampling strategies: using hard EM (top-1 as positive evidence) is slightly better than randomly sampling from top-k positives for the M-step update (Table 5, second row).
+The Effect of Evidence Filtering Filtering positive evidence is crucial for ensuring high-quality evidence. We ablate different ﬁltering methods in Table 5 and Figure 3a: No ﬁlter, only an answer ﬁlter, and an additional reader ﬁlter (DISTDR). No ﬁlter fails completely: evidence should not be considered correct if it does not contain the answer. With an additional reader ﬁlter, DISTDR outperforms using only the answer matching ﬁlter and converges faster (since the reader ﬁlter reduces false-positives thus makes training more robust).
+Despite rapidly changing evidence, the reader’s span extraction component is robust over iterations (Figure 3c), even on the ﬁrst iteration, suggesting it is robust against spurious false-positive evidence.
+
+Visualizing DISTDR in Dense Space DISTDR improves evidence retrieval by bringing the question representation closer to positive evidence and pushing negative evidence away (Figure 3d). In Figure 4, T-SNE (Maaten and Hinton, 2008) visualizes the ﬁrst hop query and passage representations (second hop representations are similar) in dense space at each iteration. As expected, at the beginning, the question is far from the positive passage, with negative passages between. After updating the representations, the distance gets closer until positive passage is the closest to the question.
+5.2 Analysis on Retrieved Evidence
+DISTDR is competitive to fully-supervised approaches on HOTPOTQA. However, even at the last iteration, only 65% of extracted evidence matches the gold. We ablate evidence and contrasts gold evidence with that retrieved by DISTDR.
+Non-gold Evidence is Helpful If we only retain training examples that matches the labeled gold evidence, answer accuracy falters and underperform DISTDR (Table 5, last row). Instead of providing noise, non-gold evidence gives useful signal for model training.
+Human Analysis and Case Study We manually annotate ﬁfty training examples where the ex-
+
+Q: Jo Ann Terry won the 80m hurdles event at what Sao Paulo-based event from 1963? A: Pan American Games Human Annotation: Jo Ann Terry → 1963 pan american games DISTDR: Jo Ann Terry → Jovem Pan Jo Ann Terry: Jo Ann Terry-Grissom is a retired female hurdler from the United States. Afﬁliated with the Tennessee State University she won the 80 m hurdles event at the 1963 Pan American Games. 1963 Pan American Games: The 4th Pan American Games were held from April 20 to May 5, 1963, in Sa˜o Paulo. Jovem Pan: Jovem Pan is the main Brazilian radio station based in Sa˜o Paulo, Brazil. Q: Who’s the Hungarian-born US ﬁlm director renowned for adapting Stephen King novellas to the screen, including The Mist and The Green Mile? A: Frank Darabont Human Annotation: The Mist (ﬁlm) → Frank Darabont DISTDR: The Green Mile (ﬁlm) → Frank Darabont The Mist (ﬁlm): The Mist is a 2007 American science-ﬁction horror ﬁlm based on the 1980 novella ”The Mist” by Stephen King. The ﬁlm was written and directed by Frank Darabont. The Green Mile (ﬁlm): The Green Mile is a 1999 American fantasy crime drama ﬁlm written and directed by Frank Darabont and adapted from the 1996 Stephen King novel of the same name. Frank Darabont: Frank Arpad Darabont is a French-Hungarian-American ﬁlm director, screenwriter and producer. As a director he is known for his ﬁlm adaptations of Stephen King novellas such as ”The Green Mile” and ”The Mist”. Q: Zimbabwe’s Guwe Secondary School has a sister school in what New York county? A: Nassau County Human Annotation: Guwe Secondary School → Carle Place High School DISTDR: University of Zimbabwe → East Rockaway High School Guwe Secondary School: Guwe Secondary School is located in Zimbabwe. It has a sister school in Carle Place, New York, United States. Carle Place High School: Carle Place Middle/High School is a six-year comprehensive public high school located in the hamlet of Carle Place in Nassau County, New York. University of Zimbabwe: The University of Zimbabwe (UZ) is the oldest and formerly largest university in Zimbabwe. East Rockaway High School: East Rockaway Junior-Senior High School is a co-educational six-year secondary school in East Rockaway, New York, and the sole high school in Nassau County, New York.
+
+Table 6: Case study of DISTDR on “false positive” evidence from HOTPOTQA that does not match gold evidence. Despite the dataset goals, some examples are answerable with a single piece of evidence evidence (top). Other times, DISTDR ﬁnds alternate valid evidence (middle). However, it can also ﬁnd incorrect evidence (bottom).
+
+tracted evidence from DISTDR does not match the labeled evidence. We conﬁrm that most of the extracted evidence is helpful for model training. Speciﬁcally, 38% of the questions are answerable via a single piece of evidence, even though this dataset is supposed to require multiple hops (Table 6). In another 28% of cases, DISTDR ﬁnds alternate valid evidence. In the second example in Table 6, the question mentions both ﬁlms The Mist and The Green Mile; therefore the reasoning chain from either ﬁlm to the director Frank Darabont is correct (though only one is annotated). In the ﬁnal of 34% of cases, DISTDR ﬁnds the wrong evidence, often because the extracted evidence only includes one span that matches the answer type, therefore the reader conﬁdently outputs the span for the wrong reason. In the third example in Table 6, Nassau County is the only county it sees, and therefore the model has stumbled upon the right answer erroneously. Building a model with faithful predictions is an important ongoing research topic (Jacovi and Goldberg, 2020).
+
+6 Related Work
+Question Answering Datasets There is growing interest in NLP communities to build large-scale datasets (Rajpurkar et al., 2016; Jia and Liang, 2017; Dua et al., 2019, inter alia) for QA research. In addition to questions and answers, benchmark datasets often include annotated evidence, but it requires signiﬁcant annotation protocol design and human annotations. In SQUAD (Rajpurkar et al., 2016), among the ﬁrst large-scale reading comprehension datasets, annotators write questions conditioned on a passage, which creates dataset artifacts (Jia and Liang, 2017). To overcome dataset artifacts, NATURALQUESTIONS (Kwiatkowski et al., 2019) use real Google queries as questions and ask annotators to label both evidence passages and short answers. But such annotation is expensive, as they further ask additional experts to verify whether the evidence correctly leads to the answer. Instead, DISTDR focuses on the weakly-supervised setting with only question–answer pairs, which is signiﬁcantly cheaper.
+Annotation is more fraught for multi-hop QA
+
+datasets (Yang et al., 2018). To construct HOTPOTQA, annotators are presented with a linked Wikipedia passages, as pilot studies indicate that it is difﬁcult to ask a meaningful multi-hop question with arbitrary passages. However, some questions in HOTPOTQA include shortcuts that are answerable by a single passage (Min et al., 2019b), which is conﬁrmed by our analysis (Section 5.2).
+Distant supervision has been successfully adopted for many NLP tasks such as relation extraction (Mintz et al., 2009). Recent work builds QA datasets with distant supervision, such as TRIVIAQA (Joshi et al., 2017), SEARCHQA (Dunn et al., 2017), QBLINK (Elgohary et al., 2018) by automatically gathering evidence documents from a corpus as distant supervision for available questionanswer pairs. They use standard IR techniques to ﬁnd relevant passages and match them with answer strings. These methods succeed for simple questions where terms overlap with evidence passages, This no longer holds for multi-hop questions that require a reasoning chain as evidence to the answer: evidence pieces do not overlap with the question but rather depend on the previous evidence pieces. Unsupervised IR methods cannot capture such implicit relations. DISTDR removes the burden of little textual overlap through dense retrieval and its iterative process retrieves better evidence.
+Open-domain QA systems Chen et al. (2017) ﬁrst combine information retrieval and (neural) reading comprehension for open-domain QA. Several works aim to improve the neural reader (Clark and Gardner, 2018; Wang et al., 2018, inter alia), or use generative models to compose an answer (Lewis et al., 2020; Izacard and Grave, 2021, inter alia). Recent progress (Karpukhin et al., 2020; Xiong et al., 2021a,b, inter alia) uses dense retrieval to aid both single-hop and multi-hop questions. However, a crucial distinction is that these approaches assume the evidence is given for training, while DISTDR iteratively ﬁnds evidence and uses it to improve the model. Min et al. (2019a) also use hard-EM for weakly-supervised QA, but— orthogonal to our approach—they assume the evidence is given and ﬁnd the most likely answer mentions in the evidence, while we aim to ﬁnd evidence from a large corpus.
+7 Conclusion
+We present DISTDR, a distantly-supervised ODQA system that improves over a weak retriever by iter-
+
+atively ﬁnding evidence from a corpus, and using the evidence as distant supervision for model training. Without using any evidence labels, DISTDR matches the fully-supervised SOTA approaches on both multi-hop and single-hop QA benchmarks.
+Annotating evidence for existing questionanswer pairs is generally expensive, especially for complex questions. While DISTDR can accurately ﬁnd evidence for arbitrary complex machine reading-style questions, future work needs to validate whether this can work for other types of questions. This could improve the reader to answer numerical reasoning (Dua et al., 2019), temporal reasoning (Ning et al., 2020), multi-model reasoning (Lei et al., 2018), or combination of these skills (Bartolo et al., 2020).
+Acknowledgments
+We thank CLIP members, Tianze Shi, anonymous reviewers and meta-reviewer for their suggestions and comments. Zhao is supported by the Ofﬁce of the Director of National Intelligence (ODNI), Intelligence Advanced Research Projects Activity (IARPA), via the BETTER Program contract 201919051600005. Boyd-Graber is supported by NSF Grant IIS-1822494. Any opinions, ﬁndings, conclusions, or recommendations expressed here are those of the authors and do not necessarily reﬂect the view of the sponsors.
+References
+Akari Asai, Kazuma Hashimoto, Hannaneh Hajishirzi, Richard Socher, and Caiming Xiong. 2020. Learning to retrieve reasoning paths over Wikipedia graph for question answering. In Proceedings of the International Conference on Learning Representations.
+Max Bartolo, Alastair Roberts, Johannes Welbl, Sebastian Riedel, and Pontus Stenetorp. 2020. Beat the ai: Investigating adversarial human annotation for reading comprehension. Transactions of the Association for Computational Linguistics.
+Danqi Chen, Adam Fisch, Jason Weston, and Antoine Bordes. 2017. Reading Wikipedia to answer opendomain questions. In Proceedings of the Association for Computational Linguistics.
+Hao Cheng, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2020. Probabilistic assumptions matter: Improved models for distantlysupervised document-level question answering. In Proceedings of the Association for Computational Linguistics.
+
+Christopher Clark and Matt Gardner. 2018. Simple and effective multi-paragraph reading comprehension. In Proceedings of the Association for Computational Linguistics.
+Dheeru Dua, Yizhong Wang, Pradeep Dasigi, Gabriel Stanovsky, Sameer Singh, and Matt Gardner. 2019. Drop: A reading comprehension benchmark requiring discrete reasoning over paragraphs. In Conference of the North American Chapter of the Association for Computational Linguistics.
+Matthew Dunn, Levent Sagun, Mike Higgins, V Ugur Guney, Volkan Cirik, and Kyunghyun Cho. 2017. SearchQA: A new q&a dataset augmented with context from a search engine. arXiv preprint arXiv:1704.05179.
+Ahmed Elgohary, Chen Zhao, and Jordan Boyd-Graber. 2018. Dataset and baselines for sequential opendomain question answering. In Proceedings of Empirical Methods in Natural Language Processing.
+Kelvin Guu, Kenton Lee, Zora Tung, Panupong Pasupat, and Ming-Wei Chang. 2020. REALM: Retrieval-augmented language model pre-training. In Proceedings of the International Conference of Machine Learning.
+Gautier Izacard and Edouard Grave. 2021. Leveraging passage retrieval with generative models for open domain question answering. In Proceedings of the European Chapter of the Association for Computational Linguistics.
+Alon Jacovi and Yoav Goldberg. 2020. Towards faithfully interpretable NLP systems: How should we deﬁne and evaluate faithfulness? In Proceedings of the Association for Computational Linguistics.
+Robin Jia and Percy Liang. 2017. Adversarial examples for evaluating reading comprehension systems. In Proceedings of Empirical Methods in Natural Language Processing.
+Mandar Joshi, Eunsol Choi, Daniel Weld, and Luke Zettlemoyer. 2017. TriviaQA: A large scale distantly supervised challenge dataset for reading comprehension. In Proceedings of the Association for Computational Linguistics.
+Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and Wen-tau Yih. 2020. Dense passage retrieval for open-domain question answering. In Proceedings of Empirical Methods in Natural Language Processing.
+Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redﬁeld, Michael Collins, Ankur Parikh, Chris Alberti, Danielle Epstein, Illia Polosukhin, Jacob Devlin, Kenton Lee, et al. 2019. Natural questions: a benchmark for question answering research. Transactions of the Association for Computational Linguistics.
+
+Kenton Lee, Ming-Wei Chang, and Kristina Toutanova. 2019. Latent retrieval for weakly supervised open domain question answering. In Proceedings of the Association for Computational Linguistics.
+Jie Lei, Licheng Yu, Mohit Bansal, and Tamara Berg. 2018. TVQA: Localized, compositional video question answering. In Proceedings of Empirical Methods in Natural Language Processing.
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Ku¨ttler, Mike Lewis, Wen-tau Yih, Tim Rockta¨schel, et al. 2020. Retrieval-augmented generation for knowledge-intensive nlp tasks. In Proceedings of Advances in Neural Information Processing Systems.
+Laurens van der Maaten and Geoffrey Hinton. 2008. Visualizing data using t-SNE. Journal of machine learning research, 9(11).
+Sewon Min, Danqi Chen, Hannaneh Hajishirzi, and Luke Zettlemoyer. 2019a. A discrete hard EM approach for weakly supervised question answering. In Proceedings of Empirical Methods in Natural Language Processing.
+Sewon Min, Eric Wallace, Sameer Singh, Matt Gardner, Hannaneh Hajishirzi, and Luke Zettlemoyer. 2019b. Compositional questions do not necessitate multi-hop reasoning. In Proceedings of the Association for Computational Linguistics.
+Mike Mintz, Steven Bills, Rion Snow, and Daniel Jurafsky. 2009. Distant supervision for relation extraction without labeled data. In Proceedings of the Association for Computational Linguistics.
+Qiang Ning, Hao Wu, Rujun Han, Nanyun Peng, Matt Gardner, and Dan Roth. 2020. Torque: A reading comprehension dataset of temporal ordering questions. In Proceedings of Empirical Methods in Natural Language Processing.
+Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. 2016. SQuAD: 100,000+ questions for machine comprehension of text. In Proceedings of Empirical Methods in Natural Language Processing.
+Daniel M Russell. 2019. The Joy of Search: A Google Insider’s Guide to Going Beyond the Basics. MIT Press.
+Rajhans Samdani, Ming-Wei Chang, and Dan Roth. 2012. Uniﬁed expectation maximization. In Conference of the North American Chapter of the Association for Computational Linguistics.
+Anshumali Shrivastava and Ping Li. 2014. Asymmetric LSH (ALSH) for sublinear time maximum inner product search (MIPS). In Proceedings of Advances in Neural Information Processing Systems.
+
+Ellen M Voorhees et al. 1999. The TREC-8 question answering track report. In Proceedings of Text Retrieval Conference.
+Shuohang Wang, Mo Yu, Xiaoxiao Guo, Zhiguo Wang, Tim Klinger, Wei Zhang, Shiyu Chang, Gerald Tesauro, Bowen Zhou, and Jing Jiang. 2018. R3: Reinforced reader-ranker for open-domain question answering. In Proceedings of the Association for the Advancement of Artiﬁcial Intelligence.
+Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang, Jialin Liu, Paul Bennett, Junaid Ahmed, and Arnold Overwijk. 2021a. Approximate nearest neighbor negative contrastive learning for dense text retrieval. In Proceedings of the International Conference on Learning Representations.
+Wenhan Xiong, Xiang Lorraine Li, Srini Iyer, Jingfei Du, Patrick Lewis, William Yang Wang, Yashar Mehdad, Wen tau Yih, Sebastian Riedel, Douwe Kiela, and Barlas Og˘uz. 2021b. Answering complex open-domain questions with multi-hop dense retrieval. In Proceedings of the International Conference on Learning Representations.
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William Cohen, Ruslan Salakhutdinov, and Christopher D. Manning. 2018. HotpotQA: A dataset for diverse, explainable multi-hop question answering. In Proceedings of Empirical Methods in Natural Language Processing.
+Chen Zhao, Chenyan Xiong, Jordan Boyd-Graber, and Hal Daume´ III. 2021. Multi-step reasoning over unstructured text with beam dense retrieval. In Conference of the North American Chapter of the Association for Computational Linguistics.
+Chen Zhao, Chenyan Xiong, Corby Rosset, Xia Song, Paul Bennett, and Saurabh Tiwary. 2020. Transformer-xh: Multi-evidence reasoning with extra hop attention. In Proceedings of the International Conference on Learning Representations.
+
+

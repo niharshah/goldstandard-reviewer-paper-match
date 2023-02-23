@@ -1,0 +1,793 @@
+Optimizing Data Usage via Differentiable Rewards
+
+arXiv:1911.10088v3 [cs.LG] 16 Jun 2021
+
+Xinyi Wang * 1 Hieu Pham * 1 2 Paul Michel 1 Antonios Anastasopoulos 1 Jaime Carbonell 1 Graham Neubig 1
+
+Abstract
+To acquire a new skill, humans learn better and faster if a tutor informs them of how much attention they should pay to particular content or practice problems based on their current knowledge level. Similarly, a machine learning model could potentially be trained better if data is presented in a way that adapts to its current learning state. In this paper, we examine the problem of training an adaptive scorer that weights data instances to maximally beneﬁt learning. Training such as scorer efﬁciently is a challenging problem; in order to precisely quantify the effect of a data instance on the ﬁnal model, a naive approach would require completing the entire training process and observing ﬁnal performance. We propose an efﬁcient alternative – Differentiable Data Selection (DDS) – that formulates a scorer as a learnable function of the training data that can be efﬁciently updated along with the main model being trained. Specifically, DDS updates the scorer with an intuitive reward signal: it should up-weigh the data that has a similar gradient with a development set upon which we would ﬁnally like to perform well. Without signiﬁcant computing overhead, DDS delivers consistent improvements over several strong baselines on two very different tasks of machine translation and image classiﬁcation.
+1. Introduction
+While deep learning models are remarkably good at ﬁtting large data sets, their performance is also highly sensitive to the structure and domain of their training data. Training on out-of-domain data can lead to worse model performance, while using more relevant data can assist transfer learning. Previous work has attempted to create strategies to handle
+*Equal contribution 1Language Technology Institute, Carnegie Mellon University, Pittsburgh, PA 15213, USA 2Google Research, Brain Team, Mountain View, CA 94043, USA. Correspondence to: Xinyi Wang, Hieu Pham <{xinyiw1,hyhieu}@cs.cmu.edu>.
+Proceedings of the 36 th International Conference on Machine Learning, Long Beach, California, PMLR 97, 2019. Copyright 2019 by the author(s).
+
+this sensitivity by selecting subsets of the data to train the model on (Jiang & Zhai, 2007; Wang et al.; Axelrod et al., 2011; Moore & Lewis, 2010), providing different weights for each example (Sivasankaran et al., 2017; Ren et al., 2018), or changing the presentation order of data (Bengio et al., 2009; Kumar et al., 2019).
+However, there are several challenges with existing work on better strategies for data usage. Most data ﬁltering critera or training curriculum rely on domain-speciﬁc knowledge and hand-designed heuristics, which can be sub-optimal. To avoid hand-designed heuristics, several works propose to optimize a parameterized neural network to learn the data usage schedule, but most of them are tailored to speciﬁc use cases, such as handling noisy data for classiﬁcation (Jiang et al., 2018), learning a curriculum learning strategy for speciﬁc tasks (Kumar et al., 2019; Tsvetkov et al., 2016), and actively selecting data for annotation (Fang et al., 2017; Wu et al., 2018). Fan et al. (2018b) proposes a more general teacher-student framework that ﬁrst trains a “teacher network” to select data that directly optimizes development set accuracy over multiple training runs. However, because running multiple runs of training simply to learn this teacher network entails an n-fold increase in training time for n runs, this is infeasible in many practical settings. In addition, in preliminary experiments we also found the single reward signal provided by dev set accuracy at the end of training to be noisy, to the extent that we were not able to achieve results competitive with simpler heuristic training methods.
+In this paper, we propose an alternative: a general Reinforcement Learning (RL) framework for optimizing training data usage by training a scorer network that minimizes the model loss on the development set. We formulate the scorer network as a function of the current training examples, and update the scorer along with the main model being trained. Thus, our method requires no heuristics and is generalizable to various tasks. To make the scorer adaptive, we train it using frequent and efﬁcient updates towards a reward function inspired by recent work on learning from auxiliary tasks (Du et al., 2018; Liu et al., 2019b), which uses the similarity between two gradients as a measure of task relevance. We propose to use the gradient alignment between the training examples and the dev set as a reward signal for a parametric scorer network, as illustrated in Fig. 1. We then
+
+Optimizing Data Usage via Differentiable Rewards
+
+Training (x, y) Data
+
+Scorer
+ψ
+
+p(x, y; ψ) (x, y)
+
+Model θ
+
+∇θℓ(x, y; θ) ∇θ J(θ, Ddev)
+Figure 1: The general workﬂow of DDS.
+
+formulate our framework as a bi-level optimization problem similar to those found in prior works such as meta-learning for few-shot learning (Finn et al., 2017), noisy data ﬁltering (Ren et al., 2018), and neural architecture search (Liu et al., 2019a), and demonstrate that our proposed update rules follow a direct differentiation of the scorer parameters to optimize the model loss on the dev set. Thus we refer to our framework as “Differentiable Data Selection” (DDS).
+We demonstrate two concrete instantiations of the DDS framework, one for a more general case of image classiﬁcation, and the other for a more speciﬁc case of neural machine translation (NMT). For image classiﬁcation, we test on both CIFAR-10 and ImageNet. For NMT, we focus on a multilingual setting, where we optimize data usage from a multilingual corpus to improve the performance on a particular language. For these two very different and realistic tasks, we ﬁnd the DDS framework brings signiﬁcant improvements over diverse baselines for all settings.
+
+2. Differentiable Data Selection
+2.1. Risk, Training, and Development Sets
+
+Commonly in machine learning, we seek to ﬁnd the parameters θ∗ that minimize the risk J(θ, P ), the expected value of a loss function (x, y; θ), where x, y are pairs of inputs and associated labels sampled from a particular distribution P (X, Y ):
+
+θ∗ = argmin J(θ, P ) where
+
+θ
+
+(1)
+
+J (θ, P ) = Ex,y∼P (X,Y )[ (x, y; θ)]
+
+Ideally, we would like the risk J(·) to be minimized over
+the data distribution that our system sees at test time, ie. Ptest(X, Y ). Unfortunately, this distribution is unknown at training time, so instead we collect a training set Dtrain = {(xi, yi) : i = 1, ..., Ntrain} with distribution Ptrain(X, Y ) = Uniform(Dtrain), and minimize the empirical risk by taking x, y ∼ Ptrain(X, Y ). Since we need a sufﬁciently large training set Dtrain to train a good model, it is hard to ensure that Ptrain(X, Y ) ≈ Ptest(X, Y ). In fact, we often accept that training data comes from a dif-
+ferent distribution than test data. The discrepancy between Ptrain(X, Y ) and Ptest(X, Y ) manifests itself in the form of problems such as overﬁtting (Zhang et al., 2017; Srivastava
+
+et al., 2014), covariate shift (Shimodaira, 2000), and label shift (Lipton et al., 2018).
+However, unlike the large training set, we can often collect a relatively small development set Ddev = {(xi, yi) : i = 1, ..., Ndev} with a distribution Pdev(X, Y ) that is much closer to Ptest(X, Y ) (Some examples can be found in § 4). Since Ddev is a better approximation of our test-time scenario, we can use Ddev to get reliable feedback to learn to better utilize our training data from Dtrain. In particular, we propose to train a scorer network, parameterized by ψ, that adjusts the weights of examples in Dtrain to minimize J (θ, Ddev) .
+2.2. Learning to Optimize Data Usage
+We propose to optimize the scorer’s parameters ψ in an RL setting. Our environment is the model state θ and an example x, y . Our RL agent is the scorer network ψ, which optimizes the data usage for the current model state. The agent’s reward on picking an example approximates the dev set performance of the resulting model after the model is updated on this example.
+Our scorer network is parameterized as a differentiable function that only takes as inputs the features of the example x, y . Intuitively, it represents a distribution over the training data where more important data has a higher probability of being used, denoted P (X, Y ; ψ). Unlike prior methods which generally require complicated featurization of both the model state and the data as input to the RL agent (Fan et al., 2018b; Jiang et al., 2018; Fang et al., 2017), our formulation is much simpler and generalizable to different tasks. Since our scorer network does not consider the model parameters θt as input, we update it iteratively with the model so that at training step t, P (X, Y ; ψt) provides an up-to-date data scoring feedback for a given θt.
+Although the above formulation is simpler and more general, it requires much more frequent updates to the scorer parameter ψ. Existing RL frameworks simply use the change in dev set risk as the regular reward signal, which makes the update expensive and unstable (Fan et al., 2018b; Kumar et al., 2019). Therefore, we propose a novel reward function as an approximation to ∆Jdev(x, y) to quantify the effect of the training example x, y . Inspired by Du et al. (2018), which uses gradient similarity between two tasks to measure the effect of adaptating between them, we use the agreement between the model gradient on data x, y and the gradient on the dev set to approximate the effect of x, y on dev set performance. This reward implies that we prefer data that moves θ in the direction that minimizes the dev set risk:
+R(x, y) = ∆Jdev(x, y) (2)
+≈ ∇θ (x, y; θt−1) · ∇θJ (θt, Ddev)
+
+Optimizing Data Usage via Differentiable Rewards
+
+According to the REINFORCE algorithm (Williams, 1992), the update rule for ψ is thus
+
+follows:
+
+ψt+1 ← ψt+ ∇θ (x, y; θt−1) · ∇θJ (θt, Ddev) ∇ψlog(P (X, Y ; ψ))
+R(x,y)
+(3) The update rule for the model is simply
+
+θt ← θt−1 − ∇θJ (θt−1, P (X, Y ; ψ))
+
+(4)
+
+For simplicity of notation, we omit the learning rate term. The full derivation can be found in § A.1. By alternating between Eqn. 4 and Eqn. 3, we can iteratively update θ using the guidance from the scorer network, and update ψ to optimize the scorer using feedback from the model.
+Our formulation of scorer network as P (X, Y ; ψ) has several advantages. First, it provides the ﬂexibility that we can either (1) sample a training instance with probability proportional to its score, (2) or equivalently scale the update from the training instance based on its score. In later sections, we provide an algorithm under the DDS framework for multilingual NMT (see § 3.2), where the former is more efﬁcient, and another more general algorithm for image classiﬁcation (see § 3.1), where the latter choice is natural. Second, it allows easy integration of prior knowledge of the data, which is shown to be effective in § 4.
+2.3. Deriving Rewards through Direct Differentiation
+In this section, we show that the update for the scorer network in Eqn. 3 can be approximately derived as the solution of a bi-level optimization problem (Colson et al., 2007), which has been applied to many different lines of research in the ﬁeld of meta-learning (Baydin et al., 2018; Liu et al., 2019a; Ren et al., 2018).
+Under our framework, the scorer samples the data according to x, y ∼ P (X, Y ; ψ), and ψ will be chosen so that θ∗ that minimizes J(θ, P (X, Y ; ψ)) will approximately minimize J (θ, Pdev(X, Y )):
+ψ∗ = argmin J (θ∗(ψ), Ddev) where ψ (5)
+θ∗(ψ) = argmin Ex,y∼P (X,Y ;ψ) [ (x, y; θ)]
+θ
+
+The connection between ψ and θ in Eqn. 5 shows that J(θt, Ddev) is differentiable with respect to ψ. Now we can approximately compute the gradient ∇ψJ(θt, Ddev) as
+
+∇ψJ (θt, Ddev) (apply chain rule:)
+= ∇θt J (θt, Ddev) · ∇ψθt(ψ) (substitute θt from Eqn. 4:)
+= ∇θt J (θt, Ddev) · ∇ψ (θt−1 − ∇θJ (θt−1, ψ)) (assume ∇ψθt−1 ≈ 0:)
+≈ −∇θt J (θt, Ddev) · ∇ψ (∇θJ (θt−1, ψ))
+= −∇ψEx,y∼P (X,Y ;ψ) ∇θJ (θt, Ddev) · ∇θ (x, y; θt−1)
+= −Ex,y∼P (X,Y ;ψ) ∇θJ (θt, Ddev) · ∇θ (x, y; θt−1)
+· ∇ψ log P (x, y; ψ) (6)
+Here, we make a Markov assumption that ∇ψθt−1 ≈ 0, assuming that at step t, given θt−1 we do not care about how the values of ψ from previous steps led to θt−1. Intuitively, this assumption indicates in the previous step ψt−1 is already updated regards to θt−1, so the effect of ψ on θt−1 is likely to be minimal. This assumption can simplify and speed up computation. Moreover, this allows us to have a natural interpretation of the update rule for the data scorer: it should up-weight the training data that have similar gradient direction with the dev data1. Eqn. 6 leads to a rule to update ψ using gradient descent, which is exactly the same as the RL update rule in Eqn. 3.
+2.4. Additional Derivation Details and Clariﬁcations
+Note that our derivation above does not take into the account that we might use different optimization algorithms, such as SGD or Adam (Kingma & Ba, 2015), to update θ. We provide detailed derivations for several popular optimization algorithms in § A.1.
+One potential concern with our approach is that because we optimize ψt directly on the dev set using J(θt, Ddev), we may risk indirectly overﬁtting model parameters θt by selecting a small subset of data that is overly specialized. However we do not observe this problem in practice, and posit that this because (1) the inﬂuence of ψt on the ﬁnal model parameters θt is quite indirect, and acts as a “bottleneck” which has similarly proven useful for preventing overﬁtting in neural models (Gre´zl et al., 2007), and (2) because the actual implementations of DDS (which we further
+1Our use of the Markov assumption is based on its use and empirical success in previous work on bi-level optimization, such as Hyper Gradient Descent (Baydin et al. 2017) and many others. Of course, this is a simplifying assumption, but we believe that our empirical results show that the proposed method is useful nonetheless.
+
+Optimizing Data Usage via Differentiable Rewards
+
+discuss in § 3) only samples a subset of data from Dtrain at each optimization step, further limiting expressivity.
+3. Concrete Instantiations of DDS
+We now turn to discuss two concrete instantiations of DDS that we use in our experiments: a more generic example of classiﬁcation, which should be applicable to a wide variety of tasks, and a specialized application to the task of multilingual NMT, which should serve as an example of how DDS can be adapted to the needs of speciﬁc applications.
+3.1. Formulation for Classiﬁcation
+Alg. 1 presents the pseudo code for the training process on classiﬁcation tasks, using the notation introduced in § 2.
+
+Algorithm 1: Training a classiﬁcation model with
+
+DDS.
+
+Input :Dtrain, Ddev Output :Optimal parameters θ∗
+
+1 Initializer θ0 and ψ0
+
+2 for t = 1 to num train steps do
+
+3 Sample B training data points
+
+xi, yi ∼ Uniform(Dtrain)
+
+4 Sample B validation data points
+
+xi, yi ∼ Uniform(Ddev) Optimize θ
+
+5
+
+gθ ←
+
+B i=1
+
+p(xi
+
+,
+
+yi
+
+;
+
+ψt−1
+
+)∇θ
+
+(xi, yi; θt−1)
+
+6 Update θt ← GradientUpdate θt−1, gθ
+
+Evaluate θt on Ddev
+
+7
+
+Let
+
+dθ
+
+←
+
+1 B
+
+B j=1
+
+∇θ
+
+(xj, yj; θt)
+
+Optimize ψ
+
+8 ri ← dθ · ∇θ (xi, yi; θt−1)
+
+9
+
+Let
+
+dψ
+
+←
+
+1 B
+
+B i=1
+
+[ri
+
+·
+
+∇ψ
+
+log
+
+p(xi,
+
+yi;
+
+ψ)]
+
+10 Update ψt ← GradientUpdate(ψt−1, dψ)
+
+11 end
+
+The main classiﬁcation model is parameterized by θ. The scorer p(X, Y ; ψ) uses an architecture identical to the main model, but with independent weights, i.e. p(X, Y ; ψ) does not share weights with θ. For each example xi in a minibatch uniformly sampled from Dtrain2, this DDS model outputs a scalar for the data point xi. All scalars are passed through a softmax function to compute the relative probabilities of the examples in the minibatch, and their gradients are scaled accordingly when applied to θ.
+We have two gradient update steps, one for the model param-
+2Note that our actual formulation of p(X, Y ; ψ) does not depend on Y , but we keep Y in the notation for consistency with the formulation of the DDS framework.
+
+eter θt in line 6 and the other for the DDS scorer parameter ψ in line 10. For the model parameter update, we can simply use any of the standard optimization update rule. For the scorer ψ, we use the update rule derived in § 2.3.
+Per-Example Gradient. In standard neural network training, a single aggregate gradient is computed with respect to a mini-batch of training data of size n to improve computational efﬁciency. In contrast, as seen from line 9 of Alg. 1, as well as from Eqn. 13, DDS requires us to compute ∇θ (xi, yi; θt−1), the gradient for each example in a batch of training data. This potentially slows down training by a factor of n. A naive implementation of this operation would be very slow and memory intensive, especially when the batch size is large, e.g. our experiments on ImageNet use a batch size of 4096 (see § 4).
+We propose an efﬁcient approximation of this per-example gradient computation via the ﬁrst-order Taylor expansion of (xi, yi; θt−1). In particular, for any vector v ∈ R|θ|, with sufﬁciently small > 0, we have:
+
+v · ∇θ (xi, yi; θt−1)
+
+1
+
+(7)
+
+≈
+
+xi, yi; θt−1 + v − xi, yi; θt−1 ,
+
+Eqn. 7 can be implemented by keeping a shadow version of parameters θt−1, caching training loss (xi, yi; θt−1), and computing the new loss with θt−1 + v. Here, v is dθ as in line 9 of Alg. 1.
+
+3.2. Formulation for Multilingual NMT
+Next we demonstrate an application of DDS to multilingual models for NMT, speciﬁcally for improving accuracy on low-resource languages (LRL) (Zoph et al., 2016; Neubig & Hu, 2018).
+
+Problem Setting. In this setting, we assume that we have a particular LRL S that we would like to translate into target language T , and we additionally have a multilingual corpus Dtrain that has parallel data between n source languages (S1, S2, ..., Sn) and target language T . We would like to pick parallel data from any of the source languages to the target language to improve translation of a particular LRL S, so we assume that Ddev exclusively consists of parallel data between S and T . Thus, DDS will select data from Dtrain that improve accuracy on S-to-T translation as represented by Ddev.
+
+Adaptation to NMT. To make training more efﬁcient and stable in this setting, we make three simpliﬁcations of the main framework in § 2.3 that take advantage of the problem structure of multilingual NMT. First, instead of directly modeling p(X, Y ; ψ), we assume a uniform distribution over the
+
+Optimizing Data Usage via Differentiable Rewards
+
+target sentence Y , and only parameterize the conditional distribution of which source language sentence to pick given the target sentence: p(X|y; ψ). This design follows the formulation of Target Conditioned Sampling (TCS; Wang & Neubig (2019)), an existing state-of-the-art data selection method that uses a similar setting but models the distribution p(X|y) using heuristics. Since the scorer only needs to model a simple distribution over training languages, we use a fully connected 2-layer perceptron network, and the input is a vector indicating which source languages are available for the given target sentence. Second, we only update ψ after updating the NMT model for a ﬁxed number of steps. Third, we sample the data according to p(X|y; ψ) to get a Monte Carlo estimate of the objective in Eqn. 5. This signiﬁcantly reduces the training time compared to using all data. The pseudo code of the training process is in Alg. 2. In practice, we use cosine distance instead of dot product to measure the gradient alignment between the training and dev language, because cosine distance has smaller variance and thus makes the scorer update more stable.
+
+Algorithm 2: Training multilingual NMT with
+
+DDS.
+
+Input :Dtrain; K: number of data to train the NMT
+
+model before updating ψ; E: number of
+
+updates for ψ; α1,α2: discount factors for
+
+the gradient Output :The converged NMT model θ∗
+
+1 Initialize ψ0, θ0
+
+Initialize the gradient of each source language
+
+2 grad[Si] ← 0 for i in n
+
+3 while θ not converged do
+
+4 X, Y ← load data(ψ, Dtrain, K)
+
+Train the NMT model
+
+5 for xi, y in X, Y do
+
+6
+
+θt ←
+
+GradientUpdate θt−1, ∇θt−1 (xi, y; θt−1)
+
+7
+
+grad[Si] ←
+
+α1 × grad[Si] + α2 × ∇θt−1 (xi, y; θt−1)
+
+8 end
+
+Optimize ψ
+
+9 for iter in E do
+
+10
+
+sample B data pairs from Dtrain
+
+11
+
+dψ
+
+←
+
+1 B
+
+B j=1
+
+n i=1
+
+grad[Si]
+
+grad[S] ·
+
+∇ψt−1 log (p (Si|yj ; ψt−1))
+
+12
+
+ψt ← GradientUpdate(ψt−1, dψt−1 )
+
+13 end
+
+14 end
+
+4. Experiments
+We now discuss experimental results on both image classiﬁcation, an instance of the general classiﬁcation problem using Alg. 1, and multilingual NMT using Alg. 23.
+4.1. Experimental Settings
+Data. We apply our method on established benchmarks for image classiﬁcation and multilingual NMT. For image classiﬁcation, we use CIFAR-10 (Krizhevsky, 2009) and ImageNet (Russakovsky et al., 2015). For each dataset, we consider two settings: a reduced setting where only roughly 10% of the training labels are used, and a full setting, where all labels are used. Speciﬁcally, the reduced setting for CIFAR-10 uses the ﬁrst 4000 examples in the training set, and with ImageNet, the reduced setting uses the ﬁrst 102 TFRecord shards as pre-processed by Kornblith et al. (2019). We use the size of 224 × 224 for ImageNet.
+For multilingual NMT, we use the 58-language-to-English TED dataset (Qi et al., 2018). Following prior work (Qi et al., 2018; Neubig & Hu, 2018; Wang et al., 2019b), we evaluate translation from four low-resource languages (LRL) Azerbaijani (aze), Belarusian (bel), Galician (glg), and Slovak (slk) to English, where each is paired with a similar high-resource language Turkish (tur), Russian (rus), Portugese (por), and Czech (ces) (details in § A.3). We combine data from all 8 languages, and use DDS to optimize data selection for each LRL.
+To update the scorer, we construct Ddev so that it does not overlap with Dtest. For image classiﬁcation, we hold out 10% of the training data as Ddev; while for multilingual NMT, we simply use the dev set of the LRL as Ddev.
+Models and Training Details. For image classiﬁcation, on CIFAR-10, we use the pre-activation WideResNet28 (Zagoruyko & Komodakis, 2016), with width factor k = 2 for the reduced setting and k = 10 for the normal setting. For ImageNet, we use the post-activation ResNet50 (He et al., 2016). These implementations reproduce the numbers reported in the literature (Zagoruyko & Komodakis, 2016; He et al., 2016; Xie et al., 2017), and additional details can be found in § A.4.
+For NMT, we use a standard LSTM-based attentional baseline (Bahdanau et al., 2015), which is similar to previous models used in low-resource scenarios on this dataset (Neubig & Hu, 2018; Wang et al., 2019b) and others (Sennrich & Zhang, 2019) due to its relative stability compared to other options such as the Transformer (Vaswani et al., 2017).
+3Code for image classiﬁcation: https://github. com/google-research/google-research/tree/ master/differentiable_data_selection. Code for NMT: https://github.com/cindyxinyiwang/ DataSelection
+
+Optimizing Data Usage via Differentiable Rewards
+Table 1: Results for image classiﬁcation accuracy (left) and multilingual MT BLEU (right). For MT, the statistical signiﬁcance is indicated with ∗ (p < 0.005) and † (p < 0.0001). DDS outperforms the best baseline in all settings. For both image classiﬁcation and NMT, DDS performs better than other intelligent data selection methods.
+
+Methods
+Uniform SPCL BatchWeight MentorNet DDS retrained DDS
+
+CIFAR-10 (WRN-28-k)
+
+4K, k = 2 Full, k = 10
+
+82.60±0.17 81.09±0.22 79.61±0.50 83.11±0.62
+
+95.55±0.15 93.66±0.12 94.11±0.18 94.92±0.34
+
+83.63± 0.29 96.31± 0.13 85.56±0.20 97.91±0.12
+
+ImageNet (ResNet-50)
+
+10%
+
+Full
+
+56.36/79.45 -
+
+76.51/93.20 -
+
+56.81/79.51 77.23/93.57
+
+-
+
+-
+
+Methods
+Uniform SPCL Related TCS
+DDS TCS+DDS
+
+aze
+10.31 9.07 10.34 11.18
+10.74 11.84∗
+
+bel
+17.21 16.99 15.31 16.97
+17.24 17.74†
+
+glg
+26.05 23.64 27.41 27.28
+27.32 27.78
+
+slk
+27.44 21.44 25.92 27.72
+28.20∗ 27.74
+
+Accuracy is measured using BLEU score (Papineni et al., 2002). More experiment details are noted in § A.2.
+Baselines and Our Methods. For both image classiﬁcation and multi-lingual NMT, we compare the following data selection methods. Uniform: data is selected uniformly from all of the data that we have available, as is standard in training models. SPCL (Jiang et al., 2015): a curriculum learning method that dynamically updates the curriculum to focus more on the “easy” training examples based on model loss. DDS: our proposed method.
+For image classiﬁcation, we compare with several additional methods designed for ﬁltering noisy data on CIFAR-10, where we simply consider the dev set as the clean data. BatchWeight (Ren et al., 2018): a method that scales example training loss in a batch with a locally optimized weight vector using a small set of clean data. MentorNet (Jiang et al., 2018): a curriculum learning method that trains a mentor network to select clean data based on features from both the data and the main model.
+For machine translation, we also compare with two stateof-the-art heuristic methods for multi-lingual data selection. Related: data is selected uniformly from the target LRL and a linguistically related HRL (Neubig & Hu, 2018). TCS: a recently proposed method of “target conditioned sampling”, which uniformly chooses target sentences, then picks which source sentence to use based on heuristics such as word overlap (Wang & Neubig, 2019). Note that both of these methods take advantage of structural properties of the multi-lingual NMT problem, and do not generalize to other problems such as classiﬁcation.
+DDS with Prior Knowledge DDS is a ﬂexible framework to incorporate prior knowledge about the data using the scorer network, which can be especially important when the data has certain structural properties such as language or domain. We test such a setting of DDS for both tasks.
+For image classiﬁcation, we use retrained DDS, where we ﬁrst train a model and scorer network using the standard
+
+DDS till convergence. The trained scorer network can be considered as a good prior over the data, so we use it to train the ﬁnal model from scratch again using DDS. For multilingual NMT, we experiment with TCS+DDS, where we initialize the parameters of DDS with the TCS heuristic, then continue training.
+4.2. Main Results
+The results of the baselines and our method are listed in Tab. 1. First, comparing the standard baseline strategy of “Uniform” and the proposed method of “DDS” we can see that in all 8 settings DDS improves over the uniform baseline. This is a strong indication of both the consistency of the improvements that DDS can provide, and the generality – it works well in two very different settings. Next, we ﬁnd that DDS outperforms SPCL by a large margin for both of the tasks, especially for multilingual NMT. This is probably because SPCL weighs the data only by their easiness, while ignoring their relevance to the dev set, which is especially important in settings where the data in the training set can have very different properties such as the different languages in multilingual NMT.
+DDS also brings improvements over the state-of-the-art intelligent data utilization methods. For image classiﬁcation, DDS outperforms MentorNet and BatchWeight on CIFAR-10 in all settings. For NMT, in comparison to Related and TCS, vanilla DDS performs favorably with respect to these state-of-the-art data selection baselines, outperforming each in 3 out of the 4 settings (with exceptions of slightly underperforming Related on glg and TCS on aze). In addition, we see that incorporating prior knowledge into the scorer network leads to further improvements. For image classiﬁcation, retrained DDS can signiﬁcantly improve over regular DDS, leading to the new state-of-theart result on the CIFAR-10 dataset. For mulitlingual NMT, TCS+DDS achieves the best performance in three out of four cases (with the exception of slk, where vanilla DDS al-
+
+Optimizing Data Usage via Differentiable Rewards
+
+ready outperformed TCS).4
+DDS does not incur much computational overhead. For image classiﬁcation and multilingual NMT respectively, the training time is about 1.5× and 2× the regular training time without DDS. This contrasts favorably to previous methods that learn to select data using reinforcement learning. For example, in the IMDB movie review experiment in Fan et al. (2018a), the data agent is trained for 200 episode, where each episode uses around 40% of the whole dataset, requiring 80x more training time than a single training run.
+4.3. Analysis
+Image Classiﬁcation. Prior work on heuristic data selection has found that models perform better when fed higher quality or more domain-relevant data towards the end of training (van der Wees et al., 2017; Wang et al., 2019a). Here we verify this observation by analyzing the learned importance weight at the end of training for image classiﬁcation. Fig. 3 shows that at the end of training, DDS learns to balance the class distribution, which is originally unbalanced due to the dataset creation. Fig. 2 shows that at the end of training, DDS assigns higher probabilities to images with clearer class content from ImageNet. These results show that DDS learns to focus on higher quality data towards the end of training.
+NMT. Next, we focus on multilingual NMT, where the choice of data directly corresponds to picking a language, which has an intuitive interpretation. Since DDS adapts the data weights dynamically to the model throughout training, here we analyze how the dynamics of learned weights.
+We plot the probability distribution of the four HRLs (because they have more data and thus larger impact on training) over the course of training. Fig. 4 shows the change of language distribution for TCS+DDS. Since TCS selects the language with the largest vocabulary overlap with the LRL, the distribution is initialized to focus on the most related HRL. For all four LRLs, the percentage of their most related HRL starts to decrease as training continues. For aze, DDS quickly comes back to using its most related HRL. For gig and slk, DDS learns to mainly use both por and ces, their corresponding HRL. However, for bel, DDS continues the trend of using all four languages. This shows that DDS is able to maximize the beneﬁts of the multilingual data by having a more balanced usage of all languages.
+Fig. 5 shows a more interesting trend of DDS without heuristic initialization. For both aze and bel, DDS focuses on
+4Signiﬁcance tests (Clark et al., 2011) ﬁnd signiﬁcant gains over the baseline for aze, slk, and bel. For glg, DDS without heuristics performs as well as the TCS baseline.
+
+the most related HRL after a certain number of training updates. Interestingly, for bel, DDS learns to focus on both rus, its most related HRL, and ces. Similarly for slk, DDS also learns to focus on ces, its most related HRL, and rus, although there is little vocabulary overlap between slk and rus. Also notably, the ratios change signiﬁcantly over the course of training, indicating that different types of data may be more useful during different learning stages.
+5. Related Work
+Data Selection Methods Data selection for domain adaptation for disparate tasks has also been extensively studied (Moore & Lewis, 2010; Axelrod et al., 2011; Ngiam et al., 2018; Jiang & Zhai, 2007; Foster et al., 2010; Wang et al.). These methods generally design heuristics to measure domain similarity, while DDS is a more general data selection framework that works for both classiﬁcation and other usage cases. Besides domain adaptation, data selection also beneﬁts training in the face of noisy or otherwise undesirable data (Vyas et al., 2018; Pham et al., 2018). The idea of selecting training data that are similar to dev data has been used in works on submodular optimization (Kirchhoff & Bilmes, 2014; Tschiatschek et al., 2014), but they rely on features speciﬁc to the task, while DDS directly optimizes the the dev set performance, and is generalizable across tasks. Moreover, unlike DDS, these methods cannot adaptively change the data selection scheme.
+Instance Weighting Methods Our method is also related to works on training instance weighting (Sivasankaran et al., 2017; Ren et al., 2018; Jiang & Zhai, 2007; Ngiam et al., 2018). These methods reweigh data based on a manually computed weight vector, instead of using a parameterized neural network. Notably, Ren et al. (2018) tackles noisy data ﬁltering for image classiﬁcation, by using meta-learning to calculate a locally optimized weight vector for each batch of data. In contrast, our work focuses on the general problem of optimizing data usage. We train a parameterized scorer network that optimizes over the entire data space, which can be essential in preventing overﬁtting mentioned in § 2; empirically our method outperform (Ren et al., 2018) by a large margin in § 4. (Sivasankaran et al., 2017) optimizes data weights by minimizing the error rate on the dev set. However, they use a single number to weigh each subgroup of augmented data, and their algorithm requires an expensive heuristic method to update data weights; while DDS uses a more expressive parameterized neural network to model the individual data weights, which are efﬁciently updated by directly differentiating the dev loss.
+Curriculum Learning Many machine learning approaches consider how to best present data to models. First, difﬁculty-based curriculum learning estimates the presenta-
+
+brain coral
+
+bookshop
+
+Optimizing Data Usage via Differentiable Rewards
+
+cowboy boot
+
+ski mask
+
+oboe
+
+European gallinule
+
+stupa sulphur-crested cockatoo
+
+0.02427 CD player
+
+0.02702 beaver
+
+0.03352 black stork
+
+0.03402 eft
+
+0.04049 ram
+
+0.04191 lorikeet
+
+0.04429 red wine
+
+0.05322 Welsh springer spaniel
+
+0.05332
+
+0.06297
+
+0.06816
+
+0.07424
+
+0.07756
+
+0.09553
+
+0.12130
+
+0.14820
+
+Figure 2: Example images from the ImageNet and their weights assigned by DDS. A trained DDS scorer assigns higher probabilities to images from ImageNet, in which the class content is more clear. Each image’s label and weight in the minibatch is shown.
+
+Probability
+
+CIFAR-10 (4K) class counts
+
+0.115
+
+Raw counts
+
+0.110
+
+DDS-normalized
+
+0.105
+
+0.100
+
+0.095
+
+0.090 1 2 3 4 5 6 7 8 9 10 Class
+
+aze
+0.6
+0.4
+0.2
+0.0
+glg
+
+Figure 3: A trained DDS scorer learns to balance the class distri-
+
+0.4
+
+butions of CIFAR-10 4K.
+
+0.2
+
+tur
+
+por
+
+rus
+
+ces
+
+bel
+
+0.4
+
+0.2
+
+slk
+0.6 0.4 0.2 0.0
+
+aze
+1.00
+
+0.75
+
+0.50
+
+0.25
+
+0.00
+
+1.00
+
+glg
+
+0.75
+
+0.50
+
+0.25
+
+0.00
+
+tur
+
+por
+
+rus
+
+ces
+
+bel
+1.00
+
+0.75
+
+0.50
+
+0.25
+
+0.00
+slk
+0.8
+
+0.6
+
+0.4
+
+0.2
+
+0.0
+
+Figure 4: Language usage for TCS+DDS by training step. The distribution is initialized to focus on the most related HRL, and DDS learns to have a more balanced usage of all languages.
+
+Figure 5: Language usage for DDS by training step. DDS learns to upweight the most related HRL after certain training steps.
+tion order based on heuristic understanding of the hardness of examples (Bengio et al., 2009; Spitkovsky et al., 2010; Tsvetkov et al., 2016; Zhang et al., 2016; Graves et al., 2017; Zhang et al., 2018; Platanios et al., 2019). These methods, though effective, often generalize poorly because they require task-speciﬁc difﬁculty measures. On the other hand, self-paced learning (Kumar et al., 2010; Lee & Grauman, 2011) deﬁnes the hardness of the data based on the loss from the model, but is still based on the assumption that the model should learn from easy examples. Our method does not make these assumptions.
+RL for Training Data Usage Our method is closest to the learning to teach framework (Fan et al., 2018b) but their formulation involves manual feature design and requires expensive multi-pass optimization. Instead, we formulate our reward using bi-level optimization, which has been successfully applied for a variety of other tasks (Colson et al., 2007; Anandalingam & Friesz, 1992; Liu et al., 2019a; Baydin et al., 2018; Ren et al., 2018). (Wu et al., 2018; Kumar et al.,
+
+Optimizing Data Usage via Differentiable Rewards
+
+2019; Fang et al., 2017) propose RL frameworks for speciﬁc natural language processing tasks, but their methods are less generalizable and requires more complicated featurization.
+6. Conclusion
+We present differentiable data selection, an efﬁcient RL framework for optimizing training data usage. We parameterize the scorer network as a differentiable function of the data, and provide an intuitive reward function for efﬁciently training the scorer network. We formulate two algorithms under the DDS framework for two realistic and very different tasks, image classiﬁcation and multilingual NMT, which lead to consistent improvements over strong baselines.
+Acknowledgement
+The authors would like to thank Quoc Le for various suggestions, and thank Hanxiao Liu for comments on the paper’s ﬁrst draft. The ﬁrst author Xinyi Wang is supported by a research grant from the Tang Family Foundation. The authors would like to thank Amazon for providing GPU credits.
+References
+Anandalingam, G. and Friesz, T. L. Hierarchical optimization: An introduction. Annals OR, 1992.
+Axelrod, A., He, X., and Gao, J. Domain adaptation via pseudo in-domain data selection. In EMNLP, 2011.
+Bahdanau, D., Cho, K., and Bengio, Y. Neural machine translation by jointly learning to align and translate. In ICLR, 2015.
+Baydin, A. G., Cornish, R., Mart´ınez-Rubio, D., Schmidt, M., and Wood, F. Online learning rate adaptation with hypergradient descent. In ICLR, 2018.
+Bengio, Y., Louradour, J., Collobert, R., and Weston, J. Curriculum learning. In ICML, 2009.
+Clark, J. H., Dyer, C., Lavie, A., and Smith, N. A. Better hypothesis testing for statistical machine translation: Controlling for optimizer instability. In ACL, 2011.
+Colson, B., Marcotte, P., and Savard, G. An overview of bilevel optimization. Annals OR, 153(1), 2007.
+Du, Y., Czarnecki, W. M., Jayakumar, S. M., Pascanu, R., and Lakshminarayanan, B. Adapting auxiliary losses using gradient similarity. CoRR, abs/1812.02224, 2018. URL http://arxiv.org/abs/1812.02224.
+Fan, Y., Tian, F., Qin, T., Bian, J., and Liu, T.-Y. Learning what data to learn. 2018a. URL https://arxiv. org/abs/1702.08635.
+
+Fan, Y., Tian, F., Qin, T., Li, X., and Liu, T. Learning to teach. In ICLR, 2018b.
+Fang, M., Li, Y., and Cohn, T. Learning how to active learn: A deep reinforcement learning approach. In EMNLP, pp. 595–605, 2017.
+Finn, C., Abbeel, P., and Levine, S. Model-agnostic metalearning for fast adaptation of deep networks. In ICML, 2017.
+Foster, G., Goutte, C., and Kuhn, R. Discriminative instance weighting for domain adaptation in statistical machine translation. In EMNLP, 2010.
+Graves, A., Bellemare, M. G., Menick, J., Munos, R., and Kavukcuoglu, K. Automated curriculum learning for neural networks. In ICML, 2017.
+Gre´zl, F., Karaﬁa´t, M., Konta´r, S., and Cernocky, J. Probabilistic and bottle-neck features for lvcsr of meetings. In ICASSP, volume 4, pp. IV–757. IEEE, 2007.
+He, K., Zhang, X., Ren, S., and Sun, J. Deep residual learning for image recognition. In CPVR, 2016.
+Ioffe, S. and Szegedy, C. Batch normalization: Accelerating deep network training by reducing internal covariate shift. In ICML, 2015.
+Jiang, J. and Zhai, C. Instance weighting for domain adaptation in nlp. In ACL, 2007.
+Jiang, L., Meng, D., Zhao, Q., Shan, S., and Hauptmann, A. G. Self-paced curriculum learning. In AAAI, 2015.
+Jiang, L., Zhou, Z., Leung, T., Li, L., and Fei-Fei, L. Mentornet: Learning data-driven curriculum for very deep neural networks on corrupted labels. In ICML, 2018.
+Kingma, D. P. and Ba, J. L. Adam: A method for stochastic optimization. In ICLR, 2015.
+Kirchhoff, K. and Bilmes, J. A. Submodularity for data selection in machine translation. In EMNLP, 2014.
+Kornblith, S., Shlens, J., and Le, Q. V. Do better imagenet models transfer better? In CVPR, 2019.
+Krizhevsky, A. Learning multiple layers of features from tiny images. Technical report, 2009.
+Kumar, G., Foster, G., Cherry, C., and Krikun, M. Reinforcement learning based curriculum optimization for neural machine translation. In NAACL, pp. 2054–2061, 2019.
+Kumar, M. P., Packer, B., and Koller, D. Self-paced learning for latent variable models. In NIPS, 2010.
+
+Optimizing Data Usage via Differentiable Rewards
+
+Lee, Y. J. and Grauman, K. Learning the easy things ﬁrst: Self-paced visual category discovery. In CVPR, 2011.
+Lipton, Z. C., Wang, Y.-X., and Smola, A. Detecting and correcting for label shift with black box predictors. arXiv preprint arXiv:1802.03916, 2018.
+Liu, H., Simonyan, K., and Yang, Y. DARTS: differentiable architecture search. 2019a.
+Liu, S., Davison, A. J., and Johns, E. Self-supervised generalisation with meta auxiliary learning. CoRR, abs/1901.08933, 2019b. URL http://arxiv.org/ abs/1901.08933.
+Loshchilov, I. and Hutter, F. Sgdr: Stochastic gradient descent with warm restarts. In ICLR, 2017.
+Moore, R. C. and Lewis, W. Intelligent selection of language model training data. In ACL, 2010.
+Nesterov, Y. E. A method for solving the convex programming problem with convergence rate o(1/k2). Soviet Mathematics Doklady, 1983.
+Neubig, G. and Hu, J. Rapid adaptation of neural machine translation to new languages. EMNLP, 2018.
+Ngiam, J., Peng, D., Vasudevan, V., Kornblith, S., Le, Q. V., and Pang, R. Domain adaptive transfer learning with specialist models. CVPR, 2018.
+Papineni, K., Roukos, S., Ward, T., and Zhu, W. Bleu: a method for automatic evaluation of machine translation. In ACL, 2002.
+Pham, M. Q., Crego, J., Senellart, J., and Yvon, F. Fixing translation divergences in parallel corpora for neural MT. In EMNLP, 2018.
+Platanios, E. A., Stretcu, O., Neubig, G., Poczos, B., and Mitchell, T. Competence-based curriculum learning for neural machine translation. In NAACL, 2019.
+Qi, Y., Sachan, D. S., Felix, M., Padmanabhan, S., and Neubig, G. When and why are pre-trained word embeddings useful for neural machine translation? NAACL, 2018.
+Ren, M., Zeng, W., Yang, B., and Urtasun, R. Learning to reweight examples for robust deep learning. In ICML, pp. 4331–4340, 2018.
+Russakovsky, O., Deng, J., Su, H., Krause, J., Satheesh, S., Ma, S., Huang, Z., Karpathy, A., Khosla, A., Bernstein, M., Berg, A. C., and Fei-Fei, L. ImageNet Large Scale Visual Recognition Challenge. IJCV, 2015.
+Sennrich, R. and Zhang, B. Revisiting low-resource neural machine translation: A case study. In ACL, 2019.
+
+Shimodaira, H. Improving predictive inference under covariate shift by weighting the log-likelihood function. Journal of statistical planning and inference, 90(2):227–244, 2000.
+Sivasankaran, S., Vincent, E., and Illina., I. Discriminative importance weighting of augmented training data for acoustic model training. In ICASSP, 2017.
+Spitkovsky, V. I., Alshawi, H., and Jurafsky, D. From baby steps to leapfrog: How ”less is more” in unsupervised dependency parsing. In NAACL, 2010.
+Srivastava, N., Hinton, G., Krizhevsky, A., Sutskever, I., and Salakhutdinov, R. Dropout: A simple way to prevent neural networks from overﬁtting. In JMLR, 2014.
+Tschiatschek, S., Iyer, R. K., Wei, H., and Bilmes, J. A. Learning mixtures of submodular functions for image collection summarization. In NIPS, 2014.
+Tsvetkov, Y., Faruqui, M., Ling, W., MacWhinney, B., and Dyer, C. Learning the curriculum with bayesian optimization for task-speciﬁc word representation learning. In ACL, 2016.
+van der Wees, M., Bisazza, A., and Monz, C. Dynamic data selection for neural machine translation. In EMNLP, 2017.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Attention is all you need. In NIPS, pp. 5998–6008, 2017.
+Vyas, Y., Niu, X., and Carpuat, M. Identifying semantic divergences in parallel text without annotations. In NAACL, 2018.
+Wang, R., Utiyama, M., Liu, L., Chen, K., and Sumita, E. Instance weighting for neural machine translation domain adaptation. In EMNLP.
+Wang, W., Caswell, I., and Chelba, C. Dynamically composing domain-data selection with clean-data selection by ”co-curricular learning” for neural machine translation. In ACL, 2019a.
+Wang, X. and Neubig, G. Target conditioned sampling: Optimizing data selection for multilingual neural machine translation. In ACL, 2019.
+Wang, X., Pham, H., Arthur, P., and Neubig, G. Multilingual neural machine translation with soft decoupled encoding. In ICLR, 2019b.
+Williams, R. J. Simple statistical gradient-following algorithms for connectionist reinforcement learning. Machine Learning, 1992.
+
+Optimizing Data Usage via Differentiable Rewards
+
+Wu, J., Li, L., and Wang, W. Y. Reinforced co-training. In NAACL, 2018.
+Xie, S., Girshick, R., Dolla´r, P., Tu, Z., and He, K. Aggregated residual transformations for deep neural networks. In CVPR, 2017.
+Zagoruyko, S. and Komodakis, N. Wide residual networks. In BMVC, 2016.
+Zhang, C., Bengio, S., Hardt, M., Recht, B., and Vinyals, O. Understanding deep learning requires rethinking generalization. In ICLR, 2017.
+Zhang, D., Kim, J., Crego, J., and Senellart, J. Boosting neural machine translation. Arxiv 1612.06138, 2016.
+Zhang, X., Kumar, G., Khayrallah, H., Murray, K., Gwinnup, J., Martindale, M. J., McNamee, P., Duh, K., and Carpuat, M. An empirical exploration of curriculum learning for neural machine translation. Arxiv, 1811.00739, 2018.
+
+A. Appendix
+
+A.1. Deriving gradient of ψ for Different Optimizers
+
+First, we rewrite the update rule of θ in Eqn. 4 to incorporate the effect of its speciﬁc optimization algorithm.
+
+For a ﬁxed value of ψ, J(θ, ψ) can be optimized using a stochastic gradient update. Speciﬁcally, at time step t, we update
+
+θt ← θt−1 − g ∇θJ (θt−1, ψ)
+
+(8)
+
+where g(·) is any function that may be applied to the gradient ∇θJ(θt−1, ψ). For instance, in standard gradient descent g(·) is simply a linear scaling of ∇θJ(θt−1, ψ) by a learning rate ηt, while with the Adam optimizer (Kingma & Ba, 2015) g also modiﬁes the learning rate on a parameter-byparameter basis.
+Due to the relationship between θt and ψ as in Eqn. 8, J(θt, Ddev) is differentiable with respect to ψ. By the chain rule, we can compute the gradient ∇ψJ(θt, Ddev) as follows:
+
+Zoph, B., Yuret, D., May, J., and Knight, K. Transfer learning for low-resource neural machine translation. In EMNLP, 2016.
+
+(chain rule):
+∇ψJ (θt, Ddev) = ∇θt J (θt, Ddev) · ∇ψθt(ψ) (substitute θt from Eqn. 8):
+= ∇θt J (θt, Ddev) · ∇ψ θt−1 − g ∇θJ (θt−1) (assume ∇ψθt−1 ≈ 0)
+≈ −∇θt J (θt, Ddev) · ∇ψg ∇θJ (θt−1) (9)
+Here, we make a Markov assumption that ∇ψθt−1 ≈ 0, assuming that at step t, given θt−1 we do not care about how the values of ψ from previous steps led to θt−1. Eqn. 9 leads to a rule to update ψ using gradient descent:
+
+ψt+1 ← ψt + ηψ∇θt J (θt, Ddev) · ∇ψg ∇θJ (θt−1, ψt) , (10)
+Here we ﬁrst derive ∇ψg for the general stochastic gradient descent (SGD) update, then provide examples for two other common optimization algorithms, namely Momentum (Nesterov, 1983) and Adam (Kingma & Ba, 2015).
+
+SGD Updates. The SGD update rule for θ is as follows
+
+θt ← θt−1 − ηt∇θJ (θt−1, ψ)
+
+(11)
+
+where ηt is the learning rate. Matching the updates in Eqn. 11 with the generic framework in Eqn. 8, we can see that g in Eqn. 8 has the form:
+
+g ∇θJ (θt−1, ψ) = ηt∇θJ (θt−1, ψ)
+
+(12)
+
+This reveals a linear dependency of g on ∇θJ(θt−1,ψ), allowing the exact differentiation of g with respect to ψ. From
+
+Optimizing Data Usage via Differentiable Rewards
+
+Eqn. 10, we have
+
+A.2. Hyperparameters for multilingual NMT
+
+∇J (θt, Ddev) · ∇ψg ∇θJ (θt−1, ψ) = ηt · ∇ψEx,y∼p(X,Y ;ψ) ∇J (θt, Ddev) · ∇θ (x, y; θt−1)
+
+In this section, we give a detailed description of the hyperparameters used for the multilingual NMT experiments.
+
+= ηtEx,y∼p(X,Y ;ψ) ∇J(θt, Ddev) · ∇θ (x, y; θt−1) · ∇ψ log p(x, y• ; Wψ)e use a 1 layer LSTM with hidden size of 512 for both
+
+(13)
+
+the encoder and decoder, and set the word embedding
+
+Here, the last equation follows from the log-derivative trick
+
+to size 128.
+
+in the REINFORCE algorithm (Williams, 1992). We can
+
+consider the alignment of dev set and training data gradi-
+
+• For multilingual NMT, we only use the scorer to model
+
+ents as the reward for update ψ. In practice, we found
+
+the distribution over languages. Therefore, we use
+
+that using cosine distance is more stable than simply tak-
+
+a simple 2-layer perceptron network as the scorer ar-
+
+ing dot product between the gradients. Thus in our im-
+
+chitecture. Suppose the training data is from n dif-
+
+plementation of the machine translation algorithm, we use
+
+ferent languages. For each target sentence and its
+
+cos J (θt, Ddev) · ∇θ (x, y; θt−1) as the reward signal.
+
+corresponding source sentences, the input feature is
+
+a n-dimensional vector of 0 and 1, where 1 indicates a
+
+Momentum Updates. The momentum update rule for θ
+
+source language exists for the given target sentence.
+
+is as follows
+
+mt ← µtmt−1 + ηt∇θJ (θt−1, ψ) θt ← θt−1 − mt,
+
+• We simply use the dev set that comes with the dataset
+
+(14)
+
+as Ddev to update the scorer.
+
+where µt is the momentum coefﬁcient and ηt is the learning rate. This means that g has the form:
+g(x) = µmt−1 + ηtx (15)
+g (x) = ηt
+Therefore, the computation of the gradient ∇ψ for the Momentum update is exactly the same with the standard SGD update rule in Eqn. 13.
+
+• The dropout rate is set to 0.3.
+• For the NMT model, we use Adam optimizer with learning rate of 0.001. For the distribution parameter ψ, we use Adam optimizer with learning rate of 0.0001.
+• We train all models for 20 epochs without any learning rate decay.
+
+Adam Updates. We use a slightly modiﬁed update rule based on Adam (Kingma & Ba, 2015):
+
+gt ← ∇θJ (θt−1, ψ) vt ← β2vt−1 + (1 − β2)gt2 vˆt ← vt/(1 − β2t ) (16)
+√ θt ← θt−1 − ηt · gt/ vˆt +
+
+where β2 and ηt are hyper-parameters. This means that g is a component-wise operation of the form:
+
+g(x) =
+
+ηt 1 − β2t · x β2vt−1 + (1 − β2)x2 +
+
+g (x) =
+
+ηt 1 − β2t (β2vt−1 + ) ≈ ηt β2vt−1 + (1 − β2)x2 + 3/2
+
+1 − β2t , β2 vt−1
+
+(17)
+
+the last equation holds because we assume vt−1 is indepen-
+
+dent of ψ. Here the approximation makes sense because
+
+we empirically observe that the individual values of the
+
+gradient vector ∇θJ(θt−1, ψ), i.e. gt, are close to 0. Fur-
+
+thermore, for Adam, we usually use β2 = 0.999. Thus, the value (1 − β2)x2 in the denominator of Eqn. 17 is negligible.
+
+With this approximation, the computation of the gradient
+
+∇ψ is almost the same with that for SGD in Eqn. 13, with
+
+one extra component-wise scaling by the term in Eqn. 17.
+
+• We optimize both the NMT and DDS models with Adam, using learning rates of 0.001 and 0.0001 for θ and ψ respectively.
+A.3. Dataset statistics for Multilingual NMT
+LRL Train Dev Test HRL Train aze 5.94k 671 903 tur 182k bel 4.51k 248 664 rus 208k glg 10.0k 682 1007 por 185k slk 61.5k 2271 2445 ces 103k
+Table 2: Statistics of the multilingual NMT datasets.
+A.4. Hyperparameters for image classiﬁcation In this section, we provide some additional details for the image classiﬁcation task:
+• We use the cosine learning rate decay schedule (Loshchilov & Hutter, 2017), starting at 0.1 for CIFAR-10 and 3.2 for ImageNet, both with 2000 warmup steps.
+
+Optimizing Data Usage via Differentiable Rewards
+• For image classiﬁcation, we use an identical network architecture with the main model, but with independent weights and a regressor to predict the score instead of a classiﬁer to predict image classes.
+• To construct the Ddev to update the scorer, we hold out about 10% of the training data. For example, in CIFAR-10 (4,000), Ddev is the last 400 images, while in ImageNet-10%, since we use the ﬁrst 102 TFRecord shards, Ddev consists of the last 10 shards. Here, “last” follows the order in which the data is posted on their website for CIFAR-10, and the order in which the TFRecord shards are processed for ImageNet. All data in Ddev are excluded from Dtrain. Thus, for example, with CIFAR-10 (4,000), |Dtrain| = 3600, ensuring that in total, we are only using the amount of data that we claim to use.
+• We maintain a moving average of all model parameters with the rate of 0.999. Following Kornblith et al. (2019), we treat the moving statistics of batch normalization (Ioffe & Szegedy, 2015) as untrained parameters and also add them to the moving averages.
+• For ImageNet, we use the post-activation ResNet50 (He et al., 2016). The batch sizes for CIFAR-10 and for ImageNet are 128 and 4096, running for 200K steps and 40K steps, respectively.
+
+

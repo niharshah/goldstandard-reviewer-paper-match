@@ -1,0 +1,429 @@
+On-the-ﬂy Operation Batching in Dynamic Computation Graphs
+
+arXiv:1705.07860v1 [cs.LG] 22 May 2017
+
+Graham Neubig∗ Language Technologies Institute
+Carnegie Mellon University gneubig@cs.cmu.edu
+
+Yoav Goldberg∗ Computer Science Department
+Bar-Ilan University yogo@cs.biu.ac.il
+
+Chris Dyer DeepMind cdyer@google.com
+
+Abstract
+Dynamic neural network toolkits such as PyTorch, DyNet, and Chainer offer more ﬂexibility for implementing models that cope with data of varying dimensions and structure, relative to toolkits that operate on statically declared computations (e.g., TensorFlow, CNTK, and Theano). However, existing toolkits—both static and dynamic—require that the developer organize the computations into the batches necessary for exploiting high-performance algorithms and hardware. This batching task is generally difﬁcult, but it becomes a major hurdle as architectures become complex. In this paper, we present an algorithm, and its implementation in the DyNet toolkit, for automatically batching operations. Developers simply write minibatch computations as aggregations of single instance computations, and the batching algorithm seamlessly executes them, on the ﬂy, using computationally efﬁcient batched operations. On a variety of tasks, we obtain throughput similar to that obtained with manual batches, as well as comparable speedups over singleinstance learning on architectures that are impractical to batch manually.2
+1 Introduction
+Modern CPUs and GPUs evaluate batches of arithmetic operations signiﬁcantly faster than the sequential evaluation of the same operations. For example, performing elementwise operations takes nearly the same amount of time on the GPU whether operating on tens or on thousands of elements, and multiplying a few hundred different vectors by the same matrix is signiﬁcantly slower than executing a single (equivalent) matrix–matrix product using an optimized GEMM implementation on either a GPU or a CPU. Thus, careful grouping of operations into batches that can execute efﬁciently in parallel is crucial for making the most of available hardware resources.
+Today, developers who write code to train neural networks are responsible for crafting most of this batch handling by hand. In some cases this is easy: when inputs and outputs are naturally represented as ﬁxed sized tensors (e.g., images of a ﬁxed size such those in the MNIST and CIFAR datasets, or regression problems on ﬁxed sized vector inputs), and the computations required to process each instance are instance-invariant and expressible as standard operations on tensors (e.g., a series of matrix multiplications, convolutions, and elementwise nonlinearities), a suitably ﬂexible tensor library
+∗Authors contributed equally. 2The proposed algorithm is implemented in DyNet (http://github.com/clab/dynet), and can be activated by using the “--dynet-autobatch 1” command line ﬂag.
+31st Conference on Neural Information Processing Systems (NIPS 2017), Long Beach, CA, USA.
+
+RNN
+x(11) RNN
+x(12) RNN
+
+RNN
+x(21) RNN
+x(22) RNN
+
+RNN
+x(31) L(2)
+y(2) RNN
+
+RNN x(41)
+L(3)
+
+L(1)
+
+masks
+
+m1
+
+m2
+
+m3
+
+m4
+
+Y
+
+Y
+
+Y
+
+Y
+
+y(1)
+
+L L1
+batches
+RNN
+
+L2 RNN
+
+L3 RNN
+
+L4
+
+RNN
+
+L
+
+x(13)
+
+x(23)
+
+x(33)
+
+y(3)
+
+X1
+
+X2
+
+X3
+
+X4
+
+padding
+
+Figure 1: Two computation graphs for computing the loss on a minibatch of three training instances consisting of a sequence of input vectors paired with a ﬁxed sized output vector. On the left is a “conceptual” computation graph which shows the operations associated with computing the losses individually for each sequence and then aggregating them. The same computation is executed by the right-hand (“batched”) computation graph: it aggregates the inputs in order to make better use of modern processors. This comes with a price in complexity—the variable length of the sequences requires padding and masking operations. Our aim is for the user to specify the conceptual computation on the left, and let the framework take care of its efﬁcient execution.
+
+that provides efﬁcient implementations of higher-order generalizations of low-order operations makes manual batching straightforward. For example, by adding a leading or trailing dimension to the tensors representing inputs and outputs, multiple instances can be straightforwardly represented in a single data structure. In other words: in this scenario, the developer conceives of and writes code for the computation on an individual instance, packs several instances into a tensor as a “minibatch”, and the library handles executing these efﬁciently in parallel.
+Unfortunately, this idealized scenario breaks when working with more complex architectures. Deep learning is increasingly being applied to problems whose inputs, outputs and intermediate representations do not ﬁt easily into ﬁxed sized tensors. For example, images vary in size and sequences in length; data may be structured as trees [27] or graphs [16], or the model may select its own computation conditional on the input [15, 26, 31]. In all these cases, while the desired computation is easy enough to write for a single instance, organizing the computational operations so that they make optimally efﬁcient use of the hardware is nontrivial. Indeed, many papers that operate on data structures more complicated than sequences have avoided batching entirely [7, 14, 24]. In fact, until last year [6, 19], all published work on recursive (i.e., tree-structured) neural networks appears to have used single instance training.
+The premise of this work is that operation batching should not be the responsibility of the user, but instead should be a service provided by the framework. The user should only be responsible for specifying a large enough computation so that batching is possible (i.e, summing the losses of several instances, such as one sees in the left side of Figure 1), and the framework should take care of the lower-level details of operation batching, much like optimizing compilers or JIT optimizers in interpreted languages do.
+We take a large step towards this goal by introducing an efﬁcient algorithm—and a corresponding implementation—for automatic batching in dynamically declared computation graphs.3 Our method relies on separating the graph construction from its execution, using operator overloading and lazy evaluation (§2). Once this separation is in place, we propose a fast batching heuristic that can be performed in real time, for each training instance (or minibatch), between the graph construction and its execution (§3). We extend the DyNet toolkit [20] with this capability. From the end-user’s
+3Computation graphs (often represented in a form called a Wengert list) are the data structures used to structure the evaluation of expressions and use reverse mode automatic differentiation to compute their derivatives [3]. Broadly, learning frameworks use two strategies to construct these: static and dynamic. In static toolkits (e.g., Theano [5], Tensorﬂow [1]) the computation graph is deﬁned once and compiled, and then examples are fed into the same graph. In contrast, dynamic toolkits (e.g., DyNet [20], Chainer [30], PyTorch [http://pytorch.org]) construct the computation graph for each training instance (or minibatch) as the forward computation is executed. While dynamic declaration means that each minibatch can have its own computational architecture, the user is still responsible for batching operations themselves.
+2
+
+perspective, the result is a simple mechanism for exploiting efﬁcient data-parallel algorithms in networks that would be cumbersome to batch by hand. The user simply deﬁnes the computation independently for each instance in the batch (using standard Python or C++ language constructs), and the framework takes care of the rest. Experiments show that our algorithm compares favorably to manually batched code, that signiﬁcant speed improvements are possible on architectures with no straightforward manual batching design, and that we obtain better performance than TensorFlow Fold [18], an alternative framework built to simulate dynamic graph deﬁnition and automatic batching on top of TensorFlow (§4).
+
+2 Batching: Conception vs. Efﬁcient Implementation
+
+To illustrate the challenges with batching, consider the problem of predicting a real-valued vector conditional on a sequence of input vectors (this example is chosen for its simplicity; experiments are conducted on more standard tasks). We assume that an input sequence of vectors is read sequentially by an RNN, and then the ﬁnal state is used to make a prediction; the training loss is the Euclidean distance between the prediction and target. We compare two algorithms for computing this code: a naïve, but developer-friendly one (whose computation graph is shown in the left part of Figure 1), which reﬂects how one conceives of what a batch loss computation is; and a computationally efﬁcient— but more conceptually complex—version that batches up the computations so they are executed in parallel across the sequences (the right part of Figure 1).
+
+Naïve (developer-friendly) batched implementation The left part of Figure 1 shows the computations that must be executed to compute the losses associated with three (b = 3) training instances,
+
+implemented naïvely. Pseudo-code for constructing the graph for each of the RNNs on the left using
+
+a dynamic declaration framework is as follows:
+
+function RNN-REGRESSION-LOSS(x1:n, y; (W, U, b, c) = θ)
+
+h0 = 0 for t ∈ 1, 2, . . . , n do
+
+Initial state of the RNN; ht ∈ Rd.
+
+ht = tanh(W[ht−1; xt] + b)
+
+yˆ = Uhn + c L = ||yˆ − y||22 return L
+
+Note that the code does not compute any value, but constructs a symbolic graph describing the
+
+computation. This can then be integrated into a batched training procedure:
+
+function TRAIN-BATCH-NAIVE(T = {(x(1i:)n(i) , y(i))}bi=1; θ) NEW-GRAPH()
+
+for i ∈ 1, 2, . . . , b do
+
+Naïvely loop over elements of batch.
+
+L(i) = RNN-REGRESSION-LOSS(x(1i:)n(i) , y(i); θ)
+
+Single instance loss.
+
+L = i L(i) FORWARD(L)
+
+Aggregate losses for all elements in batch.
+
+∂L ∂θ
+
+=
+
+BACKWARD(L)
+
+θ
+
+=
+
+θ
+
+−
+
+η
+
+∂L ∂θ
+
+This code is simple to understand, uses basic ﬂow control present in any programming language and simple mathematical operations. Unfortunately, executing it will generally be quite inefﬁcient, since in the resulting computation graph each operation is performed sequentially without exploiting the fact that similar operations are being performed across the training instances.
+
+Efﬁcient manually batched implementation To make good use of efﬁcient data-parallel algorithms and hardware, it is necessary to batch up the operations so that the sequences are processed in parallel. The standard way to achieve this is by aggregating the inputs and outputs, altering the code as follows:
+
+3
+
+function RNN-REGRESSION-BATCH-LOSS(X1:nmax , Y, n(1:b); (W, U, b, c) = θ)
+
+M=0
+
+Build loss mask; M ∈ Rb×nmax .
+
+for i ∈ 1, 2, . . . , b do
+
+M[i,n(i)] = 1
+
+Position where the ﬁnal symbol in sequence i occurs.
+
+H0 = 0 for t ∈ 1, 2, . . . , nmax do
+
+Initial states of the RNN (one per instance); Ht ∈ Rd×b.
+
+Ht = tanh(W[Ht−1; Xt] + b) Yˆ t = UHt + c Lt = ||(Yˆ t − Y)(mt1 )||2F
+
+Addition broadcasts b over columns. Addition broadcasts c over columns. Compute masked losses (mt is the tth column of M).
+
+L = t Lt return L
+
+function TRAIN-BATCH-MANUAL(T nmax = maxi n(i) for t ∈ 1, 2, . . . , nmax do Xt = 0 ∈ Rd×b
+
+= {(x(1i:)n(i) , y(i))}bi=1; θ) Build sequence of batch input matrices.
+
+for i ∈ 1, 2, . . . , b do
+
+Xt,[·,i] = x(ti) if t ≤ n(i) otherwise 0
+
+The ith column of Xt.
+
+Y = [y(1) y(2) · · · y(b)]
+
+Build batch of output targets.
+
+NEW-GRAPH() Now that inputs are constructed, create graph, evaluate loss and gradient.
+
+L = RNN-REGRESSION-BATCH-LOSS(X1:nmax , Y, n(1:b); θ) FORWARD(L)
+
+∂L ∂θ
+
+=
+
+BACKWARD(L)
+
+θ
+
+=
+
+θ
+
+−
+
+η
+
+∂L ∂θ
+
+This code computes the same value as the naïve implementation, it does so more efﬁciently, and it is signiﬁcantly more complicated. Because the sequences processed by RNNs will generally be of different lengths (which is precisely why RNNs are useful!), it is necessary to pad the input representation with dummy values, and also to mask out the resulting losses at the right times. While these techniques are part of the inventory of skills that a good ML engineer has, they increase the difﬁculty of implementation and probability that bugs will be present in the code.
+Implementation comparison The naïve algorithm has two advantages over manual batching. First, it is easy to implement: the way we conceive of a model is the way it is implemented, and errors with padding, masking, and batching are avoided. Second, the naïve algorithm aggregates any single instance loss, whereas manual batching efforts are generally problem speciﬁc. For these reasons, one should strongly prefer the ﬁrst algorithm; however, for efﬁciency reasons, batching matters. In the next section we turn to the problem of how to efﬁciently execute naïve computation graphs so that they can take advantage of efﬁcient batched implementations of operations. This provides the best of both worlds to developers: code is easy to write, but execution is fast.
+3 An Algorithm for On-the-ﬂy Batching
+Manual batching, discussed in the previous section, mostly operates by aggregating input instances and feeding them through a network. In RNNs, this means aggregating inputs that share a time step. This often require padding and masking, as input sizes may differ. It also restricts the kinds of operations that can be batched. In contrast, our method identiﬁes and aggregates computation graph nodes that can be executed in a batched fashion for a given graph. This reduces the need for workarounds such as padding and masking, allows for seamless efﬁcient execution also in architectures which are hard to conceptualize in the input-centric paradigm, and allows for the identiﬁcation of batching opportunities that may not be apparent from an input-centric view.
+Our batching procedure operates in three steps (1) graph deﬁnition, (2) operation batching, and (3) computation. Here, steps (1) and (3) are shared with standard execution of computation graphs, while (2) corresponds to our proposed method.
+3.1 Graph Deﬁnition First, we deﬁne the graph that represents the computation that we want to perform. From the user’s perspective, this is done by simply performing computation that they are interested in performing, such as that deﬁned in the RNN-REGRESSION-LOSS function from the previous example. While it is common for dynamic graph frameworks to interleave the graph deﬁnition and its forward execution,
+
+4
+
+we separate these parts by using lazy evaluation: we only perform forward evaluation when a resulting value is requested by the user through the calling of the FORWARD function. The graph can be further extended after a call to FORWARD, and further calls will lazily evaluate the delta of the computation. This allows the accumulation of large graph chunks before executing forward computations, providing ample opportunities for operation batching.
+3.2 Operation Batching Next, given a computation graph, such as the one on the left side of Figure 1, our proposed algorithm converts it into a graph where operations that can be executed together are batched together. This is done in the two step process described below.
+Computing compatibility groups We ﬁrst partition the nodes into compatibility groups, where nodes in the same group have the potential for batching. This is done by associating each node with a signature such that nodes that share the same signature are guaranteed to be able to be executed in a single operation if their inputs are ready. Signatures vary depending on the operation the node represents. For example, in nodes representing element-wise operations, all nodes with the same operation can be batched together, so the signature is simply the operation name (tanh, log, ...). In nodes where dimensions or other information is also relevant to whether the operations can be batched, this information is also included in the signature. For example, a node that picks a slice of the input matrix will also be dependent on the matrix size and range to slice, so the signature will look something like slice-400x500-100:200. In some other cases (e.g. a parameterized matrix multiply) we may remember the speciﬁc node ID of one of the inputs (e.g. node123 representing the matrix multiply parameters) while generalizing across other inputs (e.g. data or hidden state vectors on the right-hand side), resulting in a signature that would look something like matmul-node123-400x1. A more thorough discussion is given in Appendix A.
+Determining execution order A computation graph is essentially a job dependency graph where each node depends on its input (and by proxy the input of other preceding nodes on the path to its inputs). Our goal is to select an execution order in which (1) each node is executed after its dependencies; and (2) nodes that have the same signature and do not depend on each other are scheduled for execution on the same step (and will be executed in a single batched operation). Finding an optimal execution order that maximizes the amount of batching in the general case is NP hard [23]. We discuss two heuristic strategies for identifying execution orders that satisfy these requirements.
+Depth-based batching is used as a method for automatic batching in TensorFlow Fold [18]. This is done by calculating the depth of each node in the original computation graph, deﬁned as the maximum length from a leaf node to the node itself, and batching together nodes that have an identical depth and signature. By construction, nodes of the same depth are not dependent on each-other, as all nodes will have a higher depth than their input, and thus this batching strategy is guaranteed to satisfy condition (1) above. However, this strategy will also miss some good batching opportunities. For example, the loss function calculations in Figure 1 are of different depths due to the different-lengthed sequences, and similar problems will occur in recurrent neural network language models, tree-structured neural networks, and a myriad of other situations.
+Agenda-based batching is a method we propose that does not depend solely on depth. The core of this method is an agenda that tracks “available” nodes that have no unresolved dependencies. For each node, a count of its unresolved dependencies is maintained; this is initialized to be the number of inputs to the node. The agenda is initialized by adding nodes that have no incoming inputs (and thus no unresolved dependencies). At each iteration, we select a node from the agenda together with all of the available nodes in the same signature, and group them into a single batch operation. These nodes are then removed from the agenda, and the dependency counter of all of their successors are decremented. Any new zero-dependency nodes are added to the agenda. This process is repeated until all nodes have been processed.
+How do we prioritize between multiple available nodes in the agenda? Intuitively, we want to avoid prematurely executing nodes if there is a potential for more nodes of the same signature to be added to the agenda at a later point, resulting in better batching. A good example of this from our running example in Figure 1 is the loss-calculating nodes, which will be added to the agenda at different points due to becoming calculable after different numbers of RNN time steps. To capture this intuition, we introduce a heuristic method for prioritizing nodes based on the average depth of all nodes with their
+5
+
+signature, such that nodes with a lower average depth will be executed earlier. In general (with some exceptions), this tends to prioritize nodes that occur in earlier parts of the graph, which will result in the nodes in the later parts of the graph, such as these loss calculations, being executed later and hopefully batched together.4
+Finally, this non-trivial batching procedure must be executed quickly so that overhead due to batch scheduling calculations doesn’t cancel out the efﬁciency gains from operation batching. To ensure this, we perform a number of optimizations in the implementation, which we detail in Appendix B.
+3.3 Forward-backward Graph Execution and Update
+Once we have determined an execution order (including batching decisions), we perform calculations of the values themselves. In standard computation graphs, forward computation is done in topological order to calculate the function itself, and backward calculation is done in reverse topological order to calculate gradients. In our automatically batched evaluation, the calculation is largely similar with two exceptions:
+Single→batch node conversion First, it is necessary to convert single nodes into a batched node, which also requires modiﬁcation of the underlying operations such as converting multiple matrixvector operations Whi to a single matrix-matrix operation WH. This is done internally in the library, while the user-facing API maintains the original unbatched computation graph structure, making this process invisible to the user.
+Ensuring contiguous memory To ensure that operations can be executed as a batch, the inputs to the operations (e.g. the various vectors h(ti)) must be arranged in contiguous memory (e.g. a matrix Ht). In some cases, it is necessary to perform a memory copy to arrange these inputs into contiguous memory, but in other cases the inputs are already contiguous and in the correct order, and in these cases we can omit the memory copy and use the inputs as-is.
+4 Experiments
+In this section we describe our experiments, designed to answer three main questions: (1) in situations where manual batching is easy, how close can the proposed method approach the efﬁciency of a program that uses hand-crafted manual batching, and how do the depth-based and agenda-based approaches compare (§4.1)? (2) in situations where manual batching is less easy, is the proposed method capable of obtaining signiﬁcant improvements in efﬁciency (§4.2)? (3) how does the proposed method compare to TensorFlow Fold, an existing method for batching variably structured networks within a static declaration framework (§4.3)?
+4.1 Synthetic Experiments
+Our ﬁrst experiments stress-test our proposed algorithm in an ideal case for manual batching. Speciﬁcally, we train a model on a bi-directional LSTM sequence labeler [11, 22], on synthetic data where every sequence to be labeled is the same length (40). Because of this, manual batching is easy because we don’t have to do any padding or adjustment for sentences of different lengths. The network takes as input a size 200 embedding vector from a vocabulary of size 1000, has 2 layers of 256 hidden node LSTMs in either direction, then predicts a label from one of 300 classes. The batch size is 64.5
+Within this setting we test various batching settings: Without or with manual mini-batching where we explicitly batch the word vector lookup, LSTM update, and loss calculation for each time step. Without on-the-ﬂy batching (NOAUTO), with depth-based autobatching (BYDEPTH), or with agendabased autobatching (BYAGENDA). We measure the speed of each method by ms/sec and also break down the percentage of computation time spent in (1) forward graph creation/on-the-ﬂy batching, (2) forward computation, (3) backward graph creation, (4) backward computation, (5) parameter update.
+4Even given this prioritization method it is still possible to have ties, in which case we break ties by calculating “cheap” operations (e.g. tanh and other elementwise ops) before “heavy” ones (e.g. matrix multiplies).
+5Experiments were run on a single Tesla K80 GPU or Intel Xeon 2.30GHz E5-2686v4 CPU. To control for variance in execution time, we perform three runs and report the fastest. We do not report accuracy numbers, as the functions calculated and thus accuracies are the same regardless of batching strategy.
+6
+
+w/o Manual
+
+CPU ms/ sent for graph 0 20
+No Auto By Depth By Agenda No Auto By Depth By Agenda
+
+for calc back graph back calc update 40 60 80 100 120 140 160 180 200
+0 2 4 6 8 10 12 14 16 18 20
+
+w/ Manual
+
+w/o Manual
+
+GPU ms/ sent for graph 0 20
+No Auto By Depth By Agenda No Auto By Depth By Agenda
+
+for calc back graph back calc update 40 60 80 100 120 140 160 180 200
+0 2 4 6 8 10 12 14 16 18 20
+
+w/ Manual
+
+Figure 2: Computation time for forward/backward graph construction or computation, as well as parameter update for a BiLSTM tagger without or with manual batching, and without, with depth-based, or with agenda-based automatic batching.
+
+The results can be found in Figure 2. First, comparing the ﬁrst row with the second two, we can see that the proposed on-the-ﬂy batching strategy drastically reduces computation time per sentence, with BYAGENDA reducing per-sentence computation time from 193ms to 16.9ms on CPU and 54.6ms to 5.03ms on GPU, resulting in an approximately 11-fold increase in sentences processed per second (5.17→59.3 on CPU and 18.3→198 on GPU). BYAGENDA is faster than BYDEPTH by about 15–30%, demonstrating that our more sophisticated agenda-based strategy is indeed more effective at batching together operations.
+Next, compared to manual batching without automatic batching (the fourth row), we can see that fully automatic batching with no manual batching is competitive, but slightly slower. The speed decrease is attributed to the increased overhead for computation graph construction and batch scheduling. However, even in this extremely idealized scenario where manual batching will be most competitive, the difference is relatively small (1.27× on CPU and 1.76× on GPU) compared to the extreme difference between the case of using no batching at all. Given that automatic batching has other major advantages such as ease of implementation, it may be an attractive alternative even in situations where manual batching is relatively easy.
+Finally, if we compare the fourth and ﬁfth/sixth rows, we can see that on GPU, even with manual batching, automatic batching still provides gains in computational efﬁciency, processing sentences up to 1.1 times faster than without automatic batching. The reason for this can be attributed to the fact that our BiLSTM implementation performs manual batching across sentences, but not across time steps within the sentence. In contrast, the auto-batching procedure was able to batch the word embedding lookup and softmax operations across time-steps as well, reducing the number of GPU calls and increasing speed. This was not the case for CPU, as there is less to be gained from batching these less expensive operations.
+4.2 Experiments on Difﬁcult-to-batch Tasks
+Next, we extend our experiments to cases that are increasingly more difﬁcult to manually batch. We use realistic dimension sizes for the corresponding tasks, and batches of size b = 64. Exact dimensions and further details on training settings are in Appendix C.
+BiLSTM: This is similar to the ideal case in the previous section, but trained on actual variable length sequences.
+BiLSTM w/char: This is the same as the BiLSTM tagger above, except that we use an additional BiLSTM over characters to calculate the embeddings over rare words. These sorts of character-based embeddings have been shown to allow the model to generalize better [17], but also makes batching operations more difﬁcult, as we now have a variably-lengthed encoding step that may or may not occur for each of the words in the input.
+7
+
+Table 1: Sentences/second on various training tasks for increasingly challenging batching scenarios.
+
+Task
+BiLSTM BiLSTM w/ char TreeLSTM Transition-Parsing
+
+NOAUTO
+16.8 15.7 50.2 16.8
+
+CPU BYDEPTH
+139 93.8 348 61.0
+
+BYAGENDA
+156 132 357 61.2
+
+NOAUTO
+56.2 43.2 76.5 33.0
+
+GPU BYDEPTH
+337 183 672 89.5
+
+BYAGENDA
+367 275 661 90.1
+
+Tree-structured LSTMs: This is the Tree-LSTM model of [29]. Here, each instance is a tree rather than a sequence, and the network structure follows the tree structures. As discussed in the introduction, this architecture is notoriously hard to manually batch.
+Transition-based Dependency Parsing: The most challenging case we evaluate is that of a transition-based system, such as a transition based parser with LSTM-based featureextraction [7, 8, 12] and exploration-based training [2, 4, 9]. Here, a sequence is encoded using an LSTM (or a bi-LSTM), followed by a series of predictions. Each prediction based on a subset of the encoded vectors, and the vectors that participate in each prediction, as well as the loss, are determined by the outcomes of the previous predictions. Here, batching is harder yet as the nature of the computation interleaves sampling from the model and training, and requires calling FORWARD at each step, leaving the automatic-batcher very little room to play with. However, with only a small change to the computation, we can run b different parsers “in parallel”, and potentially share the computation across the different systems in a given time-step. Concretely, we use a modiﬁed version of the BIST parser [13].
+From the results in Table 1, we can see that in all cases automatic batching gives healthy improvements in computation time, 3.6x–9.2× on the CPU, and 2.7–8.6× on GPU. Furthermore, the agenda-based heuristic is generally more effective than the depth-based one.
+
+4.3 Comparison to TensorFlow Fold
+
+We compare the TensorFlow Fold reference im-
+
+plementation of the Stanford Sentiment Tree-
+
+bank regression task [28], using the same TreeL-
+
+STM architecture [29].Figure 3 shows how
+
+many trees are processed per second by TF (ex-
+
+cluding both evaluation of the dev set and static
+
+graph construction/optimization) on GPU and
+
+CPU relative to the performance of the BYA-
+
+GENDA algorithm in DyNet (including graph
+
+construction time). The DyNet performance is
+
+better across the board stratiﬁed by hardware
+
+type. Furthermore, DyNet has greater through-
+
+put on CPU than TensorFlow Fold on GPU until
+
+batch sizes exceed 64. Additionally, we ﬁnd
+
+that with single instance training, DyNet’s sequential evaluation processes 46.7 trees/second on CPU, whereas autobatching processes 93.6 trees/second. This demonstrates that in complex
+
+Figure 3: Comparison of runtime performance between TensorFlow Fold and DyNet with autobatching on TreeLSTMs (trees/sec).
+
+architectures like TreeLSTMs, there are opportunities to batch up operations inside a single training
+
+instance, which are exploited by our batching algorithm. In addition, it should be noted that the DyNet
+
+implementation has the advantage that it is much more straightforward, relying on simple Python data
+
+structures and ﬂow control to represent and traverse the trees, while the Fold implementation requires
+
+implementing the traversal and composition logic in a domain speciﬁc functional programming
+
+language (described in Section 3 of Looks et al. [18]).
+
+8
+
+5 Related Work
+Optimization of static algorithms is widely studied, and plays an important role in numerical libraries used in machine learning. Our work is rather different since the code/workload (as represented by the computation graph) is dynamically speciﬁed and must be executed rapidly, which precludes sophisticated statistic analysis. However, we review some of the important related work here.
+Automatic graph optimization and selection of kernels for static computation graphs is used in a variety of toolkits, including TensorFlow [1] and Theano [5]. Dynamic creation of optimally sized minibatches (similar to our strategy, except the computation graph is assumed to be static) that make good use of hardware resources has also been proposed for optimizing convolutional architectures [10]. The static nature of the computation makes this tools closer to optimizing compilers rather than efﬁcient interpreters which are required to cope with the dynamic workloads encountered when dealing with dynamically structured computations.
+Related to this is the general technique of automatic vectorization, which is a mainstay of optimizing compilers. Recent work has begun to explore vectorization in the context of interpreted code which may cannot be compiled [25]. Our autobatching variant of DyNet similarly provides vectorized primitives that can be selected dynamically.
+Further aﬁeld, the problem of scheduling with batching decisions has been widely studied in operations research since at least the 1950s (for a recent survey, see [23]). Although the OR work deals with similar problems (e.g., scheduling work on machines that can process a ‘family’ of related item with minimal marginal cost over a single item), the standard algorithms from this ﬁeld (which are often based on polynomial-time dynamic programs or approximations to NP-hard search problems) are too computationally demanding to execute in the inner loop of a learning algorithm.
+6 Conclusion
+Deep learning research relies on empirical exploration of architectures. The rapid pace of innovation we have seen in the last several years has been enabled largely by tools that have automated the error-prone aspects of engineering, such as writing code that computes gradients. However, our contention is that operation batching is increasingly becoming another aspect of model coding that is error prone and amenable to automation.
+Our solution is a framework that lets programmers express computations naturally and relies on a smart yet lightweight interpreter to ﬁgure out how to execute the operations efﬁciently. Our hope is that this will facilitate the creation of new classes of models that better cope with the complexities of real-world data.
+References
+[1] Martın Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng Chen, Craig Citro, Greg S Corrado, Andy Davis, Jeffrey Dean, Matthieu Devin, et al. Tensorﬂow: Large-scale machine learning on heterogeneous distributed systems. arXiv preprint arXiv:1603.04467, 2016.
+[2] Miguel Ballesteros, Yoav Goldberg, Chris Dyer, and Noah A. Smith. Training with exploration improves a greedy stack LSTM parser. In Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 2005–2010, November 2016.
+[3] Michael Bartholomew-Briggs, Steven Brown, Bruce Christianson, and Laurence Dixon. Automatic differentiation of algorithms. Journal of Computational and Applied Mathematics, 124:171–190, 2000.
+[4] Samy Bengio, Oriol Vinyals, Navdeep Jaitly, and Noam Shazeer. Scheduled sampling for sequence prediction with recurrent neural networks. CoRR, abs/1506.03099, 2015.
+[5] James Bergstra, Olivier Breuleux, Frédéric Bastien, Pascal Lamblin, Razvan Pascanu, Guillaume Desjardins, Joseph Turian, David Warde-Farley, and Yoshua Bengio. Theano: A CPU and GPU math compiler in Python. In Proc. 9th Python in Science Conf, pages 1–7, 2010.
+9
+
+[6] Samuel R. Bowman, Jon Gauthier, Abhinav Rastogi, Raghav Gupta, Christopher D. Manning, and Christopher Potts. A fast uniﬁed model for parsing and sentence understanding. In Annual Conference of the Association for Computational Linguistics (ACL), pages 1466–1477, 2016.
+[7] Chris Dyer, Miguel Ballesteros, Wang Ling, Austin Matthews, and Noah A. Smith. Transitionbased dependency parsing with stack long short-term memory. In Annual Conference of the Association for Computational Linguistics (ACL), pages 334–343, 2015.
+[8] Chris Dyer, Adhiguna Kuncoro, Miguel Ballesteros, and Noah A. Smith. Recurrent neural network grammars. In Conference of the North American Chapter of the Association for Computational Linguistics (NAACL), pages 199–209, 2016.
+[9] Yoav Goldberg and Joakim Nivre. Training deterministic parsers with non-deterministic oracles. Transactions of the Association for Computational Linguistics, 1:403–414, 2013.
+[10] Stefan Hadjis, Firas Abuzaid, Ce Zhang, and Christopher Ré. Caffe con troll: Shallow ideas to speed up deep learning. In Proceedings of the Fourth Workshop on Data analytics at sCale (DanaC 2015), 2015.
+[11] Zhiheng Huang, Wei Xu, and Kai Yu. Bidirectional LSTM-CRF models for sequence tagging. arXiv preprint arXiv:1508.01991, 2015.
+[12] Eliyahu Kiperwasser and Yoav Goldberg. Easy-ﬁrst dependency parsing with hierarchical tree LSTMs. Transactions of the Association for Computational Linguistics, 4:445–461, 2016.
+[13] Eliyahu Kiperwasser and Yoav Goldberg. Simple and accurate dependency parsing using bidirectional LSTM feature representations. Transactions of the Association for Computational Linguistics, 4:313–327, 2016.
+[14] Faisal Ladhak, Ankur Gandhe, Markus Dreyer, Lambert Matthias, Ariya Rastrow, and Björn Hoffmeister. Latticernn: Recurrent neural networks over lattices. In Proc. INTERSPEECH, 2016.
+[15] Chengtao Li, Daniel Tarlow, Alexander L. Gaunt, Marc Brockschmidt, and Nate Kushman. Neural program lattices. In International Conference on Learning Representations (ICLR), 2017.
+[16] Xiaodan Liang, Xiaohui Shen, Jiashi Feng, Liang Lin, and Shuicheng Yan. Semantic object parsing with graph LSTM. In Proc. ECCV, 2016.
+[17] Wang Ling, Chris Dyer, Alan W Black, Isabel Trancoso, Ramon Fermandez, Silvio Amir, Luis Marujo, and Tiago Luis. Finding function in form: Compositional character models for open vocabulary word representation. In Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 1520–1530, 2015.
+[18] Moshe Looks, Marcello Herreshoff, DeLesley Hutchins, and Peter Norvig. Deep learning with dynamic computation graphs. In International Conference on Learning Representations (ICLR), 2017.
+[19] Gilles Louppe, Kyunghyun Cho, Cyril Becot, and Kyle Cranmer. QCD-aware recursive neural networks for jet physics. arXiv:1702.00748, 2017.
+[20] Graham Neubig, Chris Dyer, Yoav Goldberg, Austin Matthews, Waleed Ammar, Antonios Anastasopoulos, Miguel Ballesteros, David Chiang, Daniel Clothiaux, Trevor Cohn, Kevin Duh, Manaal Faruqui, Cynthia Gan, Dan Garrette, Yangfeng Ji, Lingpeng Kong, Adhiguna Kuncoro, Gaurav Kumar, Chaitanya Malaviya, Paul Michel, Yusuke Oda, Matthew Richardson, Naomi Saphra, Swabha Swayamdipta, and Pengcheng Yin. DyNet: The dynamic neural network toolkit. arXiv preprint arXiv:1701.03980, 2017.
+[21] Joel Nothman, Nicky Ringland, Will Radford, Tara Murphy, and James R. Curran. Learning multilingual named entity recognition from Wikipedia. Artiﬁcial Intelligence, 194:151–175, 2012.
+10
+
+[22] Barbara Plank, Anders Søgaard, and Yoav Goldberg. Multilingual part-of-speech tagging with bidirectional long short-term memory models and auxiliary loss. In Annual Conference of the Association for Computational Linguistics (ACL), pages 412–418, 2016.
+[23] Chris N. Potts and Mikhail Y. Kovalyov. Scheduling with batching: A review. European Journal of Operational Research, 20(2):228–249, 2000.
+[24] Scott Reed and Nando de Freitas. Neural programmer-interpreters. In International Conference on Learning Representations (ICLR), 2016.
+[25] Erven Rohou, Kevin Williams, and David Yuste. Vectorization technology to improve interpreter performance. ACM Transactions on Architecture and Code Optimization, 9(4), 2013.
+[26] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton, and Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. In International Conference on Learning Representations (ICLR), 2017.
+[27] Richard Socher, Cliff C Lin, Chris Manning, and Andrew Y Ng. Parsing natural scenes and natural language with recursive neural networks. In International Conference on Machine Learning (ICML), pages 129–136, 2011.
+[28] Richard Socher, Alex Perelygin, Jean Wu, Jason Chuang, Christopher Manning, Andrew Ng, and Christopher Potts. Recursive deep models for semantic compositionality over a sentiment treebank. In Conference on Empirical Methods in Natural Language Processing (EMNLP), 2013.
+[29] Kai Sheng Tai, Richard Socher, and Christopher D. Manning. Improved semantic representations from tree-structured long short-term memory networks. In Annual Conference of the Association for Computational Linguistics (ACL), 2015.
+[30] Seiya Tokui, Kenta Oono, Shohei Hido, and Justin Clayton. Chainer: a next-generation open source framework for deep learning. In Proceedings of Workshop on Machine Learning Systems (LearningSys) in The Twenty-ninth Annual Conference on Neural Information Processing Systems (NIPS), 2015.
+[31] Dani Yogatama, Phil Blunsom, Chris Dyer, Edward Grefenstette, and Wang Ling. Learning to compose words into sentences with reinforcement learning. In International Conference on Learning Representations (ICLR), 2017.
+11
+
+A Details on Node Signatures
+Each node has a “signature,” such that nodes with identical signatures can be batched together. With few exceptions, nodes can only be batched together if they perform the same operation, so the identity of the operation the node performs will be a necessary part of the signature. In addition, there may be additional constraints on what nodes can be batched together based on the nature of the operation to be performed. We demonstrate the signatures for a few illustrative classes of operations below:
+Component-wise operations such as “tanh” or “log” will perform exactly the same work regardless of the shape of the tensors involved. For these simple operations, the signature is simply the identity of the operation (e.g. tanh or log) with no additional constraints. This is also true for component-wise operations that take multiple arguments such as sums or component-wise multiplications, as long as they do not involve broadcasting, which will be discussed in the following items.
+Dimension-sensitive operations require additional restrictions. For example, matrix multiplies can generally only be performed on inputs where the dimensions match, so if we have several Wihi operations we will only be able to batch them together if Wi and hi are the same dimension across all elements i. In these cases, we explicitly specify the necessary dimensions in the signature (e.g. mult-256×256-256 if Wi was a 256×256 matrix and bi was a length-256 vector), preventing inputs with incompatible dimensions from being processed together.
+Operations with shared elements such as a matrix–vector multiply Whi where same matrix is applied to all the vectors, are both common and the source of most potential gains from operation batching. The reason why these operations are important is because we can perform explicit optimizations such as concatenating all of the hi vectors into a matrix H and performing a single matrix–matrix multiplication WH. To take advantage of this, if W is represented as node nW, we can deﬁne a signature mult-nW-256, where operations that share their left side but may have different right sides are grouped together. Matrix multiplication can have either a shared or un-shared signature.
+Unbatchable operations are operations that either cannot be batched together trivially, or would not beneﬁt signiﬁcantly from batching.
+One thing that should be noted is that for some nodes, like the matrix multiplies Ax in the example or afﬁne transforms Ax + y, which signature to use is not clear. If some of the elements are shared parameters, it would be preferable to use a signature that shares these parameters to take advantage of efﬁcient implementations such as the one mentioned above. However, if all of the elements of the multiply or afﬁne transform are unique, then it is better to use the simpler dimension-sensitive operations.
+In our implementation, we use a simple heuristic: because multiplies and afﬁne transforms in neural networks tend to have the parameters in the positions of A and y, and the elements in the x position tend to be input-dependent, we use signatures that share the elements in the A and y positions but do not share the elements in the x position.
+B Optimizations for Fast Graph Calculation
+In order to ensure that the increased complexity of automatic batching does not introduce unacceptable overhead in our calculation, we took care to efﬁciently implement the different parts of the algorithm using sophisticated but fairly standard optimization techniques. These include:
+• Minimizing the number of memory allocations and preferring stack allocation of ﬁxed-size memory to heap allocation of variable-sized memory.
+• Implementing specialized linked-list-style data structures in contiguous memory to avoid expensive-to-construct vectors of vectors.
+• Computing node signatures as integer hash values instead of strings. • Implementing optimized GPU kernels to perform sparse-to-dense and dense-to-sparse
+memory copies for use when copying operations results to/from contiguous memory for use in batched nodes.
+12
+
+Details of all of these optimizations can be found in the open source implementation in DyNet.6
+C Experimental Settings
+The ﬁrst three experiments are based on implementations in the DyNet benchmark repository,7. BiLSTM (bilstm-tagger-bulk): As our tagging data, we use data from the named entity recog-
+nition task Models were trained and tested on the WikiNER English Corpus [21], and all words with frequency less than ﬁve were treated as unknowns. The network was single-layer with word embeddings and LSTMs in either direction containing 256 nodes each. BiLSTM w/char (bilstm-tagger-withchar-bulk): The settings for the BiLSTM tagger with character embeddings are the same as above, but with the addition of character-based LSTMs for unknown words. The character embeddings are of size 64, and the character LSTMs are 128 in both directions. Tree-structured LSTMs (treenn-bulk): Tree LSTMs are trained on the Stanford Sentiment Treebank regression task [28]. These similarly use word embedding and node sizes of 256. The models are trained to predict the labels at the each node in the tree. For our ﬁnal experiment, we modiﬁed a version of the publicly available transition-based version (barchybrid) of the BISTPARSER8[13]. Our modiﬁed code is available in the DyNet benchmark repository. Transition-based Dependency Parsing: The parser was modiﬁed to perform aggregate batching by running several parsers in-parallel and aggregating decisions in a given time-step across the different parsers. In contrast to the other benchmarks in this paper which are implemented in C++, this is a python-based implementation. We measure the training time of one iteration over the training set of the publicly available English Universal Dependencies Treebank,9 containing 12K sentences. We use the default settings of the parser (100 dim word embeddings, 25 dim POS embeddings, 25 dim relation embeddings, 200 dim LSTM layers, and a 100 dim hidden layer in the prediction MLP), as well as the ﬂags –-userlmost –-userl –-bibi-lstm.
+6http://github.com/clab/dynet 7https://github.com/neulab/dynet-benchmark 8http://www.github.com/elikip/bist-parser/ 9https://github.com/UniversalDependencies/UD_English
+13
+
+

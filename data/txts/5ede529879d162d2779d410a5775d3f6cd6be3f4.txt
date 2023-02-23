@@ -1,0 +1,770 @@
+Published as a conference paper at ICLR 2021
+
+arXiv:2103.10282v2 [cs.LG] 31 Mar 2021
+
+MODELING THE SECOND PLAYER IN DISTRIBUTIONALLY ROBUST OPTIMIZATION
+
+Paul Michel School of Computer Science Carnegie Mellon University pmichel1@cs.cmu.edu
+
+Tatsunori Hashimoto Computer Science Department Stanford University thashim@stanford.edu
+
+Graham Neubig School of Computer Science Carnegie Mellon University gneubig@cs.cmu.edu
+
+ABSTRACT
+Distributionally robust optimization (DRO) provides a framework for training machine learning models that are able to perform well on a collection of related data distributions (the “uncertainty set”). This is done by solving a min-max game: the model is trained to minimize its maximum expected loss among all distributions in the uncertainty set. While careful design of the uncertainty set is critical to the success of the DRO procedure, previous work has been limited to relatively simple alternatives that keep the min-max optimization problem exactly tractable, such as f -divergence balls. In this paper, we argue instead for the use of neural generative models to characterize the worst-case distribution, allowing for more ﬂexible and problem-speciﬁc selection of the uncertainty set. However, while simple conceptually, this approach poses a number of implementation and optimization challenges. To circumvent these issues, we propose a relaxation of the KL-constrained inner maximization objective that makes the DRO problem more amenable to gradient-based optimization of large scale generative models, and develop model selection heuristics to guide hyper-parameter search. On both toy settings and realistic NLP tasks, we ﬁnd that the proposed approach yields models that are more robust than comparable baselines1.
+
+1 INTRODUCTION
+
+Machine learning models trained with empirical risk minimization (ERM) are able to achieve high aggregate performance on data sampled from their training distribution. However, they often exhibit drops in accuracy when confronted with data from domains that are under-represented in their training data, such as those of different topic (Gururangan et al., 2020), sociolect (Blodgett et al., 2016), accent (Amodei et al., 2016) or writer age (Hovy & Søgaard, 2015) in language processing tasks, or skin color (Grother et al., 2019) or lighting (Georghiades et al., 2001) in image processing tasks. This is a particularly egregious issue in applications where higher error rates can have far reaching negative implications, such as the silencing of underrepresented minorities in toxicity detection systems (Dixon et al., 2018) or disparity amplifying feedback loops in credit rating models (Fuster et al., 2018).
+This behaviour often arises from the objective function of ERM, where the parameters θ of the model are learned by minimizing the expectation of a loss function under a data distribution p (or, speciﬁcally in practice, an associated empirical data distribution pˆ)
+
+LERM(θ) = E(x,y)∼pˆ (x, y, θ).
+
+(1)
+
+When the model encounters data sampled from a different distribution qtest = p, performance can suffer signiﬁcantly. Distributionally robust optimization (DRO) (Ben-Tal et al., 2013b) provides a natural solution to this issue by replacing the expected risk under a single distribution p with the worst expected risk over a pre-determined family of distributions Q (the “uncertainty set”)
+
+LDRO(θ) = max E(x,y)∼q (x, y, θ).
+
+(2)
+
+q∈Q
+
+1Code to reproduce our experiments can be found at https://github.com/pmichel31415/P-DRO
+
+1
+
+Published as a conference paper at ICLR 2021
+
+If Q contains qtest, the DRO objective upper bounds the expected risk under qtest. However, a priori knowledge of possible test distributions is not always available or easy to acquire. For example, training a model to be robust to some demographic attributes (Q = {qdemographic 1, qdemographic 2, . . .}) requires collecting and annotating data with the necessary information, an expensive and ethically fraught endeavour. In the absence of such information, one has to resort to deﬁning the uncertainty set analytically, drawing on one’s intuition of what constitutes a possible test distribution given the observed training distribution, such as using moment constraints (Delage & Ye, 2010; Nguyen et al., 2020), f -divergence (Ben-Tal et al., 2013a; Hu & Hong, 2013; Faury et al., 2020), Wasserstein/IPM (Sinha et al., 2018; Husain, 2020) balls, or coarse-grained mixture models (Oren et al., 2019; Hu et al., 2018). However, the need for keeping the inner supremum in Eq. (2) tractable limits the possible choices.
+In this paper, we propose that the uncertainty set be instead deﬁned as a family of parametric generative models. The resulting DRO objective (§2) is a differentiable game with two players: the original model (x, y; θ) and a model of its worst-case distribution qψ(x, y), the titular “second player” which we hereafter refer to as the adversary. Using this formulation — which we call Parametric DRO (P-DRO) — allows for more ﬂexibility in the choice of the adversary’s architecture (and so the uncertainty set). Unfortunately, ﬁnding a solution of this game via direct application of simultaneous gradient descent (Singh et al., 2000) is difﬁcult (Balduzzi et al., 2018). In particular, direct gradient descent on the uncertainty set suffers from instability due to the large variance of the gradients (Greensmith et al., 2004), and hyper-parameter selection is not straightforward.
+To address these challenges, we make two main contributions (§3): ﬁrst, we propose a new relaxation of the DRO game’s inner maximization problem (with KL constraints). The resulting objective is more amenable to simultaneous gradient update than the original zero-sum game and signiﬁcantly improves training stability, while still yielding useful adversaries. Second, we develop a principled approach for selecting hyper-parameters: we leverage the learned adversaries to decide which of any two given models trained with P-DRO is more robust than the other.
+We do an in-depth set of experiments analyzing the effect of our proposed changes on both a toy task as well as a more realistic, yet still synthetic sentiment classiﬁcation task (§4). Finally, we show that in the more realistic setting of toxicity detection, P-DRO yields models that are more robust to changes in demographic groups, even though these groups are unknown at training time, opening up applications in combatting dataset bias (§5).
+
+2 PARAMETERIZING THE UNCERTAINTY SET
+
+Consider a model parameterized by θ ∈ R . dmodel Minimizing the DRO objective described in Eq. (2) over the uncertainty set Q turns the optimization problem into the min-max (or zero-sum) game
+
+min max E(x,y)∼q (x, y, θ).
+
+(3)
+
+θ∈Rd q∈Q
+
+The ﬁrst player controls the parameters θ, whilst the second player controls the worst-case distribution q. In the absence of explicit information on groups of interest (such as demographics, domain, etc.), an adequate choice of the uncertainty set Q is critical to the success of DRO. This is in fact very much an active area of research (Sinha et al. (2018); Duchi & Namkoong (2018); Oren et al. (2019), see Rahimian & Mehrotra (2019) for a survey). Q must be sufﬁciently large to contain test distributions of interest, but if it is too large it may contain “adversarial” distributions on which no model can perform well. Moreover, the design of Q is also circumscribed by the necessity of keeping the min-max problem tractable, particularly in the context of stochastic optimization. In Hu & Hong (2013) and Duchi et al. (2016) for example, the choice of f -divergence balls allows the use of duality arguments to reformulate (3) as a more manageable min-min problem. Others, like Hu et al. (2018) or Oren et al. (2019), propose using mixture models, the simplicity of which enables them to solve the inner maximization problem efﬁciently.
+
+Instead, we propose to explicitly model the second player in the DRO game as a parametric model qψ of the data. Of course, not all parameterizations ψ ∈ Rdadv of a given generative model represent useful distributions, and we require that the adversary stay “close” to the underlying true data distri-
+bution p. As a measure of distance between qψ and p, we choose the KL (Kullback & Leibler, 1951) divergence due to its wide acceptance in the machine learning community, as well as its appealing
+
+2
+
+Published as a conference paper at ICLR 2021
+
+Model Adversary
+
+Figure 1: Summary of P-DRO: At every step of training, (x, y) pairs are sampled from the data distribution p and fed to both the model θ and the adversary ψ. For every sample, the model produces loss values (x, y; θ) and the adversary produces densities qψ(x, y). Both are combined into Lmodel and Ladv, which are used to update the θ and ψ respectively, via simultaneous gradient updates.
+
+properties in the context of DRO.2 The KL upper bound, κ, is left as a parameter to be decided by the experimenter. We refer to the resulting DRO formulation as Parametric DRO
+
+min max E(x,y)∼qψ (x, y, θ) .
+
+(4)
+
+θ
+
+ψ
+
+KL(qψ p)≤κ
+
+LP-DRO (θ,ψ)
+
+3 OPTIMIZING P-DRO
+The min-max problem in Eq. (4) belongs to a class of games called “differentiable games” (another famous representative being generative adversarial networks (Goodfellow et al., 2014)). We can search for a solution of this game with simultaneous gradient descent (Singh et al., 2000), i.e. by simultaneously updating θ and ψ with −∇θ LP-DRO and ∇ψ LP-DRO respectively. Unfortunately, in general, there is no theoretical guarantee that simultaneous gradient descent will converge to a Nash equilibrium3 (Balduzzi et al., 2018), nor that any such equilibrium even exists if the objective is nonconvex in θ (or non-concave in ψ). The success of GANs and the follow-up literature (Wang et al., 2019) serves as an encouraging example that gradient based methods can yield useful solutions despite the pessimistic theoretical results. In this section, we discuss difﬁculties that arise when optimizing θ and ψ jointly, and propose modiﬁcations of the objective to address them.
+
+3.1 TRAINING THE MODEL θ
+
+We could train the model θ by taking negative gradient steps on E(x,y)∼qψ (x, y; θ). This gra-
+
+dient can be estimated by sampling examples from qψ and averaging the gradient of their losses.
+
+Unfortunately, this objective requires that qψ is well-behaved at all iterations, as it is the only
+
+source of supervision for θ. If qψ is initialized incorrectly or begins producing unrealistic (x, y),
+
+the quality of θ degrades as it begins to learn a predictor on invalid training examples from qψ.
+
+As an alternative, we opt to compute the gradients for θ with importance sampling, i.e. rewriting
+
+L P-DRO
+
+as
+
+E(x,y)∼p
+
+qψ (x,y) p(x,y)
+
+(x, y; θ), which ensures that all (x, y) samples will be derived from the
+
+training set itself. Unfortunately, the true density p is unknown to us. As an approximation, we
+
+replace qpψ((xx,y,y)) with the likelihood ratio between qψ and the maximum likelihood estimate of p,
+
+qψ0 := arg maxqψ E(x,y)∼p log qψ(x, y). This changes the min-max problem to
+
+min max E(x,y)∼p qψ(x, y) (x, y, θ) . (5)
+
+θ
+
+ψ
+
+qψ0 (x, y)
+
+KL(qψ p)≤κ
+
+Lmodel
+
+2For instance: KL(q p) < +∞ implies that q stays within the support of p 3Nash equilibria (Osborne & Rubinstein, 1994) can be thought of the game theoretic analog of global minima
+in optimization.
+
+3
+
+Published as a conference paper at ICLR 2021
+
+This becomes a simple expected loss objective, which we can estimate by sampling from the empirical distribution pˆ. In experiments, we ﬁnd that with this formulation we are able to train robust θ even when qψ is only a mediocre generative model (see Appendix C.2). To further stabilize training at the beginning of the optimization process, we initialize ψ with ψ0, making the objective exactly the same as ERM for the ﬁrst gradient step.
+
+3.2 TRAINING THE ADVERSARY ψ
+According to Eq. (5) the adversary ψ must maximize E(x,y)∼qψ qψp0(x(x,y,y) ) (x, y, θ) within a KL ball of ﬁxed radius. This is challenging for several reasons: ﬁrst, enforcing the bound is intractable for complex families of adversaries where e.g. projecting onto the KL ball is another difﬁcult optimization problem of its own. Second, maximizing the expectation with respect to the parameters of the distribution qψ is prone to instability due to large gradient variance (Greensmith et al., 2004).
+
+Lagrangian Relaxation To address the ﬁrst difﬁculty, we loosen the strict KL constraint and instead consider the Lagrangian relaxation L
+
+p(x, y)
+
+L(ψ, τ ) = E(x,y)∼qψ qψ (x, y) (x, y, θ) − τ (KL(qψ p) − κ) .
+
+(6)
+
+0
+
+We ﬁx the Lagrangian multiplier τ > 0 as treat it as a “temperature” hyper-parameter. With some reorganization (which we develop in Appendix A.1), we can show that
+
+L(ψ, τ ) = −τ KL(qψ qτ∗,θ) + C.
+
+(7)
+
+p(x,y) (x,y;θ)
+Where qτ∗,θ ∝ p(x, y)e qψ0 (x,y) τ and C is a constant in ψ. In other words, maximizing L in ψ is equivalent to minimizing the KL divergence between qψ and qτ∗,θ. One difﬁculty with this objective is that qτ∗,θ depends upon the unknown probability density p(x, y). We avoid this problem by treating
+the density ratio p(x,y) as a constant, which is closely related to assumptions that have been used
+qψ0 (x,y)
+successfully in past formulations of DRO (Oren et al., 2019). Empirically, we ﬁnd that incorporating
+qψ0 as a surrogate for p is a serviceable approximation, as demonstrated in Section 4.
+
+Reversing the KL Minimizing the KL divergence in this direction is difﬁcult for several reasons.
+First, it entails optimizing an expectation in qψ over ψ, which is difﬁcult due to the large variance of the gradients (Greensmith et al., 2004). Second, computing this KL necessitates access to the true theoretical density p(x, y) in order to compute qτ∗,θ(x, y) in the argument of the expectation, but this quantity is unknown in practice.4 To sidestep these issues, we elect to minimize the reverse direction KL(qτ∗,θ qψ) instead. Due to the KL divergence being non-symmetric, this is a rather crude approximation5, the implications of which are discussed in Norouzi et al. (2016). However,
+we ﬁnd that this approach dramatically stabilizes the gradient dynamics while still yielding good
+adversaries, as observed empirically in Section 4.4. Discarding the entropy term (constant in ψ), the
+resulting problem is equivalent to minimizing
+
+1
+
+(x,y;θ)
+
+Ladv(ψ, τ ) := − Ep e τ log qψ(x, y)
+
+(8)
+
+Zτ,θ
+
+in ψ, where Zτ,θ
+
+=
+
+Ep e
+
+(x,y;θ) τ
+
+is the normalizer of q∗.
+
+In this case, we can estimate this expectation
+
+by substituting the empirical distribution pˆ for p in the expectation.
+
+Computing the Normalizer Approximating the inverse normalizer Zτ1,θ in a minibatch yields a biased estimator. On the other hand, computing Zτ,θ over the entire training data at each step is prohibitive since it requires computing the loss of every single example. As a middle ground, we keep a running normalizer Z˜k computed from the average of the normalizers over a ﬁxed number
+4Note that substituting the empirical distribution pˆ for p poses issues here, because qψ is not absolutely continuous with respect to pˆ. 5For instance, the optimum of the reverse KL doesn’t necessarily match that of the forward KL within the parametric confusion set Q
+
+4
+
+Published as a conference paper at ICLR 2021
+
+k of consecutive minibatches. In other words, if Bi and θi denote the minibatch and adversary parameters at step i respectively, the normalizer at step t will be
+
+Z˜ =
+
+1
+
+t
+
+e . (x,y;θi) τ
+
+(9)
+
+k
+
+t |Bi|
+
+i=t−k
+
+i=t−k x,y∈Bi
+
+If k is too low, there is a risk of under-estimating the normalizer, especially if the distribution of weights contains infrequent high weight samples. On the other hand, if k is too high there is a risk of using “stale” weights in the normalizer. In experiments, we treat k as a hyper-parameter.
+
+3.3 OPTIMAL STOPPING
+
+When should one stop training a model with P-DRO? In ERM it is customary to stop training after the empirical risk — periodically evaluated on a held out validation dataset — stops decreasing. This is particularly important to prevent over-ﬁtting to the training data. However, it is not an appropriate criterion for P-DRO, since the model is not trained to minimize empirical risk in the ﬁrst place. A more pertinent choice is to compare the robust validation losses
+
+1 Lrobust,valid(θ) = max
+
+qψ(x, y) (x, y; θ) .
+
+qψ∈Q |Dvalid| x,y∈Dvalid qψ0 (x, y)
+
+:=Lvalid (θ,ψ)
+
+(10)
+
+However, ﬁnding the inner supremum for each of the T evaluation checkpoints θ1 . . . θT is expensive as it requires solving T independent optimization problems. Instead, we leverage the existence of adversaries ψt associated with each model θt, as well as the initial adversary ψ0 and take the maximum over the T + 1 adversaries {ψ0, . . . , ψT }. Since our relaxation of the P-DRO objective loosens the KL constraint, we need weed out adversaries which might violate it. Speciﬁcally, we estimate the KL(qψ p) = Ep qψ/p log qψ/p on the validation set, using qψ/qψ0 as a stand-in for qψ/p, and reject all adversaries for which the result is greater than a threshold, which we set to log 10 based on preliminary experiments detailed in Appendix C.1.6 We refer to this stopping criterion as Minmax.
+Computing the full min-max necessitates keeping track of T models and T + 1 adversaries, which is ponderous when the model is large. As a solution, we propose an approximation, Greedy-Minmax, in which we only keep one best model θ∗. At each evaluation step T , we compare θT to θ∗, and update θ∗ to whichever achieves lower robust validation loss over the T + 1 adversaries ψ0, . . . , ψT .
+By keeping track of only one additional model, and using the weights qψt (xi,yi) of individual exam-
+qψ0 (xi,yi)
+ples in Dvalid as sufﬁcient statistics for computing the loss against each adversary, Greedy-Minmax can be achieved with space complexity 2dmodel + T |Dvalid|, which is much more efﬁcient than the T (dmodel + dadv) of Minmax.
+
+3.4 HYPER-PARAMETER SELECTION
+
+Our proposed P-DRO method relies on 3 different hyper-parameters (in addition to the model’s hyper-parameters): the adversary learning rate λ, the temperature τ and the size of the renormalizing window k. As a consequence, we need a reliable criterion for deciding which of two
+conﬁgurations is better. This model comparison bears many similarities with the stopping problem described above. Therefore, we resort to a similar solution: given two models θ1, θ2 trained with P-DRO, and their respective adversaries {ψ01, . . . , ψT1 }, {ψ02, . . . , ψT2 } (for instance, the adversaries associated with θ1 and θ2 at periodic checkpoints during training), we select the best model following
+
+θ∗ = arg min
+
+max
+
+Lvalid(θ, ψ).
+
+θ∈{θ1,θ2} ψ∈{ψ01,...,ψT1 ,ψ02,...,ψT2 }
+
+(11)
+
+6To simplify notation, this additional constraint is implicit in the rest of this section.
+
+5
+
+Published as a conference paper at ICLR 2021
+
+4 EXPERIMENTAL ANALYSIS OF P-DRO
+Before moving on to a real world scenario in Section 5, we ﬁrst demonstrate that P-DRO is able to learn robust models in a synthetic Natural Language Processing (NLP) task, and perform ablation studies to examine the importance of the various modiﬁcations described in Section 3.
+
+4.1 EXPERIMENTAL SETTING
+For analysis purposes, we design a simple NLP task amenable to DRO. We speciﬁcally choose NLP as a domain due to the striking success of language models as generative models of textual data (Sundermeyer et al., 2012; Radford et al., 2018), which can be used to model the uncertainty set. We base our task off of the binary version of the Stanford Sentiment Treebank dataset (SST-2; Socher et al. (2013)), which we modify to introduce spurious correlation. Speciﬁcally, we introduce a distractor token to some sentences. The distractor we use consists of prepending “so , ” to the sentence (“i hated this movie” −→ “so , I hated this movie”), which doesn’t change the underlying sentiment. The resulting samples can be categorized in 4 “groups” depending on their label (positive or negative) and the presence or absence of the distractor. In particular, we add this distractor to 95% of the negative reviews and 5% of the positive reviews in the training and validation set, so that the presence of the distractor strongly correlates with negative sentiment (a similar construction is proposed in (Utama et al., 2020)). In the test data, we modify 50% of all sentences for each class equitably to ensure that there is enough data in each group, but we report “average” test accuracy by re-weighting the group accuracies to mimick the training distribution. We call this modiﬁed task BiasedSST.
+For the classiﬁer, we train a simple one layer BiLSTM model with embedding/hidden dimension 300. For the adversary, we adopt an auto-regressive transformer model based on the successful GPT-2 language model architecture but with 6 layers, a dimension of 512 and 8 attention heads (we experiment with a smaller, LSTM based adversary in Appendix C.2). In order to model the input output pair (x, y), we pre-pend a special label-speciﬁc token to sentences before running them through the language model. We train the model with Adam (Kingma & Ba, 2014) and the adversary with vanilla stochastic gradient descent (which we found more stable in experiments). We refer to Appendix B for speciﬁc details of the experimental setting.
+
+4.2 P-DRO CAN LEARN ROBUST MODELS
+
+We train 7 models with P-DRO on BiasedSST using different hyper-parameters for the adversary. We start from conﬁguration λ = 10−4, τ = 0.01, k = 5, and for each hyper-parameter we run a conﬁguration with a smaller and a higher value, keeping all other hyper-parameters the same. We train for 50 epochs and select the best model using the strategies described in Section 3.
+
+Table 1: Average and robust accuracies on BiasedSST. Underlining indicates statistically signiﬁcant difference compared to ERM (p < 0.05)
+
+Robust
+
+Average
+
+We also compare three other approaches. First, to appreci- ERM
+
+2.15 ± 0.97 95.09 ± 0.16
+
+ate how well the model could perform if the groups were known at training time, we train with Group-DRO on the oracle groups using an exponentiated-gradients based online algorithm (Oracle DRO; Sagawa et al. (2020)). Sec-
+
+Topic CVaR NonParam P-DRO
+Oracle DRO
+
+5.18 ± 1.46 28.11 ± 2.16 34.98 ± 9.39
+67.71 ± 3.03
+
+95.00 ± 0.10 92.45 ± 1.55 84.21 ± 2.11
+77.91 ± 4.49
+
+ond, we implement Topic CVaR (Oren et al., 2019), a
+
+method for DRO on NLP where the uncertainty set is determined by mixtures of a topic model.
+
+Finally, we compare to non-parametric DRO with a Kullback-Leibler (KL) constrained uncertainty
+
+set (Hu & Hong, 2013; Hu et al., 2018), which we adapt to ﬁt our online mini-batch training setting
+
+(NonParam). We refer to Appendix B.3 for details and hyper-parameters of the baselines.
+
+We report the worst-case (“robust”) accuracy over all groups on the test set, as well the average accuracy in Table 1 (we report the mean and standard deviation over 5 runs). We ﬁnd that both TopicCVaR, NonParam and P-DRO are more robust than ERM, but the latter outperforms the former two close to 30 and 7 points respectively, achieving 52% of Oracle DRO’s robust accuracy, while not leveraging any information on the oracle groups.
+
+6
+
+Published as a conference paper at ICLR 2021
+
+Table 2: Effect of different optimal stopping and hyper-parameter selection strategies on robust validation accuracy.
+
+(a) Optimal stopping
+
+(b) Hyper-parameter selection
+
+Criterion
+Average Minmax +KL constraint +Greedy-Minmax
+Oracle
+
+Robust accuracy
+0.00 ± 0.00 25.22 ± 13.01 31.30 ± 10.07 32.17 ± ± 11.20
+50.95 ± 5.01
+
+Criterion
+Average Minmax +KL constraint
+Oracle
+
+Robust accuracy
+31.03 ± 12.16 28.62 ± 12.37 35.65 ± 11.47
+38.26 ± 13.01
+
+4.3 OPTIMAL STOPPING AND HYPER-PARAMETER SELECTION ABLATION
+To understand the importance of the optimal stopping and hyper-parameter selection strategy described in Section 3.3, we perform an ablation on the BiasedSST dataset comparing 4 strategies:
+• Average: models are selected based on their average zero-one loss (i.e. error rate) on the unmodiﬁed validation set. This is the baseline stopping criterion.
+• Minmax: selection based on the adversaries (as described in Section 3.3), with and without the KL constraint, as well as its variant Greedy-Minmax for stopping.
+• Oracle: in this setting the groups are known (in the validation set), and models are selected based on their error rate on the worst performing group. This is the optimal criterion for the group-DRO setting we are considering.
+To compare stopping criterions experiments, we only consider one set of hyper-parameters: λ = 10−4, k = 5 and τ = 0.01. From the robust validation accuracies reported in Table 2a, we ﬁrst observe that Average stopping results in a robust accuracy of 0, highlighting the necessity for a suitable stopping criterion. We ﬁnd that Minmax, especially with a KL constraint, is a much better strategy, recovering ≈ 60% of the performance achievable with Oracle stopping. Notably, the Greedy-Minmax variant which we use in practice reaches very close results (< 1 point difference) despite its requiring to keep track of only 2 out of the 50 model checkpoints at any time.
+To understand the effectiveness of the Minmax strategy for selecting hyper-parameters. We take the models trained in Section 4.1, but select the best hyper-parameters using the different strategies described above. Results, shown in Table 2b, conﬁrm that Minmax (with the KL constraint) is a better choice than Average for selecting hyper-parameters, even though the improvement is not as striking as for stopping.
+
+4.4 IMPORTANCE OF LADV
+Finally, we investigate the importance of modifying the adversary’s objective as described in Section 3.2. For this experiment, we devise a simpler toy task on which directly training the constrained DRO objective is possible. Speciﬁcally, we consider the two-dimensional binary classiﬁcation problem pictured in Figure 2. The training data consists of 10,000 points partitioned in two normally distributed “domains” with a 1:50 sampling ratio and different classiﬁcation boundaries. We train a logistic regression model, which cannot perfectly ﬁt the training data and must trade-off between accuracy on each domain. For the sake of simplic- Figure 2: A toy classiﬁity, we only model the input variables x7 as isotropic normal distributions cation task. with ﬁxed variance: the adversaries’ parameter ψ ∈ R2 represents the location of the Gaussian (we ﬁx the variance to the empirical variance of the data).
+7In other words, we set qψ(x, y) = p(y | x)qψ(x), where p(y | x), is the true conditional which will be canceled out in the ratio qψ(x,y) .
+qψ0 (x,y)
+7
+
+Published as a conference paper at ICLR 2021
+
+We compare 3 different versions of P-DRO: ﬁrst, naive si- Table 3: Ablation of P-DRO to train the
+
+multaneous gradient descent on the zero-sum game, with- linear model on the toy task. We report
+
+out any constraint on the adversary (bare P-DRO), then accuracy on both domains, as well as
+
+the same, but with an approximation of the explicit KL robust accuracy.
+
+constraint between qψ and qψ0 (+KL constraint; see Appendix A.2 for more details). Finally we report results us-
+
+Average
+
+Robust
+
+ing our relaxation and the KL reversal described in Section ERM
+
+84.66 ± 0.10 49.75 ± 0.05
+
+3.2 (+Ladv). For each setting, we report the average and bare P-DRO 49.97 ± 0.10 49.85 ± 0.10
+
+robust accuracy with mean and standard deviation over 10 runs. For the KL constraint and the relaxation, we report
+
++kl constraint +Ladv
+
+76.63 ± 9.93 76.97 ± 0.43
+
+58.41 ± 9.25 64.32 ± 1.31
+
+the best results among 4 values of the KL bound κ and the temperature τ respectively.
+
+In Table 3, we observe that bare P-DRO is too unstable and systematically diverges. The addition of a KL constraint mitigates this behaviour, but the zero-sum objective is still unstable, as evidenced by the high standard deviations. Finally, we ﬁnd that the addition of Lrev stabilizes the training process greatly, leading to consistently high robust accuracy.
+
+5 P-DRO IN PRACTICE: CASE STUDY OF TOXICITY DETECTION
+In this section, we demonstrate the effectiveness of P-DRO in the more realistic setting of toxicity detection, the task of recognizing various forms of toxic language (eg. hate speech or offensive language). Identifying online abuse on the internet is a crucial challenge, and has garnered much interest in the NLP community (Schmidt & Wiegand, 2017; Fortuna & Nunes, 2018). However, recent work (Sap et al., 2019) has shown that there is strong correlation between toxic labels and the presence of certain markers of dialects of English spoken by minority groups. This correlation is in turn ampliﬁed by hate speech classiﬁers trained on such data, leading to biased prediction.
+Our results on BiasedSST suggest that P-DRO can provide one solution to preventing models from absorbing spurious correlations present in their training data, even in the absence of protected attributes (such as language variety here).
+5.1 EXPERIMENTAL SETTING
+Following Sap et al. (2019) and Xia et al. (2020), we perform experiments on two datasets: DWMW17 (Davidson et al., 2017), a corpus of 25K tweets classiﬁed in three categories: hate speech (6%), offensive (76%) and neither (18%), and FDCL18 (Founta et al., 2018), a 100k sized dataset, also collected from Twitter and annotated with an additional spam label, with the following breakdown by categories: hateful (5%), abusive (27%), normal (54%) and spam (14%).
+The released version of these datasets does not contain information on the dialect of each user. In order to be able to evaluate our models, and to train an Oracle DRO baseline, we follow Sap et al. (2019) and use annotations provided by the dialect classiﬁer described in Blodgett et al. (2016) to label each example as one of four English varieties: White-aligned, African American, Hispanic, and Other. Note that, as these are automatically obtained labels, the groups may not exactly correspond to the actual racial sociolects, however Sap et al. (2019) does report that they correlate highly with self-reported race, and they serve as a useful proxy in the absence of manual annotation.
+We formulate the group-DRO problem by separating each dataset into independent groups identiﬁed by both language variety and label, for a total of 12 and 16 groups for DWMW17 and FDCL18 respectively. Some of these groups are severely under-represented in the test set. In order to make our robust accuracy results reliable yet still representative of the under-represented groups, we combine groups that contain less than 100 samples into a single group to compute robust test accuracies.
+On DWMW17, we train the same BiLSTM model as described in Section 4.3. To illustrate the applicability of P-DRO to other model architectures, we pick BERT (Devlin et al., 2018), a large scale pre-trained model as a classiﬁer on FDCL18. In both cases, we adopt the Transformer architecture described in Section 4.3 as the adversary. We train the adversary with a temperature of τ = 0.01 and a normalizing window k = 10. To demonstrate the efﬁcacy of automatic hyper-parameter selection in the P-DRO setting, we delegate the choice of the adversary’s learning rate λ to grid-search, training 3 models with λ ∈ {10−5, 10−4, 10−3} and selecting the best using the Minmax criterion
+
+8
+
+Published as a conference paper at ICLR 2021
+
+Table 4: Robust test accuracy on the DWMW17 and FDCL18 toxicity detection tasks.
+
+(a) No group information.
+
+DWMW17
+
+Robust
+
+Average
+
+FDCL18
+
+Robust
+
+Average
+
+ERM Topic CVaR NonParam P-DRO
+
+53.19 ± 1.70 45.26 ± 3.47 54.13 ± 1.14 69.06 ± 1.70
+
+69.44 ± 0.53 61.68 ± 5.02 70.54 ± 0.64 69.69 ± 2.50
+
+19.57 ± 7.00 16.48 ± 5.46 17.54 ± 6.41 30.25 ± 10.13
+
+81.56 ± 0.26 80.49 ± 0.49 81.20 ± 0.11 79.91 ± 1.41
+
+Oracle DRO 74.50 ± 1.74 65.79 ± 0.76 55.23 ± 3.97 (b) With group information on the validation set.
+
+72.43 ± 2.61
+
+Robust
+
+Average
+
+Robust
+
+Average
+
+ERM Topic CVaR NonParam P-DRO
+
+53.15 ± 0.87 52.02 ± 1.26 49.41 ± 5.60 63.05 ± 4.25
+
+69.64 ± 1.01 69.11 ± 0.49 58.53 ± 5.71 63.07 ± 3.92
+
+34.07 ± 3.20 34.82 ± 3.73 43.13 ± 6.97 47.61 ± 4.53
+
+78.78 ± 0.38 79.59 ± 0.85 69.51 ± 3.07 74.82 ± 1.90
+
+Oracle DRO 74.50 ± 1.74 65.79 ± 0.76 55.23 ± 3.97 72.43 ± 2.61
+
+described in Section 3.4. We also report numbers for Oracle DRO and Topic CVaR. Results are averaged over 5 runs, each with a different random seed.
+5.2 CAN P-DRO PRODUCE MORE ROBUST MODELS?
+Table 4a reports the robust test accuracies of all models on both tasks. Importantly, except for Oracle DRO, none of the methods compared here necessitate any knowledge of the groups, neither in the training nor validation data. We observe that in both settings P-DRO is able to achieve higher robust accuracy than ERM, Topic-CVaR and NonParam.
+This suggests P-DRO as a useful option in case no group information whatsoever is available. However, in practice, it may be feasible to annotate at least a small amount of data with group information. To emulate this scenario, we perform the same experiment, but assume that group annotations are available on the validation data, which we use to determine optimal stopping and hyper-parameters. Results for this setting are reported in Table 4b. We ﬁnd that, while the use of robust validation accuracy yields more robust models even for ERM (especially on FDCL18), P-DRO is still the best alternative that doesn’t require group annotation on the training data.
+6 IMPLICATIONS AND OUTLOOK
+We have shown that there is promise in using parametric families of neural generative models for deﬁning the uncertainty set in distributionally robust optimization. While we only perform experiments on NLP tasks, this approach can, in theory, be applied in any modality and in future work we hope to pursue this direction. In such cases where good quality generative models are unavailable, or such model cannot produce densities efﬁciently, an interesting direction would be to model the likelihood ratio qψ/p directly. This alternative formulation poses different implementation challenges, and we leave it as a promising avenue for future research.
+
+ACKNOWLEDGEMENTS
+The authors would like to thank the anonymous reviewers for their insightful feedback which helped improve the paper to its current version. In addition, this paper greatly beneﬁted from discussion and feedback from various colleagues at CMU, in particular Chunting Zhou, Haohan Wang, Zachary Lipton and Zico Kolter. This work was supported by a Facebook Sponsored Research Award and by the DARPA GAILA project (award HR00111990063). The views and conclusions contained in this document are those of the authors and should not be interpreted as representing the ofﬁcial policies, either expressed or implied, of the sponsors.
+
+9
+
+Published as a conference paper at ICLR 2021
+REFERENCES
+Dario Amodei, Sundaram Ananthanarayanan, Rishita Anubhai, Jingliang Bai, Eric Battenberg, Carl Case, Jared Casper, Bryan Catanzaro, Qiang Cheng, Guoliang Chen, Jie Chen, Jingdong Chen, Zhijie Chen, Mike Chrzanowski, Adam Coates, Greg Diamos, Ke Ding, Niandong Du, Erich Elsen, Jesse Engel, Weiwei Fang, Linxi Fan, Christopher Fougner, Liang Gao, Caixia Gong, Awni Hannun, Tony Han, Lappi Johannes, Bing Jiang, Cai Ju, Billy Jun, Patrick LeGresley, Libby Lin, Junjie Liu, Yang Liu, Weigao Li, Xiangang Li, Dongpeng Ma, Sharan Narang, Andrew Ng, Sherjil Ozair, Yiping Peng, Ryan Prenger, Sheng Qian, Zongfeng Quan, Jonathan Raiman, Vinay Rao, Sanjeev Satheesh, David Seetapun, Shubho Sengupta, Kavya Srinet, Anuroop Sriram, Haiyuan Tang, Liliang Tang, Chong Wang, Jidong Wang, Kaifu Wang, Yi Wang, Zhijian Wang, Zhiqian Wang, Shuang Wu, Likai Wei, Bo Xiao, Wen Xie, Yan Xie, Dani Yogatama, Bin Yuan, Jun Zhan, and Zhenyao Zhu. Deep speech 2 : End-to-end speech recognition in english and mandarin. In Proceedings of the 33rd International Conference on Machine Learning (ICML), pp. 173–182, 2016. URL http://proceedings.mlr.press/v48/amodei16.html.
+David Balduzzi, Sebastien Racaniere, James Martens, Jakob Foerster, Karl Tuyls, and Thore Graepel. The mechanics of n-player differentiable games. In Proceedings of the 35th International Conference on Machine Learning (ICML), pp. 354–363, 2018. URL http://proceedings. mlr.press/v80/balduzzi18a/balduzzi18a.pdf.
+Aharon Ben-Tal, Dick Den Hertog, Anja De Waegenaere, Bertrand Melenberg, and Gijs Rennen. Robust solutions of optimization problems affected by uncertain probabilities. Management Science, 59(2):341–357, 2013a.
+Aharon Ben-Tal, Dick Den Hertog, Anja De Waegenaere, Bertrand Melenberg, and Gijs Rennen. Robust solutions of optimization problems affected by uncertain probabilities. Management Science, 59(2):341–357, 2013b.
+Su Lin Blodgett, Lisa Green, and Brendan O’Connor. Demographic dialectal variation in social media: A case study of African-American English. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (ACL), pp. 1119–1130, 2016. URL https: //www.aclweb.org/anthology/D16-1120.
+Thomas Davidson, Dana Warmsley, Michael Macy, and Ingmar Weber. Automated hate speech detection and the problem of offensive language. In Proceedings of the 11th International AAAI Conference on Weblogs and Social Media (ICWSM), 2017.
+Erick Delage and Yinyu Ye. Distributionally robust optimization under moment uncertainty with application to data-driven problems. Operations research, 58(3):595–612, 2010.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep bidirectional transformers for language understanding. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT), 2018.
+Lucas Dixon, John Li, Jeffrey Sorensen, Nithum Thain, and Lucy Vasserman. Measuring and mitigating unintended bias in text classiﬁcation. In Proceedings of the 2018 AAAI/ACM Conference on AI, Ethics, and Society, pp. 67–73, 2018.
+John Duchi and Hongseok Namkoong. Learning models with uniform performance via distributionally robust optimization. arXiv preprint arXiv:1810.08750, 2018. URL https://arxiv. org/pdf/1810.08750.pdf.
+John Duchi, Peter Glynn, and Hongseok Namkoong. Statistics of robust optimization: A generalized empirical likelihood approach. arXiv preprint arXiv:1610.03425, 2016.
+Louis Faury, Ugo Tanielian, Elvis Dohmatob, Elena Smirnova, and Flavian Vasile. Distributionally robust counterfactual risk minimization. In Proceedings of the 34th Meeting of the Association for Advancement of Artiﬁcial Intelligence (AAAI), volume 34, pp. 3850–3857, 2020.
+Paula Fortuna and Se´rgio Nunes. A survey on automatic detection of hate speech in text. ACM Computing Surveys (CSUR), 51(4):1–30, 2018.
+10
+
+Published as a conference paper at ICLR 2021
+Antigoni-Maria Founta, Constantinos Djouvas, Despoina Chatzakou, Ilias Leontiadis, Jeremy Blackburn, Gianluca Stringhini, Athena Vakali, Michael Sirivianos, and Nicolas Kourtellis. Large scale crowdsourcing and characterization of twitter abusive behavior. In Proceedings of the 12th International AAAI Conference on Weblogs and Social Media (ICWSM), 2018.
+Andreas Fuster, Paul Goldsmith-Pinkham, Tarun Ramadorai, and Ansgar Walther. Predictably unequal? the effects of machine learning on credit markets. The Effects of Machine Learning on Credit Markets (November 6, 2018), 2018.
+Athinodoros S. Georghiades, Peter N. Belhumeur, and David J. Kriegman. From few to many: Illumination cone models for face recognition under variable lighting and pose. IEEE transactions on pattern analysis and machine intelligence, 23(6):643–660, 2001.
+Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil Ozair, Aaron Courville, and Yoshua Bengio. Generative adversarial nets. In Proceedings of the 28th Annual Conference on Neural Information Processing Systems (NIPS), pp. 2672–2680, 2014. URL http://papers.nips.cc/paper/ 5423-generative-adversarial-nets.pdf.
+Evan Greensmith, Peter L Bartlett, and Jonathan Baxter. Variance reduction techniques for gradient estimates in reinforcement learning. Journal of Machine Learning Research, 5(Nov):1471–1530, 2004.
+Patrick Grother, Mei Ngan, and Kayee Hanaoka. Face Recognition Vendor Test (FVRT): Part 3, Demographic Effects. National Institute of Standards and Technology, 2019.
+Suchin Gururangan, Ana Marasovic´, Swabha Swayamdipta, Kyle Lo, Iz Beltagy, Doug Downey, and Noah A. Smith. Don’t stop pretraining: Adapt language models to domains and tasks. In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, pp. 8342–8360, Online, July 2020. Association for Computational Linguistics. doi: 10.18653/v1/ 2020.acl-main.740. URL https://www.aclweb.org/anthology/2020.acl-main. 740.
+J. Hershey and P. Olsen. Approximating the kullback leibler divergence between gaussian mixture models. Proceedings of the International Conference on Acoustics, Speech, and Signal Processing (ICASSP), 4:IV–317–IV–320, 2007.
+Sepp Hochreiter and Ju¨rgen Schmidhuber. Long short-term memory. Neural computation, 9(8): 1735–1780, 1997.
+Dirk Hovy and Anders Søgaard. Tagging performance correlates with author age. In Proceedings of the 53rd Annual Meeting of the Association for Computational Linguistics (ACL), pp. 483–488, 2015. URL https://www.aclweb.org/anthology/P15-2079.
+Weihua Hu, Gang Niu, Issei Sato, and Masashi Sugiyama. Does distributionally robust supervised learning give robust classiﬁers? In Proceedings of the 35th International Conference on Machine Learning (ICML), pp. 2029–2037, 2018. URL http://proceedings.mlr.press/v80/ hu18a/hu18a.pdf.
+Zhaolin Hu and L Jeff Hong. Kullback-leibler divergence constrained distributionally robust optimization. Available at Optimization Online, 2013.
+Hisham Husain. Distributional robustness with ipms and links to regularization and gans. In Proceedings of the 34th Annual Conference on Neural Information Processing Systems (NIPS), 2020.
+Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In Proceedings of the International Conference on Learning Representations (ICLR), 2014.
+Solomon Kullback and Richard A Leibler. On information and sufﬁciency. The annals of mathematical statistics, 22(1):79–86, 1951.
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models. Proceedings of the International Conference on Learning Representations (ICLR), 2017.
+11
+
+Published as a conference paper at ICLR 2021
+Viet Anh Nguyen, Nian Si, and Jose Blanchet. Robust bayesian classiﬁcation using an optimistic score ratio. In Proceedings of the 37th International Conference on Machine Learning (ICML), 2020.
+Mohammad Norouzi, Samy Bengio, zhifeng Chen, Navdeep Jaitly, Mike Schuster, Yonghui Wu, and Dale Schuurmans. Reward augmented maximum likelihood for neural structured prediction. In Proceedings of the 30th Annual Conference on Neural Information Processing Systems (NIPS), pp. 1723–1731. 2016.
+Yonatan Oren, Shiori Sagawa, Tatsunori Hashimoto, and Percy Liang. Distributionally robust language modeling. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing (EMNLP), pp. 4227–4237, 2019. URL https://www.aclweb.org/ anthology/D19-1432.
+Martin J. Osborne and Ariel Rubinstein. A Course in Game Theory. The MIT Press, 1994. ISBN 0262150417.
+Alec Radford, Karthik Narasimhan, Time Salimans, and Ilya Sutskever. Improving language understanding with unsupervised learning. Technical report, Technical report, OpenAI, 2018.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language models are unsupervised multitask learners. OpenAI Blog, 1:8, 2019.
+Hamed Rahimian and Sanjay Mehrotra. Distributionally Robust Optimization: A Review. arXiv preprint arXiv:1908.05659, 2019.
+Shiori Sagawa, Pang Wei Koh, Tatsunori B Hashimoto, and Percy Liang. Distributionally robust neural networks for group shifts: On the importance of regularization for worst-case generalization. In Proceedings of the International Conference on Learning Representations (ICLR), 2020. URL https://arxiv.org/pdf/1911.08731.pdf.
+Maarten Sap, Dallas Card, Saadia Gabriel, Yejin Choi, and Noah A. Smith. The risk of racial bias in hate speech detection. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics (ACL), pp. 1668–1678, 2019. URL https://www.aclweb.org/ anthology/P19-1163.
+Anna Schmidt and Michael Wiegand. A survey on hate speech detection using natural language processing. In Proceedings of the 5th International Workshop on Natural Language Processing for Social Media (SocialNLP), pp. 1–10, 2017. URL https://www.aclweb.org/ anthology/W17-1101.
+Satinder P. Singh, Michael J. Kearns, and Yishay Mansour. Nash convergence of gradient dynamics in general-sum games. In Proceedings of the 16th Conference on Uncertainty in Artiﬁcial Intelligence, UAI ’00, pp. 541–548, San Francisco, CA, USA, 2000. Morgan Kaufmann Publishers Inc. ISBN 1558607099.
+Aman Sinha, Hongseok Namkoong, and John Duchi. Certifying some distributional robustness with principled adversarial training. In Proceedings of the International Conference on Learning Representations (ICLR), 2018.
+Richard Socher, Alex Perelygin, Jean Wu, Jason Chuang, Christopher D. Manning, Andrew Ng, and Christopher Potts. Recursive deep models for semantic compositionality over a sentiment treebank. In Proceedings of the 2013 Conference on Empirical Methods in Natural Language Processing (EMNLP), pp. 1631–1642, 2013.
+Martin Sundermeyer, Ralf Schlu¨ter, and Hermann Ney. Lstm neural networks for language modeling. In Proceedings of the 13th Annual Conference of the International Speech Communication Association (InterSpeech), 2012.
+Prasetya Ajie Utama, N. Moosavi, and Iryna Gurevych. Towards debiasing nlu models from unknown biases. arXiv preprint arXiv:2009.12303, 2020.
+Zhengwei Wang, Qi She, and Tomas E Ward. Generative adversarial networks in computer vision: A survey and taxonomy. arXiv preprint arXiv:1906.01529, 2019.
+12
+
+Published as a conference paper at ICLR 2021
+
+Mengzhou Xia, Anjalie Field, and Yulia Tsvetkov. Demoting racial bias in hate speech detection. In Proceedings of the 9th International Workshop on Natural Language Processing for Social Media (SocialNLP), pp. 7–14, 2020. URL https://www.aclweb.org/anthology/2020. socialnlp-1.2.
+
+A DERIVATIONS
+
+A.1 REORGANIZING THE LAGRANGIAN L(ψ, τ )
+
+Let us write the Lagrangian L explicitly:
+
+p(x, y)
+
+L(ψ, τ ) = E(x,y)∼qψ qψ (x, y) (x, y, θ) − τ (KL(qψ p) − κ)
+
+(12)
+
+0
+
+p(x, y)
+
+qψ(x, y)
+
+= E(x,y)∼qψ qψ (x, y) (x, y, θ) − τ E(x,y)∼qψ log p(x, y) + τ κ
+
+(13)
+
+0
+
+
+
+p(x,y) (x,y,θ) 
+
+p(x, y)e qψ0 (x,y) τ
+
+= τ E(x,y)∼qψ log 
+
+qψ(x, y)
+
+ + τκ
+
+(14)
+
+= τ (κ − KL(qψ qτ∗,θ)) + log
+
+p(x,y) (x,y,θ)
+E(x,y)∼p e qψ0 (x,y) τ
+
+(15)
+
+This last step requires that the log moment generating function of under p exist for τ . In most scenarios we consider, is typically the negative log likelihood of a neural network model, which is generally bounded. Therefore the moment generating function is deﬁned everywhere.
+Note that the KL term is the only one dependent on ψ, therefore maximizing L for ψ is equivalent to maximizing −KL(qψ qτ∗,θ), in other words minimizing KL(qψ qτ∗,θ)
+
+A.2 ENFORCING THE KL CONSTRAINT IN THE TOY SETTING
+
+Even in this simplest setting, the exact KL between qψ (a gaussian) and p (a mixture of gaussians) does not have an analytical expression (Hershey & Olsen, 2007). Instead, we fall back on enforcing
+the KL constraint between qψ and qψ0 , both isotropic gaussians with the same standard deviation. Let µ and µ0 ∈ R2 denote their respective mean, and σ > 0 their standard deviation. In this context, their KL divergence reduces to:
+
+1 KL(qψ qψ ) = KL(qψ qψ) =
+
+µ − µ0 2
+
+0
+
+0
+
+2σ2
+
+In other words, the KL divergence is equivalent to the euclidean distance between the distributions’ means. We use this fact to project ψ (in the KL sense) onto Bκ = {ψˆ | KL(qψˆ qψ0 ) < κ}:
+
+projBκ (ψ) := arg min KL(qψ qψˆ)
+ψˆ∈Bκ
+√ 2κσ
+= ψ0 + ψ − ψ0 (ψ − ψ0)
+
+B EXPERIMENTAL DETAILS
+
+We describe in more details some of the experimental settings for our NLP experiments. More details can be found in our code release: https://github.com/pmichel31415/P-DRO.
+
+B.1 MODEL SETTINGS
+In all experiments, we split the text into sub-word tokens using the tokenizer described in (Devlin et al., 2018). During training, we sample minibatches that contain at most 64 sentences or 2500 tokens, whichever is greater, in order to prevent GPU memory overﬂow in case of long sentences.
+
+13
+
+Published as a conference paper at ICLR 2021
+
+We train all models with Adam (Kingma & Ba, 2014) with an initial learning rate of 2×10−5, which we decay linearly at each step until the end of training. We validate the models every epoch. For BERT, we start from the bert-base-uncased checkpoint.
+B.2 ADVERSARY SETTINGS
+In all experiments, we use a Transformer model based on the GPT-2 architecture (Radford et al., 2019) to serve as the adversary. In order to initialize the adversary (to obtain ψ0), we ﬁrst pre-train the model on a generic, relatively large language modeling dataset, WikiText-103 (Merity et al., 2017). We also use a batch size of 64 samples or 2500 tokens, and train with Adam for 10 epochs, with a ﬁxed learning rate of 3 × 10−4. Then, we ﬁne-tune this model on each dataset, this time minimizing the negative log-likelihood of the (x, y) pair (by introducing the special “[label]” token as described in Section B), using the same hyper-parameters but a smaller learning rate (10−5). We ﬁnd that, due to the small to medium size of the datasets under consideration, this LM pretraining step helped achieve lower error on the generative modeling task.
+B.3 BASELINE SETTINGS
+B.3.1 TOPIC CVAR
+To train the topic model for Topic CVaR, we ﬁrst pre-process the text by removing all punctuation, urls and user mentions (for twitter data). Importantly, we remove stop-words for our toxicity experiments but not for our BiasedSST experiment. This is because the distractor token we use (“so”) belongs to most English stop words lists, and removing it would completely prevent the topic model from picking up on the groups of interest. We then estimate the parameters of the model with Gensim8 and use similar settings as Oren et al. (2019) (α = 0.1, β = 1.0), setting the number of topics to 10.
+For both Oracle-DRO and Topic-CVaR, we use the algorithm proposed in Sagawa et al. (2020) to estimate the worst-case group (either oracle group or topic in Topic-CVaR) online during training. We perform grid-search over {1, 0.1, 0.01} to ﬁnd the best learning rate for the group weights update. For Oracle DRO, the best model is simply selected by robust validation accuracy. For Topic CVaR, unless speciﬁed otherwise, we select the model with the lowest worst-case error over all topics.
+B.3.2 NONPARAM
+In the KL-constrained non-parametric setting, the min-max problem reads
+
+min max E(x,y)∼q (x, y, θ).
+
+(16)
+
+θ
+
+q s.t.
+
+KL(qψ p)≤κ
+
+Here, κ is the desired radius of the KL ball, and is treated as a hyper-parameter. The solution of the
+
+inner maximum has an analytical solution of the form qθ∗ = Zθa,τ∗ p(x, y)e (xτ,∗y;θ) (see Hu & Hong
+
+(2013);
+
+Hu
+
+et
+
+al.
+
+(2018)
+
+for
+
+details)
+
+with
+
+Zθ,τ ∗
+
+=
+
+Epe
+
+(x,y;θ) τ∗
+
+and
+
+τ∗
+
+such
+
+that
+
+(x,y;θ)
+
+KL(q∗
+
+e p) = Ep
+
+τ∗
+
+Zθ,τ ∗
+
+(x, y; θ) τ ∗ − log Zθ,τ∗ = κ.
+
+Note that both computing Zθ,τ∗ and KL(q∗ p) require taking expectations over p. In our setting, where (x, y; θ) is the output of a large neural network, we cannot afford to take this expectation
+over the entire training data at each step. Instead, we fall back to taking the average over each minibatch. We ﬁnd τ ∗ with binary search in log10 space within the [10−10, 1010] interval and clip to the lowest or highest value should the result lie outside the search interval.
+
+8https://radimrehurek.com/gensim/
+
+14
+
+Published as a conference paper at ICLR 2021
+
+Robust validation accuracy
+
+40
+
+= 10 5 = 10 4
+
+= 10 3
+
+20
+
+0 log1log2 log5log1l0og20log5lo0g100 log1000 KL threshold
+
+log10000
+
+Figure 3: Evolution of the robust validation accuracy of the model selected by Greedy-Minmax as a function of the KL threshold κvalid
+
+In all experiments, we try 4 different values for κ: 0.01, 0.1, 1 and 10. Unless indicated otherwise, we perform early stopping and hyper-parameter selection using our Minmax criterion using the non-parametric weights as adversaries on the validation data.
+
+C ADDITIONAL EXPERIMENTS
+
+C.1 MINMAX VALIDATION KL THRESHOLD
+
+The Monte-Carlo estimate
+
+1 |Dvalid |
+
+x,y∈Dvalid qpψ((xx,y,y)) log qpψ((xx,y,y)) .
+
+likelihood ratio qψ(x,y) with qψ(x,y) .
+
+p(x,y)
+
+qψ0 (x,y)
+
+of KL(qψ Similarly to
+
+p) on Section 3,
+
+the validation we approximate the
+
+set is (unknown)
+
+We want to reject all adversaries where this approximated KL is greater than some threshold, κvalid, but how do we choose a good value for κvalid? Consider an adversary which selects a fraction of the validation data of size α|Dvalid| for some α ∈ (0, 1]. In such a case, the likelihood ratio is 1/α on this subset and 0 everywhere else, and the resulting KL estimate will be log α. In other words,
+choosing a threshold of κvalid means allowing the adversary to potentially select any subset of size at least 1/eκvalid of the original data. Our heuristic choice, log 10, corresponds to allowing subsets of
+size at least 10% of |Dvalid|.
+
+Of course, this is only a heuristic because the adversary can reweight the validation set nonuniformly. To assess the effect of κvalid on Greedy-Minmax, we compute the average robust validation error of the selected model across 5 runs for 3 different values of the adversary’s learning
+rate. Results on BiasedSST, depicted in Figure 3, show that adversaries with higher learning rate are more sensitive to the choice of threshold, but all values of κvalid between log 5 and log 20 seem to work for these settings.
+
+C.2 P-DRO EXPERIMENTS WITH AN LSTM ADVERSARY
+We replicate the experiments BiasedSST experiments in Section 4, but this time using a smaller generative model, which is unlikely to generate good samples. Speciﬁcally, we use a one layer LSTM model (Hochreiter & Schmidhuber, 1997) with embedding and hidden dimension 256. We only perform grid-search over λ ∈ [10−5, 10−4, 10−3] and select the best with Minmax.
+Once pre-trained on the BiasedSST dataset, this model achieves a perplexity of 227.0, more than 4 times worse than the transformer model we use in other experiments (49.8). However, as evidenced by its robust accuracy displayed in Table 5, P-DRO is still able to learn a robust model. We take this as evidence that the re-weighting introduced in Section 3 helps stabilize training even when qψ is not a perfect model of the data.
+
+15
+
+Published as a conference paper at ICLR 2021
+
+Table 5: Average and robust accuracies on BiasedSST when P-DRO is trained with an LSTM adversary. Underlining indicates statistically signiﬁcant difference compared to ERM (p < 0.05)
+
+ERM
+Topic CVaR NonParam P-DRO
+Oracle DRO
+
+Robust
+2.15 ± 0.97
+5.18 ± 1.46 28.11 ± 2.16 43.68 ± 4.93
+67.71 ± 3.03
+
+Average
+95.09 ± 0.16
+95.00 ± 0.10 92.45 ± 1.55 86.58 ± 1.77
+77.91 ± 4.49
+
+Table 6: Effect of hyper-parameters on robust validation accuracy on BiasedSST
+
+λ = 10−5 λ = 10−4 λ = 10−3
+τ = 0.1 τ = 0.01 τ = 0.001
+k=1 k=5 k = 10
+
+Robust accuracy Minmax stopping Oracle stopping
+
+28.62 ± 12.37 44.74 ± 3.24 25.57 ± 10.33
+
+45.10 ± 4.50 50.43 ± 5.05 38.70 ± 2.97
+
+39.72 ± 5.55 44.74 ± 3.24 44.74 ± 3.24
+
+50.00 ± 4.98 50.43 ± 5.05 50.87 ± 5.09
+
+41.98 ± 4.48 44.74 ± 3.24 32.17 ± 11.20
+
+49.60 ± 5.39 50.43 ± 5.05 50.95 ± 5.01
+
+C.3 INFLUENCE OF HYPER-PARAMETERS ON P-DRO
+We study the inﬂuence of the 3 hyper-parameters τ (temperature), k (size of the renormalization window) and λ (learning rate of the adversary) on the performance of P-DRO. All experiments are run on the BiasedSST dataset, and the analysis proceeds as follows: starting from conﬁguration τ = 0.01, k = 5 and λ = 10−4 and vary each of the hyper-parameters independently. We report two numbers for each conﬁguration: robust accuracy of the best model using Greedy-Minmax stopping and using Oracle stopping. The latter is useful to disentangle the effect of the stopping criterion.
+As seen in the results shown in Table 6, we ﬁnd that τ has the least effect on robust accuracies. While the renormalization window parameter k has some effect on optimal stopping, the best robust accuracy achieved by the model (with oracle stopping) varies little. We observe the adversary’s learning rate λ to be the most sensitive hyper-parameter, which is why we restrict our grid-search to λ in Section 5.
+
+16
+
+

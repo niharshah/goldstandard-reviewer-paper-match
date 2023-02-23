@@ -1,0 +1,643 @@
+Learning to Translate in Real-time with Neural Machine Translation
+
+Jiatao Gu†, Graham Neubig♦, Kyunghyun Cho‡ and Victor O.K. Li†
+
+†The University of Hong Kong ♦Carnegie Mellon University ‡New York University
+
+† {jiataogu,
+
+vli}@eee.hku.hk
+
+♦
+gneubig@cs.cmu.edu
+
+‡
+kyunghyun.cho@nyu.edu
+
+arXiv:1610.00388v3 [cs.CL] 10 Jan 2017
+
+Abstract
+Translating in real-time, a.k.a. simultaneous translation, outputs translation words before the input sentence ends, which is a challenging problem for conventional machine translation methods. We propose a neural machine translation (NMT) framework for simultaneous translation in which an agent learns to make decisions on when to translate from the interaction with a pre-trained NMT environment. To trade off quality and delay, we extensively explore various targets for delay and design a method for beam-search applicable in the simultaneous MT setting. Experiments against state-of-the-art baselines on two language pairs demonstrate the efﬁcacy of the proposed framework both quantitatively and qualitatively.1
+1 Introduction
+Simultaneous translation, the task of translating content in real-time as it is produced, is an important tool for real-time understanding of spoken lectures or conversations (Fu¨gen et al., 2007; Bangalore et al., 2012). Different from the typical machine translation (MT) task, in which translation quality is paramount, simultaneous translation requires balancing the trade-off between translation quality and time delay to ensure that users receive translated content in an expeditious manner (Mieno et al., 2015). A number of methods have been proposed to solve this problem, mostly in the context of phrase-based machine translation. These methods are based on a segmenter, which receives the input one word at a time, then decides when to send it to a MT system that translates each
+1Code and data can be found at https://github. com/nyu-dl/dl4mt-simul-trans.
+
+Last night we served Mr X Gestern
+Abend haben
+wir Herrn
+X ein Bier serviert
+, der
+im Laufe
+der Nacht
+ge-storben
+ist .
+< eos >
+
+a beer ,
+
+who diedduring the night . < eos >
+READ WRITE
+
+Figure 1: Example output from the proposed framework in DE → EN simultaneous translation. The heat-map represents the soft alignment between the incoming source sentence (left, upto-down) and the emitted translation (top, leftto-right). The length of each column represents the number of source words being waited for before emitting the translation. Best viewed when zoomed digitally.
+
+segment independently (Oda et al., 2014) or with a minimal amount of language model context (Bangalore et al., 2012).
+Independently of simultaneous translation, accuracy of standard MT systems has greatly improved with the introduction of neural-networkbased MT systems (NMT) (Sutskever et al., 2014; Bahdanau et al., 2014). Very recently, there have been a few efforts to apply NMT to simultaneous translation either through heuristic modiﬁcations to the decoding process (Cho and Esipova, 2016), or through the training of an independent segmentation network that chooses when to perform output using a standard NMT model (Satija and Pineau, 2016). However, the former model lacks a capability to learn the appropriate timing with which to perform translation, and the latter model uses a standard NMT model as-is, lacking a holistic design of the modeling and learning within the simultaneous MT context. In addition, neither model has demonstrated gains over previ-
+
+ous segmentation-based baselines, leaving questions of their relative merit unresolved.
+In this paper, we propose a uniﬁed design for learning to perform neural simultaneous machine translation. The proposed framework is based on formulating translation as an interleaved sequence of two actions: READ and WRITE. Based on this, we devise a model connecting the NMT system and these READ/WRITE decisions. An example of how translation is performed in this framework is shown in Fig. 1, and detailed deﬁnitions of the problem and proposed framework are described in §2 and §3. To learn which actions to take when, we propose a reinforcement-learning-based strategy with a reward function that considers both quality and delay (§4). We also develop a beam-search method that performs search within the translation segments (§5).
+We evaluate the proposed method on EnglishRussian (EN-RU) and English-German (EN-DE) translation in both directions (§6). The quantitative results show strong improvements compared to both the NMT-based algorithm and a conventional segmentation methods. We also extensively analyze the effectiveness of the learning algorithm and the inﬂuence of the trade-off in the optimization criterion, by varying a target delay. Finally, qualitative visualization is utilized to discuss the potential and limitations of the framework.
+2 Problem Deﬁnition
+Suppose we have a buffer of input words X = {x1, ..., xTs} to be translated in real-time. We deﬁne the simultaneous translation task as sequentially making two interleaved decisions: READ or WRITE. More precisely, the translator READs a source word xη from the input buffer in chronological order as translation context, or WRITEs a translated word yτ onto the output buffer, resulting in output sentence Y = {y1, ..., yTt}, and action sequence A = {a1, ..., aT } consists of Ts READs and Tt WRITEs, so T = Ts + Tt.
+Similar to standard MT, we have a measure Q(Y ) to evaluate the translation quality, such as BLEU score (Papineni et al., 2002). For simultaneous translation we are also concerned with the fact that each action incurs a time delay D(A). D(A) will mainly be inﬂuenced by delay caused by READ, as this entails waiting for a human speaker to continue speaking (about 0.3s per word for an average speaker), while WRITE consists of generating a few words from a machine transla-
+
+Figure 2: Illustration of the proposed framework: at each step, the NMT environment (left) computes a candidate translation. The recurrent agent (right) will the observation including the candidates and send back decisions–READ or WRITE.
+
+tion system, which is possible on the order of milliseconds. Thus, our objective is ﬁnding an optimal policy that generates decision sequences with a good trade-off between higher quality Q(Y ) and lower delay D(A). We elaborate on exactly how to deﬁne this trade-off in §4.2.
+In the following sections, we ﬁrst describe how to connect the READ/WRITE actions with the NMT system (§3), and how to optimize the system to improve simultaneous MT results (§4).
+
+3 Simultaneous Translation with Neural Machine Translation
+The proposed framework is shown in Fig. 2, and can be naturally decomposed into two parts: environment (§3.1) and agent (§3.2).
+
+3.1 Environment
+Encoder: READ The ﬁrst element of the NMT system is the encoder, which converts input words X = {x1, ..., xTs} into context vectors H = {h1, ..., hTs}. Standard NMT uses bi-directional RNNs as encoders (Bahdanau et al., 2014), but this is not suitable for simultaneous processing as using a reverse-order encoder requires knowing the ﬁnal word of the sentence before beginning processing. Thus, we utilize a simple left-to-right unidirectional RNN as our encoder:
+
+hη = φUNI-ENC (hη−1, xη)
+
+(1)
+
+Decoder: WRITE Similar with standard MT, we use an attention-based decoder. In contrast, we
+
+only reference the words that have been read from the input when generating each target word:
+
+cητ = φATT (zτ −1, yτ −1, Hη)
+
+zτη = φDEC (zτ −1, yτ −1, cητ )
+
+(2)
+
+p (y|y<τ , Hη) ∝ exp [φOUT (zτη)] ,
+
+where for τ , zτ−1 and yτ−1 represent the previous decoder state and output word, respectively. Hη
+is used to represent the incomplete input states, where Hη is a preﬁx of H. As the WRITE action
+calculates the probability of the next word on the
+ﬂy, we need greedy decoding for each step:
+
+yτη = arg maxy p (y|y<τ , Hη)
+
+(3)
+
+Note that yτη, zτη corresponds to Hη and is the candidate for yτ , zτ . The agent described in the next section decides whether to take this candidate or wait for better predictions.
+
+3.2 Agent
+A trainable agent is designed to make decisions A = {a1, .., aT }, at ∈ A sequentially based on observations O = {o1, ..., oT }, ot ∈ O, and then control the translation environment properly.
+Observation As shown in Fig 2, we concatenate the current context vector cητ , the current decoder state zτη and the embedding vector of the candidate word yτη as the continuous observation, oτ+η = [cητ ; zτη; E(yτη)] to represent the current state.
+Action Similarly to prior work (Grissom II et al., 2014), we deﬁne the following set of actions:
+• READ: the agent rejects the candidate and waits to encode the next word from input buffer;
+• WRITE: the agent accepts the candidate and emits it as the prediction into output buffer;
+
+Policy How the agent chooses the actions based on the observation deﬁnes the policy. In our setting, we utilize a stochastic policy πθ parameterized by a recurrent neural network, that is:
+st = fθ (st−1, ot) (4)
+πθ(at|a<t, o≤t) ∝ gθ (st) ,
+
+where st is the internal state of the agent, and is updated recurrently yielding the distribution of the action at. Based on the policy of our agent, the overall algorithm of greedy decoding is shown in Algorithm 1, The algorithm outputs the translation result and a sequence of observation-action pairs.
+
+Algorithm 1 Simultaneous Greedy Decoding
+
+Require: NMT system φ, policy πθ, τMAX, input
+
+buffer X, output buffer Y , state buffer S.
+
+1: Init x1 ⇐ X, h1 ← φENC (x1) , H1 ← {h1}
+
+2:
+
+z0 ← φINIT H1 , y0 ← s
+
+3: τ ← 0, η ← 1
+
+4: while τ < τMAX do
+
+5: t ← τ + η 6: yτη, zτη, ot ← φ (zτ−1, yτ−1, Hη)
+
+7: at ∼ πθ (at; a<t, o<t) , S ⇐ (ot, at)
+
+8: if at = READ and xη = /s then
+
+9:
+
+xη+1 ⇐ X, hη+1 ← φENC (hη, xη+1)
+
+10:
+
+Hη+1 ← Hη ∪ {hη+1}, η ← η + 1
+
+11:
+
+if |Y | = 0 then z0 ← φINIT (Hη)
+
+12: else if at = WRITE then
+
+13:
+
+zτ
+
+←
+
+z
+
+η τ
+
+,
+
+yτ
+
+←
+
+yτη
+
+14:
+
+Y ⇐ yτ , τ ← τ + 1
+
+15:
+
+if yτ = /s then break
+
+4 Learning
+The proposed framework can be trained using reinforcement learning. More precisely, we use policy gradient algorithm together with variance reduction and regularization techniques.
+4.1 Pre-training
+We need an NMT environment for the agent to explore and use to generate translations. Here, we simply pre-train the NMT encoder-decoder on full sentence pairs with maximum likelihood, and assume the pre-trained model is still able to generate reasonable translations even on incomplete source sentences. Although this is likely sub-optimal, our NMT environment based on uni-directional RNNs can treat incomplete source sentences in a manner similar to shorter source sentences and has the potential to translate them more-or-less correctly.
+4.2 Reward Function
+The policy is learned in order to increase a reward for the translation. At each step the agent will receive a reward signal rt based on (ot, at). To evaluate a good simultaneous machine translation, a reward must consider both quality and delay.
+Quality We evaluate the translation quality using metrics such as BLEU (Papineni et al., 2002). The BLEU score is deﬁned as the weighted geometric average of the modiﬁed n-gram precision BLEU0, multiplied by the brevity penalty BP to punish a short translation. In practice, the vanilla
+
+BLEU score is not a good metric at sentence level because being a geometric average, the score will reduce to zero if one of the precisions is zero. To avoid this, we used a smoothed version of BLEU for our implementation (Lin and Och, 2004).
+
+BLEU(Y, Y ∗) = BP · BLEU0(Y, Y ∗), (5)
+
+where Y ∗ is the reference and Y is the output. We decompose BLEU and use the difference of partial BLEU scores as the reward, that is:
+
+Q
+
+∆BLEU0(Y, Y ∗, t) t < T
+
+rt =
+
+BLEU(Y, Y ∗) t = T (6)
+
+where Y t is the cumulative output at t (Y 0 = ∅), and ∆BLEU0(Y, Y ∗, t) = BLEU0(Y t, Y ∗) − BLEU0(Y t−1, Y ∗). Obviously, if at = READ, no new words are written into Y , yielding rtQ = 0. Note that we do not multiply BP until the end of
+the sentence, as it would heavily penalize partial
+translation results.
+
+Delay As another critical feature, delay judges how much time is wasted waiting for the translation. Ideally we would directly measure the actual time delay incurred by waiting for the next word. For simplicity, however, we suppose it consumes the same amount of time listening for one more word. We deﬁne two measurements, global and local, respectively:
+
+• Average Proportion (AP): following the def-
+
+inition in (Cho and Esipova, 2016), X, Y are
+
+the source and decoded sequences respectively,
+
+and we use s(τ ) to denote the number of source
+
+words been waited when decoding word yτ ,
+
+1
+
+0 < d (X, Y ) =
+
+s(τ ) ≤ 1
+
+|X||Y |
+
+τ
+
+(7)
+
+0
+
+t<T
+
+dt = d(X, Y ) t = T
+
+d is a global delay metric, which deﬁnes the average waiting proportion of the source sentence when translating each word.
+
+• Consecutive Wait length (CW): in speech translation, listeners are also concerned with long silences during which no translation occurs. To capture this, we also consider on how many words were waited for (READ) consecutively between translating two words. For each action, where we initially deﬁne c0 = 0,
+
+ct = ct−1 + 1 at = READ
+
+(8)
+
+0
+
+at = WRITE
+
+• Target Delay: We further deﬁne “target delay” for both d and c as d∗ and c∗, respectively, as different simultaneous translation applications may have different requirements on delay. In our implementation, the reward function for delay is written as:
+rtD = α·[sgn(ct − c∗) + 1]+β · dt−d∗ + (9)
+where α ≤ 0, β ≤ 0.
+
+Trade-off between quality and delay A good
+simultaneous translation system requires balanc-
+ing the trade-off of translation quality and time
+delay. Obviously, achieving the best translation
+quality and the shortest translation delays are in
+a sense contradictory. In this paper, the trade-off is achieved by balancing the rewards rt = rtQ +rtD provided to the system, that is, by adjusting the coefﬁcients α, β and the target delay d∗, c∗ in Eq. 9.
+
+4.3 Reinforcement Learning
+
+Policy Gradient We freeze the pre-trained pa-
+
+rameters of an NMT model, and train the agent
+
+using the policy gradient (Williams, 1992). The
+
+policy gradient maximizes the following expected
+
+cumulative future rewards, J = Eπθ
+
+T t=1
+
+rt
+
+,
+
+whose gradient is
+
+T
+
+∇θJ = Eπθ
+
+∇θ log πθ(at |·)Rt (10)
+
+t =1
+
+Rt =
+
+T k=t
+
+rkQ + rkD
+
+is the cumulative future
+
+rewards for current observation and action. In
+
+practice, Eq. 10 is estimated by sampling multi-
+
+ple action trajectories from the current policy πθ,
+
+collecting the corresponding rewards.
+
+Variance Reduction Directly using the policy gradient suffers from high variance, which makes learning unstable and inefﬁcient. We thus employ the variance reduction techniques suggested by Mnih and Gregor (2014). We subtract from Rt the output of a baseline network bϕ to obtain Rˆt = Rt − bϕ (ot), and centered re-scale the reward as R˜t = √Rˆσt2−+b with a running average b and standard deviation σ. The baseline network is trained to minimize the squared loss as follows:
+T
+Lϕ = Eπθ Rt − bϕ (ot) 2 (11)
+t=1
+We also regularize the negative entropy of the policy to facilitate exploration.
+
+Algorithm 2 Learning with Policy Gradient
+
+Require: NMT system φ, agent θ, baseline ϕ
+
+1: Pretrain the NMT system φ using MLE;
+
+2: Initialize the agent θ;
+
+3: while stopping criterion fails do
+
+4: Obtain a translation pairs: {(X, Y ∗)};
+
+5: for (Y, S) ∼ Simultaneous Decoding do
+
+6:
+
+for (ot, at) in S do
+
+7:
+
+Compute the quality: rtQ;
+
+8:
+
+Compute the delay: rtD;
+
+9:
+
+Compute the baseline: bϕ (ot);
+
+10: Collect the future rewards: {Rt}; 11: Perform variance reduction: {R˜t};
+12: Update: θ ← θ + λ1∇θ [J − κH(πθ)]
+13: Update: ϕ ← ϕ − λ2∇ϕL
+
+The overall learning algorithm is summarized in Algorithm 2. For efﬁciency, instead of updating with stochastic gradient descent (SGD) on a single sentence, both the agent and the baseline are optimized using a minibatch of multiple sentences.
+5 Simultaneous Beam Search
+In previous sections we described a simultaneous greedy decoding algorithm. In standard NMT it has been shown that beam search, where the decoder keeps a beam of k translation trajectories, greatly improves translation quality (Sutskever et al., 2014), as shown in Fig. 3 (A).
+It is non-trivial to directly apply beam-search in simultaneous machine translation, as beam search waits until the last word to write down translation. Based on our assumption WRITE does not cost delay, we can perform a simultaneous beam-search when the agent chooses to consecutively WRITE: keep multiple beams of translation trajectories in temporary buffer and output the best path when the agent switches to READ. As shown in Fig. 3 (B) & (C), it tries to search for a relatively better path while keeping the delay unchanged.
+Note that we do not re-train the agent for simultaneous beam-search. At each step we simply input the observation of the current best trajectory into the agent for making next decision.
+6 Experiments
+6.1 Settings
+Dataset To extensively study the proposed simultaneous translation model, we train and evaluate it on two different language pairs: “English-
+
+Figure 3: Illustrations of (A) beam-search, (B) simultaneous greedy decoding and (C) simultaneous beam-search.
+German (EN-DE)” and “English-Russian (ENRU)” in both directions per pair. We use the parallel corpora available from WMT’152 for both pre-training the NMT environment and learning the policy. We utilize newstest-2013 as the validation set to evaluate the proposed algorithm. Both the training set and the validation set are tokenized and segmented into sub-word units with byte-pair encoding (BPE) (Sennrich et al., 2015). We only use sentence pairs where both sides are less than 50 BPE subword symbols long for training.
+Environment & Agent Settings We pre-trained the NMT environments for both language pairs and both directions following the same setting from (Cho and Esipova, 2016). We further built our agents, using a recurrent policy with 512 GRUs and a softmax function to produce the action distribution. All our agents are trained using policy gradient using Adam (Kingma and Ba, 2014) optimizer, with a mini-batch size of 10. For each sentence pair in a batch, 5 trajectories are sampled. For testing, instead of sampling we pick the action with higher probability each step.
+Baselines We compare the proposed methods against previously proposed baselines. For fair comparison, we use the same NMT environment:
+• Wait-Until-End (WUE): an agent that starts to WRITE only when the last source word is seen. In general, we expect this to achieve the best quality of translation. We perform both greedy decoding and beam-search with this method.
+• Wait-One-Step (WOS): an agent that WRITEs after each READs. Such a policy is problematic when the source and target language pairs have different word orders or lengths (e.g. EN-DE).
+2http://www.statmt.org/wmt15/
+
+16
+
+1.0
+
+25
+
+14 12
+
+0.8
+
+20
+
+10
+
+0.6
+
+15 AP=0.3 CW=2.0 Wait Until End
+
+8
+
+AP=0.5 CW=5.0 Wait One Step
+
+6
+
+0.4
+
+10 AP=0.7 CW=8.0
+
+4 2
+
+AP=0.3 AP=0.5
+
+CW=2.0 CW=5.0
+
+Wait Until End. Wait One Step
+
+0.2
+
+AP=0.3 AP=0.5
+
+CW=2.0 CW=5.0
+
+Wait Until End Wait One Step
+
+5
+
+00
+
+AP=0.7 CW=8.0
+10 20 30
+
+40
+
+50 0.00
+
+AP=0.7 CW=8.0
+10 20 30
+
+40
+
+50 00
+
+10 20 30 40 50
+
+Mini-batches (x1000)
+
+Mini-batches (x1000)
+
+Mini-batches (x1000)
+
+(a) BLEU (EN → RU)
+
+(b) AP (EN → RU)
+
+(c) CW (EN → RU)
+
+Figure 4: Learning progress curves for variant delay targets on the validation dataset for EN → RU.
+
+Every time we only keep one target for one delay measure. For instance when using target AP, the
+
+coefﬁcient of α in Eq. 9 will be set 0.
+
+BLEU
+
+16 15 14 13 12 0.5 0.6 0.7 0.8 0.9 1.0
+Average Proportion
+(a) EN→RU
+24 22 20 18 16 104.5 0.6 0.7 0.8 0.9 1.0
+Average Proportion
+(d) DE→EN
+
+BLEU
+
+20 18 16 14 12 10 8 6 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
+Average Proportion
+(b) RU→EN
+
+BLEU
+
+19 18 17 16 15 14 13 12 0.6 0.7 0.8 0.9 1.0
+Average Proportion
+(c) EN→DE
+
+Figure 5: Delay (AP) v.s. BLEU for both language pair–
+directions. The shown point-pairs are the results of simul-
+taneous greedy decoding and beam-search (beam-size = 5)
+respectively with models trained for various delay targets: ( : CW=8, : CW=5, ♦: CW=2, : AP=0.3, : AP=0.5, : AP=0.7). For each target, we select the model that maximizes the quality-to-delay ratio ( BALEPU ) on the validation set. The baselines are also plotted ( : WOS $: WUE, ×: WID, +: WIW).
+
+BLEU
+
+• Wait-If-Worse/Wait-If-Diff (WIW/WID): as proposed by Cho and Esipova (2016), the algorithm ﬁrst pre-READs the next source word, and accepts this READ when the probability of the most likely target word decreases (WIW), or the most likely target word changes (WID).
+• Segmentation-based (SEG) (Oda et al., 2014): a state-of-the-art segmentation-based algorithm based on optimizing segmentation to achieve the highest quality score. In this paper, we tried the simple greedy method (SEG1) and the greedy method with POS Constraint (SEG2).
+
+6.2 Quantitative Analysis
+In order to evaluate the effectiveness of our reinforcement learning algorithms with different reward functions, we vary the target delay d∗ ∈ {0.3, 0.5, 0.7} and c∗ ∈ {2, 5, 8} for Eq. 9 separately, and trained agents with α and β adjusted to values that provided stable learning for each language pair according to the validation set.
+Learning Curves As shown in Fig. 4, we plot learning progress for EN-RU translation with different target settings. It clearly shows that our algorithm effectively increases translation quality for all the models, while pushing the delay close, if not all of the way, to the target value. It can also be noted from Fig. 4 (a) and (b) that there ex-
+
+BLEU
+
+18
+
+16
+
+14
+
+12
+
+16.0
+
+10
+
+15.5 15.0
+
+8
+
+14.5 14.0
+
+6
+
+13.5 13.0
+
+4
+
+12.5
+
+20
+
+12.01.0 1.5 2.0 2.5 3.0 3.5
+5 10 15 20 25
+
+Consecutive Wait Length
+
+Figure 6: Delay (CW) v.s. BLEU score for EN → RU, ( : CW=8, : CW=5, ♦: CW=2,
+: AP=0.3, : AP=0.5, : AP=0.7), against the baselines ( : WOS : WUE, +: SEG1, ×: SEG2).
+
+ists strong correlation between the two delay measures, implying the agent can learn to decrease both AP and CW simultaneously.
+Quality v.s. Delay As shown in Fig. 5, it is clear that the trade-off between translation quality and delay has very similar behaviors across both language pairs and directions. The smaller delay (AP or CW) the learning algorithm is targeting, the lower quality (BLEU score) the output translation. It is also interesting to observe that, it is more difﬁcult for “→EN” translation to achieve a lower AP target while maintaining good quality, compared to “EN→”. In addition, the models that are optimized on AP tend to perform better than those optimized on CW, especially in “→EN” translation. German and Russian sentences tend to be longer than English, hence require more consecutive waits before being able to emit the next English symbol.
+v.s. Baselines In Fig. 5 and 6, the points closer to the upper left corner achieve better trade-off performance. Compared to WUE and WOS which can ideally achieve the best quality (but the worst delay) and the best delay (but poor quality) respectively, all of our proposed models ﬁnd a good balance between quality and delay. Some of the proposed models can achieve good BLEU scores close to WUE, while have much smaller delay.
+Compared to the method of Cho and Esipova (2016) based on two hand-crafted rules (WID, WIW), in most cases our proposed models ﬁnd better trade-off points, while there are a few exceptions. We also observe that the baseline models have trouble controlling the delay in a reasonable area. In contrast, by optimizing towards a given
+
+target delay, our proposed model is stable while maintaining good translation quality.
+We also compared against Oda et al. (2014)’s state-of-the-art segmentation algorithm (SEG). As shown in Fig 6, it is clear that although SEG can work with variant segmentation lengths (CW), the proposed model outputs high quality translations at a much smaller CW. We conjecture that this is due to the independence assumption in SEG, while the RNNs and attention mechanism in our model makes it possible to look at the whole history to decide each translated word.
+w/o Beam-Search We also plot the results of simultaneous beam-search instead of using greedy decoding. It is clear from Fig. 5 and 6 that most of the proposed models can achieve an visible increase in quality together with a slight increase in delay. This is because beam-search can help to avoid bad local minima. We also observe that the simultaneous beam-search cannot bring as much improvement as it did in the standard NMT setting. In most cases, the smaller delay the model achieves, the less beam search can help as it requires longer consecutive WRITE segments for extensive search to be necessary. One possible solution is to consider the beam uncertainty in the agent’s READ/WRITE decisions. We leave this to future work.
+6.3 Qualitative Analysis
+In this section, we perform a more in-depth analysis using examples from both EN-RU and EN-DE pairs, in order to have a deeper understanding of the proposed algorithm and its remaining limitations. We only perform greedy decoding to simplify visualization.
+EN→RU As shown in Fig 8, since both English and Russian are Subject-Verb-Object (SVO) languages, the corresponding words may share the same order in both languages, which makes simultaneous translation easier. It is clear that the larger the target delay (AP or CW) is set, the more words are read before translating the corresponding words, which in turn results in better translation quality. We also note that very early WRITE commonly causes bad translation. For example, for AP=0.3 & CW=2, both the models choose to WRITE in the very beginning the word “The”, which is unreasonable since Russian has no articles, and there is no word corresponding to it. One good feature of using NMT is that the more words
+
+The cost of Die Kosten f¨ur die Kampagne werden
+im Grunde genommen
+durch mein
+Geh-alt als
+Sen-ator ge--
+deckt .
+< eos >
+
+e mpaign sicallying id
+
+thca
+
+ibsa be pa by
+
+my salary as
+
+a sen--ator . < eos >
+READ WRITE
+
+The cost of Die Kosten f¨ur die Kampagne werden
+im Grunde genommen
+durch mein
+Geh-alt als
+Sen-ator ge--
+deckt .
+< eos >
+
+e mpaign sicallvyered
+
+thca
+
+isba co
+
+by
+
+my salary as
+
+a sen--ator . < eos >
+READ WRITE
+
+(a) Simultaneous Neural Machine Translation
+
+(b) Neural Machine Translation
+
+Figure 7: Comparison of DE→EN examples using the proposed framework and usual NMT system respectively. Both the heatmaps share the same setting with Fig. 1. The verb “gedeckt” is incorrectly translated in simultaneous translation.
+
+Source The people , as I heard in the countryside , want a Government that is not made up of thi-eves . <eos>
+
+AP=0.3 The The p-- i-- ent the p-- ol-- s
+, as I я слышал
+в сельской местности
+,
+хочу правительство ,
+которое не производится во-- ров .
+
+AP=0.7
+Люди , как я слышал
+в сельской местности
+, хотят , чтобы правительство , которое не в-- меши-вается в во-- ры .
+
+Summary
+
+BLEU=39/ AP=0.46
+
+BLEU=64/AP=0.77
+
+CW=2 The
+p-- riv-ers
+,
+как я слышал
+в
+сельской
+местности
+,
+хочу
+правительство
+, которое не является состав-- ной частью во-ров .
+BLEU=54/CW=1.76
+
+CW=8
+Люди
+, как я слышал
+в сельской
+местности
+, хотят , чтобы правительство , которое не в-- меши-- вается в во-ры . BLEU=64/CW=2.55
+
+Figure 8: Given the example input sentence (leftmost column), we show outputs by models trained for various delay targets. For these outputs, each row corresponds to one source word and represents the emitted words (maybe empty) after reading this word. The corresponding source and target words are in the same color for all model outputs.
+
+the decoder READs, the longer history is saved, rendering simultaneous translation easier.
+DE→EN As shown in Fig 1 and 7 (a), where we visualize the attention weights as soft alignment between the progressive input and output sentences, the highest weights are basically along the diagonal line. This indicates that our simultaneous translator works by waiting for enough
+
+source words with high alignment weights and then switching to write them.
+DE-EN translation is likely more difﬁcult as German usually uses Subject-Object-Verb (SOV) constructions a lot. As shown in Fig 1, when a sentence (or a clause) starts the agent has learned such policy to READ multiple steps to approach the verb (e.g. serviert and gestorben in Fig 1). Such a pol-
+
+icy is still limited when the verb is very far from the subject. For instance in Fig. 7, the simultaneous translator achieves almost the same translation with standard NMT except for the verb “gedeckt” which corresponds to “covered” in NMT output. Since there are too many words between the verb “gedeckt” and the subject “Kosten fu¨r die Kampagne werden”, the agent gives up reading (otherwise it will cause a large delay and a penalty) and WRITEs “being paid” based on the decoder’s hypothesis. This is one of the limitations of the proposed framework, as the NMT environment is trained on complete source sentences and it may be difﬁcult to predict the verb that has not been seen in the source sentence. One possible way is to ﬁne-tune the NMT model on incomplete sentences to boost its prediction ability. We will leave this as future work.
+7 Related Work
+Researchers commonly consider the problem of simultaneous machine translation in the scenario of real-time speech interpretation (Fu¨gen et al., 2007; Bangalore et al., 2012; Fujita et al., 2013; Rangarajan Sridhar et al., 2013; Yarmohammadi et al., 2013). In this approach, the incoming speech stream required to be translated are ﬁrst recognized and segmented based on an automatic speech recognition (ASR) system. The translation model then works independently based on each of these segments, potentially limiting the quality of translation. To avoid using a ﬁxed segmentation algorithm, Oda et al. (2014) introduced a trainable segmentation component into their system, so that the segmentation leads to better translation quality. Grissom II et al. (2014) proposed a similar framework, however, based on reinforcement learning. All these methods still rely on translating each segment independently without previous context.
+Recently, two research groups have tried to apply the NMT framework to the simultaneous translation task. Cho and Esipova (2016) proposed a similar waiting process. However, their waiting criterion is manually deﬁned without learning. Satija and Pineau (2016) proposed a method similar to ours in overall concept, but it signiﬁcantly differs from our proposed method in many details. The biggest difference is that they proposed to use an agent that passively reads a new word at each step. Because of this, it cannot consecutively decode multiple steps, rendering beam search difﬁ-
+
+cult. In addition, they lack the comparison to any existing approaches. On the other hand, we perform an extensive experimental evaluation against state-of-the-art baselines, demonstrating the relative utility both quantitatively and qualitatively.
+The proposed framework is also related to some recent efforts about online sequence-to-sequence (SEQ2SEQ) learning. Jaitly et al. (2015) proposed a SEQ2SEQ ASR model that takes ﬁxedsized segments of the input sequence and outputs tokens based on each segment in real-time. It is trained with alignment information using supervised learning. A similar idea for online ASR is proposed by Luo et al. (2016). Similar to Satija and Pineau (2016), they also used reinforcement learning to decide whether to emit a token while reading a new input at each step. Although sharing some similarities, ASR is very different from simultaneous MT with a more intuitive deﬁnition for segmentation. In addition, Yu et al. (2016) recently proposed an online alignment model to help sentence compression and morphological inﬂection. They regarded the alignment between the input and output sequences as a hidden variable, and performed transitions over the input and output sequence. By contrast, the proposed READ and WRITE actions do not necessarily to be performed on aligned words (e.g. in Fig. 1), and are learned to balance the trade-off of quality and delay.
+8 Conclusion
+We propose a uniﬁed framework to do neural simultaneous machine translation. To trade off quality and delay, we extensively explore various targets for delay and design a method for beamsearch applicable in the simultaneous MT setting. Experiments against state-of-the-art baselines on two language pairs demonstrate the efﬁcacy both quantitatively and qualitatively.
+Acknowledgments
+KC acknowledges the support by Facebook, Google (Google Faculty Award 2016) and NVidia (GPU Center of Excellence 2015-2016). GN acknowledges the support of the Microsoft CORE program. This work was also partly supported by Samsung Electronics (Project: ”Development and Application of Larger-Context Neural Machine Translation”).
+
+References
+[Bahdanau et al.2014] Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. 2014. Neural machine translation by jointly learning to align and translate. arXiv preprint arXiv:1409.0473.
+[Bangalore et al.2012] Srinivas Bangalore, Vivek Kumar Rangarajan Sridhar, Prakash Kolan, Ladan Golipour, and Aura Jimenez. 2012. Real-time incremental speech-to-speech translation of dialogs. In Proceedings of the 2012 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, pages 437–445. Association for Computational Linguistics.
+[Cho and Esipova2016] Kyunghyun Cho and Masha Esipova. 2016. Can neural machine translation do simultaneous translation? arXiv preprint arXiv:1606.02012.
+[Fu¨gen et al.2007] Christian Fu¨gen, Alex Waibel, and Muntsin Kolss. 2007. Simultaneous translation of lectures and speeches. Machine Translation, 21(4):209–252.
+[Fujita et al.2013] Tomoki Fujita, Graham Neubig, Sakriani Sakti, Tomoki Toda, and Satoshi Nakamura. 2013. Simple, lexicalized choice of translation timing for simultaneous speech translation. In INTERSPEECH.
+[Grissom II et al.2014] Alvin Grissom II, He He, Jordan Boyd-Graber, John Morgan, and Hal Daume´ III. 2014. Dont until the ﬁnal verb wait: Reinforcement learning for simultaneous machine translation. In Proceedings of the 2014 Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 1342–1352, Doha, Qatar, October. Association for Computational Linguistics.
+[Jaitly et al.2015] Navdeep Jaitly, Quoc V Le, Oriol Vinyals, Ilya Sutskeyver, and Samy Bengio. 2015. An online sequence-to-sequence model using partial conditioning. arXiv preprint arXiv:1511.04868.
+[Kingma and Ba2014] Diederik Kingma and Jimmy Ba. 2014. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980.
+[Lin and Och2004] Chin-Yew Lin and Franz Josef Och. 2004. Automatic evaluation of machine translation quality using longest common subsequence and skip-bigram statistics. In Proceedings of the 42nd Annual Meeting on Association for Computational Linguistics, page 605. Association for Computational Linguistics.
+[Luo et al.2016] Yuping Luo, Chung-Cheng Chiu, Navdeep Jaitly, and Ilya Sutskever. 2016. Learning online alignments with continuous rewards policy gradient. arXiv preprint arXiv:1608.01281.
+
+[Mieno et al.2015] Takashi Mieno, Graham Neubig, Sakriani Sakti, Tomoki Toda, and Satoshi Nakamura. 2015. Speed or accuracy? a study in evaluation of simultaneous speech translation. In INTERSPEECH.
+[Mnih and Gregor2014] Andriy Mnih and Karol Gregor. 2014. Neural variational inference and learning in belief networks. arXiv preprint arXiv:1402.0030.
+[Oda et al.2014] Yusuke Oda, Graham Neubig, Sakriani Sakti, Tomoki Toda, and Satoshi Nakamura. 2014. Optimizing segmentation strategies for simultaneous speech translation. In Proceedings of the 52nd Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers), pages 551–556, Baltimore, Maryland, June. Association for Computational Linguistics.
+[Papineni et al.2002] Kishore Papineni, Salim Roukos, Todd Ward, and Wei-Jing Zhu. 2002. Bleu: a method for automatic evaluation of machine translation. In Proceedings of the 40th annual meeting on association for computational linguistics, pages 311–318. Association for Computational Linguistics.
+[Rangarajan Sridhar et al.2013] Vivek Kumar Rangarajan Sridhar, John Chen, Srinivas Bangalore, Andrej Ljolje, and Rathinavelu Chengalvarayan. 2013. Segmentation strategies for streaming speech translation. In Proceedings of the 2013 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, pages 230–238, Atlanta, Georgia, June. Association for Computational Linguistics.
+[Satija and Pineau2016] Harsh Satija and Joelle Pineau. 2016. Simultaneous machine translation using deep reinforcement learning. Abstraction in Reinforcement Learning Workshop, ICML2016.
+[Sennrich et al.2015] Rico Sennrich, Barry Haddow, and Alexandra Birch. 2015. Neural machine translation of rare words with subword units. arXiv preprint arXiv:1508.07909.
+[Sutskever et al.2014] Ilya Sutskever, Oriol Vinyals, and Quoc V Le. 2014. Sequence to sequence learning with neural networks. In Advances in neural information processing systems, pages 3104–3112.
+[Williams1992] Ronald J Williams. 1992. Simple statistical gradient-following algorithms for connectionist reinforcement learning. Machine learning, 8(3-4):229–256.
+[Yarmohammadi et al.2013] Mahsa Yarmohammadi, Vivek Kumar Rangarajan Sridhar, Srinivas Bangalore, and Baskaran Sankaran. 2013. Incremental segmentation and decoding strategies for simultaneous translation. In IJCNLP, pages 1032–1036.
+[Yu et al.2016] Lei Yu, Jan Buys, and Phil Blunsom. 2016. Online segment to segment neural transduction. arXiv preprint arXiv:1609.08194.
+
+

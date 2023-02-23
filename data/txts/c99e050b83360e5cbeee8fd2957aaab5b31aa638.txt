@@ -1,0 +1,918 @@
+Calibration, Entropy Rates, and Memory in Language Models
+
+Mark Braverman∗
+
+Xinyi Chen† Sham M. Kakade‡
+
+Cyril Zhang¶
+
+Yi Zhang
+
+Karthik Narasimhan§
+
+arXiv:1906.05664v1 [cs.CL] 11 Jun 2019
+
+Abstract
+Building accurate language models that capture meaningful long-term dependencies is a core challenge in natural language processing. Towards this end, we present a calibrationbased approach to measure long-term discrepancies between a generative sequence model and the true distribution, and use these discrepancies to improve the model. Empirically, we show that state-of-the-art language models, including LSTMs and Transformers, are miscalibrated : the entropy rates of their generations drift dramatically upward over time. We then provide provable methods to mitigate this phenomenon. Furthermore, we show how this calibrationbased approach can also be used to measure the amount of memory that language models use for prediction.
+1 Introduction
+Recent advances in language modeling have resulted in signiﬁcant breakthroughs on a wide variety of benchmarks in natural language processing Dai et al. [2018], Gong et al. [2018], Takase et al. [2018]. Capturing long-term dependencies has especially been a major focus, with approaches ranging from explicit memory-based neural networks Grave et al. [2016], Ke et al. [2018] to optimization improvements aimed at stabilizing training Le et al. [2015], Trinh et al. [2018]. In this paper, we address a basic question: how do the long-term dependencies in a language model’s generations compare to those of the underlying language? Furthermore, if there are measurable discrepancies, this leads to the question of whether and how we can use them to improve these models.
+Starting from Shannon’s seminal work that essentially introduced statistical language modeling Shannon [1951], the most classical and widely studied long-term property of a language model is its entropy rate — the average amount of information contained per word, conditioned on the preceding words. A learned model provides an upper bound for the entropy rate of a language, via its cross-entropy loss. The exponential of the entropy rate can be interpreted as the eﬀective support size of the distribution of the next word (intuitively, the average number of “plausible” word choices to continue a document), and the perplexity score of a model (the exponential of the cross entropy loss) is an upper bound for this quantity. In state-of-the-art models trained on
+∗Princeton University, Computer Science Department, email: mbraverm@cs.princeton.edu †Google AI Princeton, email: xinyic@google.com ‡University of Washington, Allen School of Computer Science and Engineering and Department of Statistics, email: sham@cs.washington.edu §Princeton University, Computer Science Department, email: karthikn@cs.princeton.edu ¶Princeton University, Computer Science Department, email: cyril.zhang@cs.princeton.edu Princeton University, Computer Science Department, email: y.zhang@cs.princeton.edu
+1
+
+Model AWD-LSTM [Merity et al., 2017] CNN-LSTM [Jozefowicz et al., 2016] Transformer [Vaswani et al., 2017b] Transformer [Radford et al., 2019]
+
+Corpus PTB GBW GBW
+WebText
+
+Test ppl. 58.3 29.8 28.1 23.7
+
+EntRate 93.1 49.4 34.7 61.2
+
+Table 1: Entropy rate degradations for generations from popular language models. State-of-the-art performance is usually reported via perplexity (one-step prediction loss), but there is a striking blowup in the entropy rates of these models’ long-term generations.
+
+billion-scale corpora, this number ranges between 10 and 30 Melis et al. [2017], Radford et al. [2019]. A natural diagnostic question, with which we begin our work, is whether the long-term generations of these models exhibit the same entropy rates as the underlying languages they are modeling predictively.
+Empirically, and perhaps surprisingly, it turns out that the entropy rate of generated text is substantially higher than the estimate for true text derived from the model’s one-step predictions. As seen in Table 1 (see also Figure 1), this is true for both state-of-the-art LSTMs and Transformers trained on a variety of datasets. As a timely example, the GPT-2 model Radford et al. [2019], the object of much recent attention for its seemingly coherent and on-topic generations, suﬀers a dramatic degradation in its entropy rate, from 23.7 to 61.2. We will defer the details of this experiment to the supplementary material.
+This empirical ﬁnding is notable since the neural attention- and memory-based techniques have been steadily improving on standard metrics like perplexity and, in some cases, even produce remarkably coherent text (often with some heuristics to reject poor generations). That the perplexity of generated text is so much higher than it is under the true distribution suggests that there are signiﬁcant gaps in our current methodologies in accurately learning language models, particularly if we are interested in generating text that globally resembles the modeled language itself.
+Our contributions. The focus of this work is twofold: to improve generations based on any measurement mismatch on a long-term property of the model (e.g. the entropy rate), and to quantify the way a model’s predictions depend on the distant past. Central to both of these is a calibration-based approach, which is utilized in statistics and other areas of machine learning Dawid [1982, 1985], Foster [1991], Zadrozny and Elkan [2002], Platt [1999], Guo et al. [2017], NiculescuMizil and Caruana [2005].
+First, we show that, from a worst-case perspective, even an extremely accurate model (with ε average KL divergence from the true distribution) may have generated text with a substantially diﬀerent entropy rate as compared to the true distribution. Indeed, we show that this worst-case ampliﬁcation may occur for a variety of long-term properties of a probabilistic language model; this is because the one-step KL divergence does not in general provide tight control over the expectation of a bounded function. The observed entropy rate ampliﬁcation (as seen in Table 1) demonstrates that this is not only of theoretical concern. We then describe a calibration procedure to ﬁx this mismatch while simultaneously improving the perplexity of the language model. From a statistical perspective, the procedure is simple, and we discuss approaches to make it computationally eﬃcient.
+Second, we provide a deﬁnition for long-term memory in language models as the mutual information between the models predictions and the distant past in the input. We then provide
+
+2
+
+an upper bound on the amount of this mutual information using calibrated distributions (with a single-parameter exponent). This allows us to estimate the amount of context used by a language model as a function of the distance of past tokens from the current prediction timestep.
+We perform empirical studies to accompany our theoretical results. We ﬁrst use the entropy rate calibration algorithm to ﬁx an LSTM language model, resulting in a drop of around 20 perplexity points in the generated text (so that the entropy rate of the model more accurately matches that of the language itself). Then, we empirically estimate and compare the long-term memory of state-ofthe-art language models. Our insights point towards new ways of assessing (and ﬁxing) language models, especially in terms of their long-term properties, in a manner complementary to existing metrics like perplexity.
+2 Related Work
+Improving language modeling with long-term dependencies. Recent approaches to improving language modeling have focused on several ways to better capture long-term dependencies, from using manually-deﬁned context representations Mikolov and Zweig [2012], Ji et al. [2015], Wang and Cho [2016] or document-level topics Wang et al. [2017] to using LSTM recurrent neural networks with careful initialization Le et al. [2015], auxiliary loss signals Trinh et al. [2018] or augmented memory structures Grave et al. [2016], Ke et al. [2018]. More recent work has demonstrated the applicability of Transformer networks Vaswani et al. [2017a] to the task, potentially side-stepping issues in training recurrent networks (e.g. vanishing/exploding gradients) and scaling to longer contexts Dai et al. [2018], Radford et al. [2018]. All these papers propose either architectural or optimization innovations to improve language model training. In contrast, we deﬁne and measure explicit long-term properties of language models and show that calibrating them correctly can provide improvements to any black-box language model.
+Information-theoretic approaches. While most language models aim to predict a distribution over the next token conditioned on the context, there have been alternative approaches relying on information-theoretic measures. Jost and Atwell [1994] propose a model which makes use of mutual information between word pairs to generate word sequences that retain longer-term dependencies. McAllester [2018] propose a training objective based on mutual information for predictive modeling, and demonstrate its application for phoneme prediction. Clarkson and Robinson [1999] develop a hybrid metric using both perplexity and entropy rate, and show that it correlates better with a downstream metric like word error rate. Such works propose alternative optimization objectives; in contrast, we show how to use information-theoretic measures to improve models with respect to existing objectives like cross-entropy.
+Measuring long-term statistics. Khandelwal et al. [2018] analyze LSTM-based language models and empirically show that such models make use of a ﬁnite context for prediction. Lin and Tegmark [2017] measure mutual information between any two symbols in human languages, and show that it decays with distance, roughly following a power law distribution. Takahashi and Tanaka-Ishii [2018] provide an upper bound for the entropy (character-level) of human languages by training neural language models with various context and data sizes and extrapolating to inﬁnity. While we also make use of measures like entropy and mutual information across longer contexts, our goal is to use these to better calibrate the language model and provably improve its perplexity.
+3
+
+Calibration and integral probability metrics. The idea of matching properties of the models’ predictions to the empirical outcomes, in an online setting, goes back (at least) to the “prequential principle” of Dawid [1982, 1985], with subsequent work in online and game-theoretic settings Foster [1991], Vovk [2001], Kalai et al. [1999]. The idea of improving probability scores is also common in machine learning Zadrozny and Elkan [2002], Platt [1999], Guo et al. [2017], Niculescu-Mizil and Caruana [2005]. The notion of examining the expectation of functions as a metric for the distance between two distributions sometimes goes under the name of integral probability metrics Mller [1997], Sriperumbudur et al. [2009], and this notion is becoming increasingly relevant again in unsupervised learning through the connections to GANs Mroueh and Sercu [2017]. In this work, we directly focus on the KL divergence, where our use of calibration is largely based on basic facts about exponential families Brown [1986].
+
+3 Preliminaries
+
+We ﬁrst deﬁne some useful quantities for our analyses. Let Pr(W1, W2, . . . , WT ) represent the true underlying distribution over T length sequences of words, where the vocabulary is of size M . Let W1:T denote a random sequence of length T , with distribution Pr(W1:T ). For clarity of exposition, we assume that all sequences (i.e. sentences or documents or books) are of equal length T .
+For any distributions D and D over length-T sequences, recall that the entropy H(·), KL-
+divergence, and entropy rate are, respectively, deﬁned by: H(D) := Ew1:T ∼D log D(W1:T1=w1:T ) , KL(D D ) := Ew1:T ∼D log DD((WW11::TT==ww11::TT)) , and EntRate(D) := T1 H(D). Let Pr(W1:T ) denote
+a learned distribution over sequences. In the typical sequential prediction setting, the probabilistic model is implicitly deﬁned by the conditional distributions Pr(Wt|W<t), which are typically eﬃciently computable. It is standard for such a language model to be trained to minimize the cross entropy objective:
+
+CE(Pr
+
+1
+
+Pr) :=
+
+E
+
+T w1:T ∼Pr
+
+T
+
+1
+
+log
+
+t=1 Pr(wt|w<t)
+
+1
+
+1
+
+=
+
+E log
+
+.
+
+T w1:T ∼Pr
+
+Pr(w1:T )
+
+Note that for an accurate language model, we would hope that: CE(Pr Pr) ≈ EntRate(Pr), i.e. the entropy rate of the sequences generated under the learned model is nearly that of the cross entropy of the model (with respect to the true distribution Pr).
+Throughout, we assume that
+
+1
+
+KL(Pr Pr) = CE(Pr Pr) − H(Pr) ≤ ε
+
+(1)
+
+T
+
+holds for some ε. In other words, the (unknown) ε measures the degree of sub-optimality of the learned model, this ε is often referred to as the Bayes regret.
+
+4 Calibration and Entropy Rates
+In this section, we assess the long-term properties of language models when generating text. Speciﬁcally, we quantify the ampliﬁcation in the entropy rate of generations under an ε-accurate
+
+4
+
+eH (LSTM) eH (Transformer)
+
+100 90 80 70 60
+0
+
+100 200 300 400 500 600 700 Generation length t
+
+60 50 40 30
+20 0
+
+100 200 300 400 500 600 700 Generation length t
+
+Figure 1: Entropy of the t-th generated word, conditioned on the past, for two popular language models, interpolating between model’s estimate for the language’s entropy (t = 1) and entropy rate of generations (t → ∞). A perfectly calibrated generative model would exhibit a time-invariant entropy rate (gray dotted lines). Left: LSTM trained on Penn Treebank. Right: GPT-2 Transformer.
+
+model (Eq. 1). We then provide a procedure to ﬁx this ampliﬁcation, without increasing the
+perplexity of the model. Proofs for all statements are provided in the supplementary material. For generality, consider a function f : [M ]T → R, deﬁned on T length sequences. Let the mean
+and variance of f under distribution D be denoted by µD(f ) and σD2 (f )
+
+µD(f ) := E [f (w1:T )],
+w1:T ∼D
+
+σD2 (f ) := E [(f (w1:T ) − µD(f ))2] .
+w1:T ∼D
+
+4.1 Error ampliﬁcation under our model
+
+If our learned model Pr is accurate, we may hope that µPr(f ) ≈ µPr(f ) i.e. that the expected value of f under the true distribution Pr is close to its expected value under our model. We can quantify
+this gap as follows:
+
+Lemma 4.1. (Pinsker’s Inequality Csiszar and K¨orner [2011]) Suppose that for all w1:T , f (w1:T ) ≤ B. Then:
+µPr(f ) − µPr(f ) ≤ B 2KL(Pr Pr) .
+Since this holds for any bounded function, we can obtain the error ampliﬁcation of the entropy rate of Pr simply by choosing f = − log Pr.
+Before we proceed, in order to rule out ampliﬁcation of this entropy rate due to arbitrarily small probabilities (which can blow up − log Pr), it is helpful to deﬁne the γ-mixture distribution as: D(γ) := (1 − γ)D + γUni, where the Uni is the uniform distribution over all M T sequences.
+(ε)
+We will then consider the model Pr , which has only a minor degradation in the cross entropy compared to Pr, and, yet, may have a large ampliﬁcation in the entropy rate.
+
+Corollary 4.2. (Entropy rate ampliﬁcation under generations) Suppose the bound in equation 1 holds. The ε-mixture distribution has KL bounded as:
+
+1
+
+(ε)
+
+1
+
+KL(Pr Pr ) ≤ 1 + ε .
+
+T
+
+T
+
+We have that:
+
+(ε)
+
+1
+
+|CE(Pr Pr ) − EntRate(Pr)| ≤ 1 + ε , and
+
+T
+
+5
+
+(ε)
+
+(ε)
+
+log(1/ε)
+
+|CE(Pr Pr ) − EntRate(Pr )| ≤ 2ε(T + 1) log M +
+
+.
+
+T
+
+This bound shows that, in the worst case, even a small cross entropy may provide little control over the generations under our model (in terms of entropy rate). In fact, for ε = O( T1 ) (which we may hope is an accurate model), the bound is vacuous; the following remark shows this worst case bound is unimprovable, see the supplementary material.
+The above theorems suggest that entropy rate ampliﬁcation is a theoretical possibility in the worst case, which our experiments show is in fact prevalent in pratice. These entropy rate ampliﬁcations are evident from the plots in Figure 1. Regardless of the text corpus or the language model, we observe that the entropy rate under the model’s generations quickly increases with time, indicating that this is a persistent problem even for state-of-the-art language models while generating text.
+
+4.2 Model calibration
+We now describe a procedure to ﬁx this error ampliﬁcation. First, let us deﬁne a distribution Prα such that:
+
+Prα(w1:T ) = exp(αf (w1:T )) · Pr(w1:T ) where Zα = exp(αf (w1:T )) · Pr(w1:T ) . Zα w1:T
+
+We can then recover a calibrated model that does not suﬀer from error ampliﬁcation in f :
+
+Lemma 4.3. (Calibration to f with model improvement) Suppose the variance of f is uniformly bounded in that there exists σ+2 such that the following holds for all α, σP2 rα(f ) ≤ σ+2 . Let α∗ = argminα CE(Pr Prα) . We have
+
+µPr(f ) − µPrα∗ (f ) = 0, and
+
+CE(Pr
+
+Prα∗) ≤ CE(Pr
+
+1 (µ(f ) − µPr(f ))2
+
+Pr) − T
+
+2σ2
+
+.
+
++
+
+Entropy rate calibration. We can now apply the previous result to ﬁx the entropy rate ampliﬁcation seen in Table 1. Note that it is trivial to avoid the entropy rate ampliﬁcation if we were allowed to degrade the quality of our model, in terms of perplexity (e.g. a unigram model does not have this ampliﬁcation. However, we show that it is possible to match the entropy rate without having to sacriﬁce the quality of our model. In fact, we can both improve our model and more accurately match the entropy rate, by ﬁtting a family of one-parameter models.
+Theorem 4.4. (Entropy rate calibration) Suppose equation 1 holds. Algorithm 1 returns a Prα∗ such that: the following calibration property is satisﬁed:
+
+CE(Pr Prα∗) = EntRate(Prα∗).
+
+Furthermore, Prα∗ has entropy close to the true entropy rate as speciﬁed by: 1
+|EntRate(Pr) − EntRate(Prα∗)| ≤ 1 + T ε,
+
+6
+
+Algorithm 1 (Ineﬃcient) Entropy Rate Calibration
+
+(ε)
+1: Input: Model Pr . 2: Deﬁne a model class:
+
+1+α
+
+Prα(w1:T ) = Pr(w1:T )(ε)
+
+/Zα .
+
+3: Fit α∗: α∗ = argminα CE(Pr 4: Return Prα∗
+
+Prα)
+
+and Prα∗ is an improvement over the original model as characterized by:
+
+CE(Pr
+
+Prα∗) ≤ CE(Pr
+
+
+
+(ε)
+
+2
+
+(ε) 1 CE(Pr Pr ) − EntRate(Pr)
+
+Pr ) −  2
+
+log M + log(1/ε)
+
+.
+
+T
+
+This result shows that we simply need a single parameter α to deﬁne a new model class that is a powered up version of our original model. Then, we can ﬁt this α to minimize the cross-entropy of the new model with respect to the true distribution Pr, in order to eliminate the entropy rate ampliﬁcation.
+Even though this algorithm ﬁts only a single parameter, it is not easily implementable since it requires an integration over sequences, at least in its exact form. One future direction would be to a sample based approach. This may be an interesting alternative to ideas like beam search Steinbiss et al. [1994], Ortmanns and Ney [2000], Antoniol et al. [1995], which also aims to minimize a global cost function on sequences that is inconsistent with the token-level perplexity loss used to train the underlying generative model.
+
+Lookahead algorithms. In order to sidestep the computational issues of Algorithm 1, we provide another simple approach based on what can be viewed as a “one-step” lookahead correction (Algorithm 2). Let Wt be a random variable with conditional distribution Pr(·|W<t). H(Wt+1|w≤t) denotes the entropy of this conditional distribution, i.e.
+
+1
+
+H(Wt+1|w≤t) =
+
+E
+
+log
+
+.
+
+wt+1∼Pr(·|w≤t)
+
+Pr(wt+1|w≤t)
+
+Note that H(Wt+1|w≤t) includes the word wt, so we require computing the entropy at time t + 1 when predicting Wt using a learned model.
+For a conditional distribution, D(W1:T ), let us deﬁne:
+
+1T
+
+µ¯D = T
+
+E
+
+E [H(Wt+1|w≤t)]
+
+w<t∼Pr wt∼D(·|w<t)
+
+t=1
+
+Thus, µ¯D is the average of H(Wt+1|w≤t) with respect to a distribution which uses D for sampling the last word Wt (at every timestep). Intuitively, the resulting model Prα with a positive α would suppress sampling words leading to larger entropy but rather encourage words that stablizes the entropy 1-step ahead in the future. Therefore, if our learned language model Pr was accurate, we
+
+7
+
+Algorithm 2 Local Entropy Rate Calibration
+
+(ε)
+
+(ε)
+
+1: Input: Model Pr , where Wt ∼ Pr (·|W<t).
+
+2: Deﬁne a model class:
+
+Prα(w1:T ) = Pα(w1)Pα(w2|w1) . . .
+
+where
+
+Prα(wt|w<t) = Pr(wt|w<t) · exp α · H(Wt+1|w≤t) /Zα.
+
+3: Fit α∗: α∗ = argminα CE(Pr 4: Return Prα∗
+
+Prα)
+
+would hope that: µ¯Pr ≈ µ¯Pr . The following corollary shows that this is achievable, along with improving the model’s perplexity.
+
+Corollary 4.5. Suppose Equation 1 holds. Then, Algorithm 2 returns a Prα∗ such that:
+
+µ¯Pr − µ¯Prα∗ = 0, and
+
+CE(Pr
+
+Prα∗) ≤ CE(Pr
+
+(ε) 1 Pr ) −
+2
+
+µ¯ − µ¯ (ε)
+
+2
+
+Pr
+
+.
+
+log M + log(T1/ε)
+
+This result provides us with Algorithm 2, which is computationally quite tractable. We ﬁrst use the learned model Pr to deﬁne a new model class Prα, which scales Pr by an exponential distribution over the weighted 1-step lookahead entropy H(Wt+1|w≤t). Then, similar to Algorithm 1, we simply ﬁt the single parameter α to minimize the cross-entropy of the new model with respect to Pr, which ﬁxes the entropy ampliﬁcation in the resulting model Prα. We observe this empirically in Figure 2 – our calibration results in a perplexity drop of almost 20 points over long-term generations under an LSTM model. Model and implementation details are in the supplementary material.
+
+Generations from a calibrated model. Table 2 provides sample generations from a calibrated Transformer model trained on the GBW dataset, compared to its original version. Qualitatively, the calibrated generations: (1) are shorter and more concise, and (2) display a better grasp of discourse structure across sentences. More generations are provided in the supplementary material.
+
+5 Calibration and Memory
+Deﬁning a notion of memory in language models is challenging, and multiple equally sensible notions may co-exist. Here we present our choice from ﬁrst principles. Let us say that Wt is a sample from a model at time t, i.e. Wt ∼ Pr(Wt|W<t). Let us also assume that W<t ∼ Pr(W<t). We will deﬁne the memory at gap τ as the mutual information between Wt and the distant past (those words greater than τ steps ago) conditioned on the subsequence Wt−τ:t−1. Precisely,
+Iτ := I(Wt; W<t−τ |Wt−τ:t−1) = H(Wt|Wt−τ:t−1) − H(Wt|W<t) ,
+where we are not explicitly denoting the t dependence in this deﬁnition1.
+1While we may attempt to estimate Iτ for a given t, we can remove the t dependence by either deﬁning this quantity by with an average over t or by using appropriate stationarity assumptions. In our experiments, we average over t.
+
+8
+
+h
+90 80 70
+
+eH (LSTM)
+
+60
+
+original calibrated
+
+0
+
+20
+
+40
+
+60
+
+80 100
+
+Generation length t
+
+Figure 2: Eﬀect of calibrating an LSTM generative model with 1-step lookahead. Blue: entropy
+curve from the setting of Figure 1. Green: entropy measurements after applying local calibration. Intuitively, It can be viewed as how much uncertainty (entropy) in the prediction Wt the model
+is able to reduce by utilizing the deep past W<t−τ in addition to the recent past Wt−τ:t−1. The diﬃculty in estimating this mutual information is due to estimating H(Wt|Wt−τ:t−1), which
+requires the marginalized model Pr(Wt|Wt−τ:t−1). To (even approximately) marginalize a model
+distribution Pr(Wt|W<t) over the deep past W<t−τ is statistically diﬃcult, since it requires the access to a pool of samples of W<t that share an common recent past Wt−τ:t−1. Nevertheless, we now show that it is possible to obtain an upper bound (which is computationally eﬃcient to
+estimate).
+
+Upper bounding mutual information using calibrated models. In the above, we were considering the mutual information between Wt and W<t−τ conditioned on Wt−τ:t−1. Let us now consider a more general setting, where we have a distribution Pr(Z, Y, X) where Z, Y , and X are random variables. We wil eventually consider Z, Y, X to be Wt, Wt−τ:t−1W<t−τ , respectively.
+For distributions D(·|Y, X) and D(·|Y, X) and for α ∈ R, deﬁne
+α
+Dα(Z|Y, X) := D(Z|Y, X) · D(Z|Y, X) /Zα .
+We say that D(·|Y, X) is calibrated to D˜(·|Y, X), if D = Dα=0 is unimprovable in that for all α
+CE(Pr D) ≤ CE(Pr Dα) .
+Note this condition is achievable due to that calibrating a model to D(·|Y, X) involves a one dimensional (convex) estimation problem (over α).
+
+9
+
+Original model Actual results could diﬀer materially from those indicated by these forward-looking statements as a result of various important factors , including , without limitation : changes in general economic and business conditions , including more diﬃcult real estate environments ; [...174 tokens...] risks related to investigations by other companies ; inadequate information systems ; the impact of reduced availability of ; * assumptions upon such companies using such as ours to gauge CNET ’s ﬁnancial condition ; and other factors .
+Bluepoint Games , Inc. is a highly experienced and multi-faceted publisher of licensed virtual worlds for gamers , developers and technology professionals . [...114 tokens...] James Upon , CEO of MyNetSheltetWeb and the three previous Developers of MySQL . Based in Redwood City , California , BlueMountain is the leader in franchise and game development for the massively multiplayer online game .
+
+Calibrated model Actual results could diﬀer materially from those indicated by these forward-looking statements as a result of a variety of factors , including but not limited to ( i ) the risk that the tender oﬀer could close in one or more manner or at all ; ( ii ) risks associated with conducting business in foreign jurisdictions ; ( iii ) diﬃculties in combining some or all of the businesses under one roof ; ( iv ) decreased demand for electricity , natural gas and other energy products , including adverse eﬀects on the pricing of oil and natural gas ; and ( v ) the risks associated with doing business internationally . Bluepoint Games , Inc. is a highly experienced licensing , gaming and entertainment ﬁrm focused on developing the next generation of casual games based on the PlayStation ( R ) BRAVIA family of video game machines for the North American market . Bluepoint is a wholly owned subsidiary of Bluehill ID Holdings L.P.
+
+Table 2: Sample generations from a calibrated, state-of-the-art Transformer model trained on the GBW corpus, seeded with preﬁxes of sentences (in italics) from the holdout validation set. Theorem 5.1. Suppose we have a model Pr(Z|X), and suppose Z ∼ Pr(·|X), where Z is dependent only on X Suppose that Pr is calibrated to Pr. Then we have that:
+
+I(Z; X|Y ) ≤ CE(Pr Pr) − H(Z|Y, X) , where:
+
+CE(Pr
+
+1
+
+Pr) = E E log
+
+.
+
+Y ∼Pr Z∼Pr(·|Y )
+
+Pr(Z|Y )
+
+Memory estimation. We ﬁrst learn another Wt ∼ Pr(·|Wt−τ:t−1), and then calibrate Pr to Pr.
+
+cal
+Corollary 5.2. Suppose Pr (·|W<t) is a model calibrated to Pr(·|Wt−τ:t−1). For a random vari-
+
+able,
+
+Wtcal
+
+∼
+
+cal
+Pr (·|W<t),
+
+we
+
+have
+
+that:
+
+I(Wtcal; W<t−τ |Wt−τ:t−1) ≤ CE(Pr Pr) − H(Wtcal|W<t), where:
+
+CE(Pr
+
+1
+
+Pr) = E log
+
+.
+
+Wt−τ :t∼Pr
+
+Pr(Wt |Wt−τ :t−1 )
+
+This corollary gives us a means to eﬃciently provide upper bounds on the mutual information. The key is that since Pr is eﬃciently computable, we can directly estimate CE(Pr ||Pr) through Monte Carlo estimation. We measure the upper bounds on Iτ of a LSTM model with trained limited-memory models Pr (see details in the supplementary material) and report them in Figure 3. As expected, the memory estimate gradually decays with longer τ , indicating that the models make more use of the recent past to generate text.
+
+10
+
+I upper bound (nats)
+
+0.6 0.4 0.2 0.0 5 10 15 20 25 30
+history length
+
+τ CE(Pr ||Pr) Iτ upper bound α∗
+
+5 4.8144
+
+0.6180
+
+0.003515
+
+10 4.5258
+
+0.4226
+
+-0.01041
+
+15 4.4166
+
+0.2678
+
+-0.00447
+
+20 4.3347
+
+0.2485
+
+-0.02268
+
+25 4.2777
+
+0.2274
+
+-0.01814
+
+30 4.2408
+
+0.2143
+
+-0.02323
+
+Figure 3: Left: Plot of the upper bound on Iτ derived from calibrated models. Right: The measurements of the upper bound on mutual information, the cross entropy of the limited memory model Pr as well as the optimal calibration coeﬃcient α∗ for various time lengths τ . Details of the model used here can be found in the supplementary material.
+6 Conclusion
+
+We have introduced a calibration-based approach to detect and provably correct the discrepancies between the long-term generations of language models and the true distributions they estimate sequentially. In particular, for state-of-the-art neural language models, we have observed large degradations of the entropy rate under iterative generation, and a proposed ﬁrst-order correction which is both computationally tractable and eﬀective. Using the same calibration approach, we have derived estimators for the amount of information extracted by these models from the deep past.
+Aside from the empirical ﬁndings and improvements, we hope that this work will inspire a more principled line of discourse on the quality of long-term generations in language models. It remains an interesting open problem to study other ”future-aware” generation-improving heuristics (beam search, reverse language models, GANs) in this framework of calibration.
+
+Acknowledgments
+S. K. gratefully acknowledges funding from the Washington Research Foundation for Innovation in Data-intensive Discover, the ONR award N00014-18-1-2247, and NSF Award CCF-1703574.
+
+References
+Giuliano Antoniol, Fabio Brugnara, Mauro Cettolo, and Marcello Federico. Language model representations for beam-search decoding. In 1995 International Conference on Acoustics, Speech, and Signal Processing, volume 1, pages 588–591. IEEE, 1995.
+L. D. Brown. Fundamentals of Statistical Exponential Families: With Applications in Statistical Decision Theory. Institute of Mathematical Statistics, Hayworth, CA, USA, 1986. ISBN 0-94060010-2.
+Philip Clarkson and Tony Robinson. Towards improved language model evaluation measures. In Sixth European Conference on Speech Communication and Technology, 1999.
+
+11
+
+Thomas M. Cover and Joy A. Thomas. Elements of Information Theory (Wiley Series in Telecommunications and Signal Processing). Wiley-Interscience, New York, NY, USA, 2006. ISBN 0471241954.
+Imre Csiszar and J´anos K¨orner. Information theory: coding theorems for discrete memoryless systems. Cambridge University Press, 2011.
+Zihang Dai, Zhilin Yang, Yiming Yang, William W Cohen, Jaime Carbonell, Quoc V Le, and Ruslan Salakhutdinov. Transformer-xl: Language modeling with longer-term dependency. 2018.
+A. P. Dawid. The well-calibrated bayesian. Journal of the Am. Stat. Assoc, 77, 1982.
+A. P. Dawid. The impossibility of inductive inference. Journal of the Am. Stat. Assoc, 80, 1985.
+D. P. Foster. Prediction in the worst case. Annals of Statistics, 19, 1991.
+Chengyue Gong, Di He, Xu Tan, Tao Qin, Liwei Wang, and Tie-Yan Liu. Frage: frequency-agnostic word representation. In Advances in Neural Information Processing Systems, pages 1341–1352, 2018.
+Edouard Grave, Armand Joulin, and Nicolas Usunier. Improving neural language models with a continuous cache. arXiv preprint arXiv:1612.04426, 2016.
+Chuan Guo, Geoﬀ Pleiss, Yu Sun, and Kilian Q Weinberger. On calibration of modern neural networks. In Proceedings of the 34th International Conference on Machine Learning-Volume 70, pages 1321–1330. JMLR. org, 2017.
+Yangfeng Ji, Trevor Cohn, Lingpeng Kong, Chris Dyer, and Jacob Eisenstein. Document context language models. arXiv preprint arXiv:1511.03962, 2015.
+Uwe Jost and ES Atwell. Proposal for a mutual-information based language model. In Proceedings of the 1994 AISB Workshop on Computational Linguistics for Speech and Handwriting Recognition. AISB, 1994.
+Rafal Jozefowicz, Oriol Vinyals, Mike Schuster, Noam Shazeer, and Yonghui Wu. Exploring the limits of language modeling. arXiv preprint arXiv:1602.02410, 2016.
+E. Kalai, E. Lehrer, and R. Smorodinsky. Calibrated forecasting and merging. Games and Economic Behavior, 29, 1999.
+Nan Rosemary Ke, Anirudh Goyal, Olexa Bilaniuk, Jonathan Binas, Michael C Mozer, Chris Pal, and Yoshua Bengio. Sparse attentive backtracking: Temporal credit assignment through reminding. In Advances in Neural Information Processing Systems, pages 7651–7662, 2018.
+Urvashi Khandelwal, He He, Peng Qi, and Dan Jurafsky. Sharp nearby, fuzzy far away: How neural language models use context. In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), volume 1, pages 284–294, 2018.
+Quoc V Le, Navdeep Jaitly, and Geoﬀrey E Hinton. A simple way to initialize recurrent networks of rectiﬁed linear units. arXiv preprint arXiv:1504.00941, 2015.
+12
+
+Henry Lin and Max Tegmark. Critical behavior in physics and probabilistic formal languages. Entropy, 19(7):299, 2017.
+Mitchell Marcus, Beatrice Santorini, and Mary Ann Marcinkiewicz. Building a large annotated corpus of english: The penn treebank. 1993.
+David McAllester. Information theoretic co-training. arXiv preprint arXiv:1802.07572, 2018.
+G´abor Melis, Chris Dyer, and Phil Blunsom. On the state of the art of evaluation in neural language models. arXiv preprint arXiv:1707.05589, 2017.
+Stephen Merity, Nitish Shirish Keskar, and Richard Socher. Regularizing and Optimizing LSTM Language Models. arXiv preprint arXiv:1708.02182, 2017.
+Stephen Merity, Nitish Shirish Keskar, and Richard Socher. An Analysis of Neural Language Modeling at Multiple Scales. arXiv preprint arXiv:1803.08240, 2018.
+Tomas Mikolov and Geoﬀrey Zweig. Context dependent recurrent neural network language model. In 2012 IEEE Spoken Language Technology Workshop (SLT), pages 234–239. IEEE, 2012.
+Youssef Mroueh and Tom Sercu. Fisher gan. In I. Guyon, U. V. Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett, editors, Advances in Neural Information Processing Systems 30, pages 2513–2523. Curran Associates, Inc., 2017. URL http://papers.nips.cc/ paper/6845-fisher-gan.pdf.
+Alfred Mller. Integral probability metrics and their generating classes of functions. Advances in Applied Probability, 29:429–443, 06 1997. doi: 10.2307/1428011.
+Alexandru Niculescu-Mizil and Rich Caruana. Predicting good probabilities with supervised learning. In Proceedings of the 22nd international conference on Machine learning, pages 625–632. ACM, 2005.
+Stefan Ortmanns and Hermann Ney. Look-ahead techniques for fast beam search. Computer Speech & Language, 14(1):15–32, 2000.
+John C. Platt. Probabilistic outputs for support vector machines and comparisons to regularized likelihood methods. In Advances in Large Margin Classiﬁers, pages 61–74. MIT Press, 1999.
+Alec Radford, Karthik Narasimhan, Tim Salimans, and Ilya Sutskever. Improving language understanding by generative pre-training. URL https://s3-us-west-2. amazonaws. com/openaiassets/research-covers/languageunsupervised/language understanding paper. pdf, 2018.
+Alec Radford, Jeﬀ Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language models are unsupervised multitask learners. 2019.
+Claude E Shannon. Prediction and entropy of printed english. Bell system technical journal, 30(1): 50–64, 1951.
+Bharath Sriperumbudur, Kenji Fukumizu, Arthur Gretton, Bernhard Schlkopf, and Gert Lanckriet. On integral probability metrics, phi-divergences and binary classiﬁcation. 01 2009.
+13
+
+Volker Steinbiss, Bach-Hiep Tran, and Hermann Ney. Improvements in beam search. In Third International Conference on Spoken Language Processing, 1994.
+Shuntaro Takahashi and Kumiko Tanaka-Ishii. Cross entropy of neural language models at inﬁnitya new bound of the entropy rate. Entropy, 20(11):839, 2018.
+Sho Takase, Jun Suzuki, and Masaaki Nagata. Direct output connection for a high-rank language model. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing, pages 4599–4609, 2018.
+Trieu H Trinh, Andrew M Dai, Thang Luong, and Quoc V Le. Learning longer-term dependencies in rnns with auxiliary losses. arXiv preprint arXiv:1803.00144, 2018.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Information Processing Systems, pages 5998–6008, 2017a.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in neural information processing systems, pages 5998–6008, 2017b.
+V. Vovk. Competitive on-line statistics. International Statistical Review, 69, 2001. Tian Wang and Kyunghyun Cho. Larger-context language modelling with recurrent neural network.
+In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), volume 1, pages 1319–1329, 2016. Wenlin Wang, Zhe Gan, Wenqi Wang, Dinghan Shen, Jiaji Huang, Wei Ping, Sanjeev Satheesh, and Lawrence Carin. Topic compositional neural language model. arXiv preprint arXiv:1712.09783, 2017. Bianca Zadrozny and Charles Elkan. Transforming classiﬁer scores into accurate multiclass probability estimates, 2002.
+14
+
+A Proofs for Section 4
+Proof. (of Lemma 4.1) We have
+
+E [f (w1:T )] − E [f (w1:T )] =
+
+Pr(w1:T ) − Pr(w1:T ) f (w1:T )
+
+w1:T ∼Pr
+
+w1:T ∼Pr
+
+w1:T
+
+≤ Pr −Pr B
+1
+
+≤ 2KL(Pr ||Pr))B
+
+where we have used Holder’s and Pinsker’s inequalities Cover and Thomas [2006].
+
+Proof. (of Corollary 4.2) First observe:
+
+1
+
+1
+
+1
+
+1
+
+log
+
+≤ log
+
+= log
+
+− log(1 − ε) ≤ log
+
++ε
+
+(ε)
+Pr (w1:T )
+
+(1 − ε)Pr(w1:T )
+
+Pr(w1:T )
+
+Pr(w1:T )
+
+and that:
+
+1
+
+MT
+
+log
+
+≤ log .
+
+(2)
+
+(ε)
+Pr (w1:T )
+
+ε
+
+For the ﬁrst claim, we have
+
+1
+
+(ε) 1
+
+Pr(w1:T )
+
+KL(Pr ||Pr ) =
+
+E log
+
+T w ∼Pr
+
+(ε)
+
+T
+
+1:T
+
+Pr (w1:T )
+
+1 ≤ (1 + )ε .
+T
+
+using our assumption in Equation 1. For the second claim, taking f = log (ε) 1 with Lemma 4.1, we have:
+Pr (w1:T )
+
+(ε)
+
+(ε)
+
+CE(Pr ||Pr ) − EntRate(Pr )
+
+which completes the proof.
+
+1 ≤
+T 1 = T
+
+(ε)
+
+1
+
+2KL(Pr ||Pr ) log (ε)
+
+Pr ∞
+
+MT 2ε(T + 1) log ,
+ε
+
+Proof. (of Lemma 4.3) By deﬁnition,
+
+α
+
+1
+
+CE(Pr ||Prα) := CE(Pr ||Pr) −
+
+E [f (w1:T )] + log(Zα) ,
+
+T w1:T ∼Pr
+
+T
+
+we have:
+
+∂CE(Pr ||Prα) 1
+
+∂α
+
+= T
+
+−µPr(f ) + µPrα (f )
+
+The ﬁrst claim now follows from optimality of α∗.
+
+15
+
+For the second claim,
+
+∂2CE(Pr ||Prα)
+
+∂2α
+
+=
+
+=
+
+= By Taylor’s theorem, we have:
+
+1 ∂2 log(Zα) T ∂2α
+
+1 ∂ w1:T f (w1:T ) exp(αf (w1:T )) · Pr(w1:T )
+
+T ∂α
+
+w1:T exp(αf (w1:T )) · Pr(w1:T )
+
+1 σ2 (f ) = 1 σ2 (f ) ≤ σ+2 .
+
+T Prα
+
+T Prα
+
+T
+
+1
+
+α2 σ+2
+
+CE(Pr ||Prα) ≤ CE(Pr ||Pr) − α · T
+
+µPr(f ) − µPrα (f )
+
++· 2T
+
+.
+
+Taking the the α which minimizes the upper bound, leads to the second claim.
+
+Remark A.1. (Sharpness) If ε ≥ T1 , then there exists a problem where the bound is sharp and
+EntRate(Pr) takes on the maximal value of O(log M ). As an example, consider a model Pr, that starts by generating words under the true distribution Pr and has a T1 probability of transitioning into a mode in which it generates words uniformly at random thereafter.
+
+Proof. (of Theorem 4.4) We can apply the previous lemma using
+
+1
+
+f = log
+
+,
+
+Pr(w1:T )
+
+and so our calibration condition implies:
+
+0 = µPr(f ) − µPrα∗ (f ) = − µPr(log Pr) − µPrα∗ (log Pr) .
+
+Now observe that:
+
+T · CE(Pr ||Prα∗) = µPr(−(1 + α∗) log Pr + log Zα∗) = −(1 + α∗)µPr(log Pr) + log Zα∗
+
+and, similarly, These imply:
+
+T · EntRate(Prα∗) = −(1 + α∗)µPr ∗ (log Pr) + log Zα∗ . α
+
+CE(Pr ||Prα∗) − EntRate(Prα∗) = − 1 (1 + α∗) µPr(log Pr) − µ (log Pr) = 0 ,
+
+T
+
+Prα∗
+
+which completes the proof of the ﬁrst claim. The proof of the second claim uses
+
+µ(f ) − µPr(f ) = T CE(Pr ||Pr) − EntRate(Pr) ,
+
+and, by Equation 2, which completes the proof.
+
+σ+2 ≤ T log M + log(1/ε) ,
+
+16
+
+Now we move on to the proof of Corollary 4.5. Suppose f (W≤t) be a function of W≤t. For a conditional distribution, D(W1:T ), let us now deﬁne:
+
+1T
+
+µ¯D(f ) =
+
+E
+
+E [f (w≤t)] .
+
+T t=1 w<t∼Pr wt∼D(·|w<t)
+
+Deﬁne: and
+
+1 Pt,α(wt|w<t) := Zα,t exp(αf (w≤t)) · Pr(wt|w<t)
+Prα(w1:T ) := P1,α(w1)P2,α(w2|w1) . . . .
+
+Lemma A.1. Suppose f ≤ σ+2 . Let
+
+α∗ = argmin CE(Pr ||Prα) .
+α
+
+We have that:
+
+µ¯Pr(f ) − µ¯Prα∗ (f ) = 0
+
+and that
+
+(µ¯(f ) − µ¯ (f ))2
+
+CE(Pr ||Prα∗) ≤ CE(Pr ||Pr) −
+
+σ2Pr .
+
+∗
+
+Proof. (sketch) The proof is identical to that of Lemma 4.3, with the addition of using linearity of
+
+expectation.
+
+B Proofs for Section 5
+
+Proof. (of Theorem 5.1) It is convenient to deﬁne the distribution:
+
+D(Z, Y, X) = Pr(Z|X, Y ) · Pr(Y, X) .
+
+We then have:
+
+I(Z; X|Y ) = H(Z|Y ) − H(Z|Y, X)
+
+by the deﬁntion of the mutual information. The proof consists of showing that:
+
+1 H(Z|Y ) = EY,Z∼D log D(Z|Y ) ≤ CE(Pr ||Pr) .
+
+α
+Let us take Prα(Z|X, Y ) = Pr(Z|X, Y ) · Pr(Z|X) /Zα. The zero gradient condition for the
+optimality at α = 0 implies:
+
+0 = ∂CE(Pr ||Prα)
+
+∂α
+
+α=0
+
+= EX,Y ∼Pr −EZ∼Pr(·|X,Y ) log Pr(Z|Y ) + EZ∼Pr(·|X,Y ) log Pr(Z|Y )
+
+= −EY ∼Pr[EZ∼Pr(·|Y ) log Pr(Z|Y ) + EX,Y ∼Pr[EZ∼Pr(·|X,Y ) log Pr(Z|Y )]
+
+= CE(Pr ||Pr) + EX,Y ∼Pr[EZ∼Pr(·|X,Y ) log Pr(Z|Y )] .
+
+17
+
+This implies:
+
+1 CE(Pr ||Pr) = EX,Y ∼Pr[EZ∼Pr(·|X,Y ) log Pr(Z|Y ) ]
+1 = EX,Y,Z∼D log
+Pr(Z|Y ) 1
+= EY,Z∼D log Pr(Z|Y ) 1
+≥ EY,Z∼D log D(Z|Y )
+= H(Z|Y ) ,
+
+where the last step uses the deﬁnition of Z and Jensen’s inequality.
+
+C Experimental Details
+In this section, we outline the experimental setups used to obtain the empirical results throughout the paper. For the calibration and memory experiments (Table 1 row 1, Figure 1 (left), Figures 2, 3), our base model is a 3-layer LSTM with with 400 embedding dimension and 1150 hidden nodes. We train it on the Penn Treebank (PTB) corpus Marcus et al. [1993], following the setup of Merity et al. [2017] and Merity et al. [2018] for 500 epochs using SGD with batch size 20 and BPTT length 70. The trained base model achieves 64.3 validation perplexity and 58.3 test perplexity.
+The limited-memory models Pr(·|Wt−τ:t−1) used for the memory estimation in Section 5 share the same architecture as our base model while, during training, the hidden states is re-initialized after reading every τ tokens (τ takes value from {5, 15, . . . , 30}).
+Finally, for the entropy rate measurements of larger-scale state-of-the-art language models (Table 1 rows 2-4, Figure 1 (right)), we used the pretrained weights published alongside Jozefowicz et al. [2016], Radford et al. [2019] for rows 2 and 4, while we trained the model using the tensor2tensor framework. The model for row 2 is an LSTM with CNN-embedded inputs, trained on the Google Billion Words (GBW) corpus. The other two are Transformer Vaswani et al. [2017a] models trained on GBW (row 3), and an proprietary corpus derived from a web crawl (WebText; row 4). For GPT2, since the authors have not published training or validation data, we used the text of several New York Times articles as a stand-in validation set; the cross entropy loss is comparable to that reported on the validation set. The entropy rate ampliﬁcation plot in Figure 1 (bottom) corresponds to the setup from row 4.
+To measure the conditional entropy after t generations, we measured the empirical conditional entropy of the t-th word over > 500 independent generations, which were produced by the standard way of iteratively sampling from the next predicted conditional distribution, seeded with groundtruth text up to > 100 random points in the validation set. We used the entropy rate at t = 700 as a proxy for the asymptotic limit in Table 1.
+
+D Additional Generation Samples
+In this section, to provide a better sense of the qualitative eﬀect of calibration, we provide below some additional generations, seeded by 10-token preﬁxes of the holdout (validation) sentences from
+
+18
+
+the Google Billion Words dataset. Here, we used the model we trained for row 3 of Table 1. To identify a failure mode for the uncalibrated model, we selected the seed preﬁxes which resulted in unusually long generations by the uncalibrated model.
+
+Original model Actual results could differ materially from those indicated by these forward-looking statements as a result of numerous factors including the risks associated with the timely and eﬃcient completion and integration of the Temporary Liquidity Guarantee Department ’s supervision into the commercial , open market , solar energy , energy eﬃciency , electric utility transmission , and water demands of residential and business customers , Comcast ’s ability to successfully implement its business plan , timing of completion of the acquisition and the eﬀectiveness of the eﬀorts and strategies involved in the integration of Rhapsody , timing of regulatory and client approvals and availability of key enhancements .
+
+Calibrated model Actual results could differ materially from those indicated by these forward-looking statements as a result of a variety of factors , including but not limited to ( i ) the risk that the tender oﬀer could close in one or more manner or at all ; ( ii ) risks associated with conducting business in foreign jurisdictions ; ( iii ) diﬃculties in combining some or all of the businesses under one roof ; ( iv ) decreased demand for electricity , natural gas and other energy products , including adverse eﬀects on the pricing of oil and natural gas ; and ( v ) the risks associated with doing business internationally .
+
+19
+
+Actual results could differ materially from those indicated by these forward-looking statements as a result of various important factors , including , without limitation : changes in general economic and business conditions , including more diﬃcult real estate environments ; declines in information technology spending ; continued availability of capital and government regulations ; changes in general economic and business conditions ; the possibility that extended unemployment and healthcare policies may change , or may reduce access to quality care services ; failure to obtain adequate and aﬀordable medications ; changes in certain CME / CE product mix ; disruption in CME credit markets ; uncertainty of the outcomes of regulatory investigations of companies in which the Company has an interest ; dependence on suppliers for most of its products ; consolidation among ﬁnancial institutions ; ability to attract and retain skilled personnel ; changes in rapidly changing technology and regulatory environments ; arrogance and complacency among ﬁnancial analysts ; the impact of competition ; inability to retain and motivate senior management ; diﬃculties in the integration of acquired businesses ; the eﬀects of redundancy and loss of key employees ; litigation , including claims and the challenge of insurance practices ; uncertainties relating to litigation ; risks related to investigations by other companies ; inadequate information systems ; the impact of reduced availability of ; * assumptions upon such companies using such as ours to gauge CNET ’s ﬁnancial condition ; and other factors .
+
+Actual results could differ materially from those indicated by such forward-looking statements as a result of various important factors , including those discussed in the company ’s periodic reports that are ﬁled with the Securities and Exchange Commission and available on the SEC ’s website at www.sec.gov.
+
+20
+
+Actual results could differ materially from those indicated by such forward-looking statements as a result of a variety of factors , including our ability to improve our liquidity . Among these factors are changes in the general economy , changes in political and economic conditions , changes in interest rates , changes in technology and implementation of regulatory policies and legislation , the direction of interest rates and changes in the banking industry , changes in loan prepayment activity , changes in consumer preferences and consumer and business lending markets , legislation or public compliance with applicable laws and regulations and changes in the business or regulatory environment . We caution you that there are many uncertainties that could cause actual results to diﬀer materially from those indicated in the forwardlooking statements . Among them are the risk factors that could cause results to differ from those expressed in the forwardlooking statements . These factors include , but are not limited to : general economic and business conditions , including the ﬁnancial markets ; ﬂuctuations in interest rates ; government regulation of the ﬁnancial services industry and possible failures ; planning assumptions and estimates ; potential funding requirements ; unexpected changes in cost increases ( including goodwill impairment ) ; competition ; the potentially lengthy , protracted U.S. recession ; and migratory consumer and business conditions .
+
+Actual results could differ materially from those indicated by these forward-looking statements as a result of various important factors , including those discussed in the ” Risk Factors ” section of the Company ’s Annual Report on Form 10-K for the most recently ended ﬁscal year .
+
+21
+
+Bluepoint Games , Inc. is a highly experienced and multi-faceted publisher of licensed virtual worlds for gamers , developers and technology professionals . The company is based in Vancouver , Canada . BlueKai ’s innovative games are distributed by Devices EA , LLC , and Club Penguin . BlueKai owns and is the exclusive licensor of Scrabulous . BluetoothQ Interactive Inc. has acquired JoShearSwain Media , LLC , a premier developer and publisher of community based games for the handheld game device . For further information , please visit : www.netgear.com / ngcleveld . Sprint ’s fantasy game publisher and Web doing business within the Entertainment Group is James Upon , CEO of MyNetSheltetWeb and the three previous Developers of MySQL . Based in Redwood City , California , BlueMountain is the leader in franchise and game development for the massively multiplayer online game .
+
+Bluepoint Games , Inc. is a highly experienced gaming and entertainment company with several renowned blockbuster franchises including PC , GameHouse ( ( R ) ) GameHouse ( ( R ) ) , Heavenly Sword ( ( TM ) ) , EverQuest ( R ) , Untold Story ( TM ) and EverQuest ( R ) II . Through its wholly-owned subsidiary , Bluehill ID ( R ) , the Bluehill ID logo and tagline are registered trademarks of Bluehill ID Corporation and its subsidiaries in the U.S. and in other countries .
+
+22
+
+Bluepoint Games , Inc. is a highly experienced gaming , entertainment and mobile games company with a vertically integrated portfolio including : games ( TM ) , social network , mobile , casual games , MMORPG , production , distribution , and licensing including its ﬂagship games , SUIT and TIMMERIX ( TM ) , as well as its award-winning gaming , basketball and entertainment network . In order to create a highly integrated , pure and socially responsible Game ( R ) family , Bluepoint has collaborated with Amplify Systems International , Inc. on various titles for PlayStation ( R ) 2 , PLAYSTATION 3 ( R ) 5 , Wii ( TM ) 3 , PS3 , Wii ( TM ) ( and PS3 titles ) as well as PC games for PC , PSP , POOL , Wii ( TM ) ( and successor title ) and IP ( R ) , in addition to its focused gaming , entertainment and communication services . BlueBay ’s exclusive licensee worldwide licensee of the Bluepoint ( TM ) ZMFAO Gateway series , it is the world ’s leading portable gaming , PC and mobile phone company . For more information , see UNK , Inc. and ” Oakpoint : ZWC ’s Community Health Business Development Center . Bluepoint Games , Inc. is a highly experienced , innovative entertainment sports gaming company whose products and services are used by some of the most recognized and respected names in the world of gaming including : Pokemon , Macau ( Valve ) , Quattro , Super Smash Bros. , Good Neighbor Games , IGN Games , Vail Resorts , Kania ( Ocean Spray , Pemberton and Roatenham ) , PURE Holdings , TeenNick , National Amusements , SEGA Games , Cirrus ( Aircraft ) and www.netapool.com.
+
+Bluepoint Games , Inc. is a highly experienced licensing , gaming and entertainment ﬁrm focused on developing the next generation of casual games based on the PlayStation ( R ) BRAVIA family of video game machines for the North American market . Bluepoint is a wholly owned subsidiary of Bluehill ID Holdings L.P.
+Bluepoint Games , Inc. is a highly experienced player in the growing genre of casual games for both casual and active gaming enthusiasts . Bluepoint is an early stage Company with a signiﬁcant following among youth and adults in Europe and the United States with an impressive track record in global on-line gaming opportunities .
+
+23
+
+Nursing Homes : Genworth ’s 2009 Cost of Care Survey , conducted by the Robert Wood Johnson Foundation and released today , reveals the extent to which members of the U.S. population adheres to practices recommended since 1995 , including : a rolling three-hour ” Python for Life ” that fell asleep from 11 p.m. to 2 a.m. , sleep time from 11 p.m. to 3 a.m. , spare time from 8 a.m. to 9 p.m. , and use of state-of-the art non-invasive technologies . A remodeling and refurbishment of hospital facilities is underway as the nation ’s economy begins to gain momentum . Similar to the previous years , Thinking About Health - Hear how health plans are working to address various congressional proposals to advance best practices in patient care and provide greater accountability , advocacy and transparency to consumers . Nursing Homes : Genworth ’s 2009 Cost of Care Survey is based on a doubleblind , randomized , double-blind , placebo-controlled survey which involved an assessment of the cost-eﬀectiveness of healthcare associated with an adequate diet and regular physical activity compared to its managed-care counterparts . The margin of error for this survey is + / - 3.3 percentage points at the 95 percent level of conﬁdence . Nursing Homes : Genworth ’s 2009 Cost of Care Survey , conducted by CareScout ( R ) and published in the April 2009 issue , evaluated ﬁndings from the 10-year , nearly 900,000-member Specialty Health Management Association ’s more than 6,000 professionals living in the United States .
+
+Nursing Homes : Genworth ’s 2009 Cost of Care Survey is based on interviews with 516 family , friends and neighbors of insured and self-employed people conducted from Jan .
+Nursing Homes : Genworth ’s 2009 Cost of Care Survey , conducted by Harris Interactive , performed signiﬁcantly worse than a control group of its peers who provided care but were not able to oﬀer health care to their employees .
+Nursing Homes : Genworth ’s 2009 Cost of Care Survey includes a series of health and medical cost reports on more than 100 home medical equipment and related products , including more than 3.9 million units of durable medical equipment . IBC ’s cost of more than $ 100 billion is a signiﬁcant portion of Medicare spending on home health care .
+
+Table 3: More generations from a state-of-the-art Transformer model trained on GBW, seeded with preﬁxes of sentences from the holdout validation set.
+
+24
+
+

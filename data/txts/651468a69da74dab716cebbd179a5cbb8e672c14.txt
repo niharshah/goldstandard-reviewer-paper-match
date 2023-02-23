@@ -1,0 +1,1027 @@
+Self-Imitation Learning from Demonstrations
+
+George Pshikhachev
+JetBrains Research georgii39@gmail.com
+
+Dmitry Ivanov
+JetBrains Research dimonenka@mail.ru
+
+Vladimir Egorov
+JetBrains Research vladimirrim98@gmail.com
+
+Aleksei Shpilman
+JetBrains Research alexey@shpilman.com
+
+arXiv:2203.10905v1 [cs.LG] 21 Mar 2022
+
+Abstract
+Despite the numerous breakthroughs achieved with Reinforcement Learning (RL), solving environments with sparse rewards remains a challenging task that requires sophisticated exploration. Learning from Demonstrations (LfD) remedies this issue by guiding the agent’s exploration towards states experienced by an expert. Naturally, the beneﬁts of this approach hinge on the quality of demonstrations, which are rarely optimal in realistic scenarios. Modern LfD algorithms require meticulous tuning of hyperparameters that control the inﬂuence of demonstrations and, as we show in the paper, struggle with learning from suboptimal demonstrations. To address these issues, we extend Self-Imitation Learning (SIL), a recent RL algorithm that exploits the agent’s past good experience, to the LfD setup by initializing its replay buffer with demonstrations. We denote our algorithm as SIL from Demonstrations (SILfD). We empirically show that SILfD can learn from demonstrations that are noisy or far from optimal and can automatically adjust the inﬂuence of demonstrations throughout the training without additional hyperparameters or handcrafted schedules. We also ﬁnd SILfD superior to the existing state-of-the-art LfD algorithms in sparse environments, especially when demonstrations are highly suboptimal.
+1 Introduction
+Deep Reinforcement Learning (RL) algorithms have recently achieved multiple breakthroughs in solving games (Mnih et al. 2015; Moravcˇík et al. 2017; Berner et al. 2019; Jaderberg et al. 2019; Brown et al. 2020), hard visuomotor (Levine et al. 2016) and manipulation (Gu et al. 2017) tasks, but some of these algorithms additionally rely on incorporating information from human demonstrations (Silver et al. 2016; Vinyals et al. 2019). Finding the optimal solution requires tremendous amount of environment interactions, which makes RL algorithms costly and dependent on sophisticated exploration techniques. This is especially true for environments with sparse rewards where encountering a positive reward requires a long and precise sequence of actions. An alternative approach is to additionally leverage a set of expert demonstrations, which has shown to help with exploration difﬁculties and provide magnitudes of improvement in learning speed and performance. This approach is known in the literature as Learn-
+github.com/jbr-ai-labs/silfd
+
+ing from Demonstrations (LfD) (Atkeson and Schaal 1997; Schaal and others 1997).
+LfD algorithms can be attributed to one of the three categories based on the technique to incorporate demonstrations. The ﬁrst technique is to treat demonstrations as additional learning references by placing them in the experience replay buffer (Hester et al. 2018; Vecerik et al. 2017; Gao et al. 2018; Nair et al. 2018; Paine et al. 2019). The second technique is to optimize a mixture of reinforcement and imitation objectives by introducing either additional rewards (Kang, Jie, and Feng 2018; Zhu et al. 2018; Zolna et al. 2019; Brys et al. 2015; Hussenot et al. 2020), loss terms (Hester et al. 2018; Rajeswaran et al. 2017; Nair et al. 2018), or hard constraints (Jing et al. 2020). The third technique is to initialize agent’s parameters with supervised (Silver et al. 2016; Rajeswaran et al. 2017; Scheller, Schraner, and Vogel 2020) or imitation (Cheng et al. 2018) pretraining. Despite the impressive results on a variety of problems, modern algorithms typically assume access to high-quality demonstrations and, as our experiments conﬁrm, degrade when demonstrations are noisy or suboptimal. Furthermore, these algorithms rely on additional techniques and hyperparameters to properly balance between learning from agent and expert experience.
+Self-Imitation Learning (SIL) (Oh et al. 2018) is a recent RL algorithm that imitates agent’s past positive experience while ignoring negative experience. SIL has shown to ﬁt particularly well in environments with sparse rewards where it can mimic complex behaviour required to reach the reward. Still, encountering the reward in the ﬁrst place can be problematic, especially when using naive exploration. In this paper we show that SIL can greatly beneﬁt from expert demonstrations by alleviating the need to encounter positive experience and propose Self-Imitation Learning from Demonstrations (SILfD).
+The idea behind SILfD is to initialize the experience replay buffer with demonstrations. While similar ideas are used in algorithms like DQfD (Hester et al. 2018) and DDPGfD (Vecerik et al. 2017), we argue that SIL is a natural choice for the LfD setting. The focus on positive experience and the prioritization mechanism ensure that SILfD selects the most useful demonstrations if their quality varies, forgoes learning from suboptimal demonstrations when they become obsolete, and dynamically balances between learning from
+
+(a) SILfD – for demonstrations with rewards
+
+(b) SILfBC – for demonstrations without rewards
+
+Figure 1: Schematic architectures of the proposed algorithms. The agent is represented by the policy πsil trained with SelfImitation Learning. a) SILfD. The replay buffer that stores the agent experience is initialized with a set of expert demonstrations. The agent learns from both its own experience and the demonstrations. b) SILfBC. First, an auxiliary policy πbc is trained with Behavioural Cloning to mimic the expert based on a set of demonstrations. Then, the replay buffer is initialized with the experience of the auxiliary policy. The agent learns from both its own experience and the experience of the auxiliary policy.
+
+agent and expert experience based on its current usefulness. Furthermore, SILfD does not introduce any new hyperparameters related to demonstrations and can learn from as few as one demonstration. Additionally, we propose SILfBC, an extension of SILfD to the cases where the rewards are not observed in demonstrations, which can be especially relevant when demonstrations are collected by a human expert.
+We compare SILfD with the existing LfD algorithms in several environments: a toy hard-exploration environment Chain (Strens 2000); four DeepMind Control Suite tasks (Tassa et al. 2018) with continuous actions and sparsiﬁed rewards; and Pommerman environment (Resnick et al. 2018) with procedural map generation. Experiments show that both SILfD and SILfBC outperform the existing state-of-the-art LfD algorithms, especially when demonstrations are highly suboptimal.
+
+2 Background and Notations
+
+2.1 Reinforcement Learning
+
+We consider the standard Markov Decision Process S, A, r, T, γ , where
+
+• S denotes the space of states s, A denotes the space of actions a,
+
+• r : S × A → R denotes the reward function,
+
+• T : S × A → ∆(S) denotes the transition function, where ∆ denotes probability distribution,
+
+• γ ∈ (0, 1) denotes the discount factor.
+
+• Further, Rt =
+
+∞ n=t
+
+γn−trn
+
+denotes
+
+return,
+
+where
+
+sub-
+
+scripts t and n denote time steps,
+
+• πθ : S → ∆(A) denotes policy parameterized by θ,
+
+• V (s)
+
+=
+
+Eπθ [Rt|st = s], Q(s, a)
+
+=
+
+Eπθ [Rt|st = s, at = a], and A(s, a) = Q(s, a) − V (s)
+
+respectively denote value, Q-value, and advantage
+
+functions.
+
+Advantage-Actor-Critic (A2C) (Mnih et al. 2016) is one of the most prevalent RL frameworks where the Actor chooses actions in the environment by predicting policy in a given state while the Critic evaluates the state to aid the Actor’s learning. Proximal Policy Optimization (PPO) (Schulman et al. 2017) is based on the A2C framework and focuses on staying within a trust region during the updates of policy parameters.
+
+2.2 Imitation Learning
+The purpose of Imitation Learning (IL) is to train a policy that mimics expert behaviour, the samples of which are stored in a buffer of demonstrations D = (s, a). Generative Adversarial Imitation Learning (GAIL) is a recent algorithm that trains two adversarial models: discriminator and generator (Ho and Ermon 2016). The discriminator is a binary classiﬁer that distinguishes the generated and the expert transitions, whereas the generator constitutes the policy and tries to confuse the discriminator. The version of GAIL with a weighted objective denoted as wGAIL is the state-of-the-art in IL from suboptimal demonstrations (Wang et al. 2021). This algorithm is based on an observation that in the case of demonstrations being of diverse quality, the better demonstrations, which tend to be more consistent than the potentially noisy suboptimal behaviour, should be weighted higher. This relative consis-
+
+tency can be measured as the conﬁdence of the discriminator’ predictions.
+Similarly to IL, the ofﬂine RL aims to train an agent given a sample of experience, but prohibits interactions with the environment. Behavioral Cloning (BC) is a classic ofﬂine RL algorithm that trains a policy to predict the demonstrated action for a given state by maximizing log-likelihood (Pomerleau 1991). Decision Transformer (DT) can be seen as a modern analogue to BC (Chen et al. 2021) This model treats a projection of a past state-action pair and a desired return as a token. A casually masked sequence of such tokens representing past trajectory is passed through several attention layers and a linear decoder to predict an action that leads to the desired return in a given state. DT performs at least comparably with ofﬂine TD-based algorithms and BC and is able to extrapolate to returns beyond those provided during training.
+
+2.3 Learning from Demonstrations
+Unlike IL, Learning from Demonstrations (LfD) assumes both the reward signal r and a buffer of demonstrations D = (s, a, r) to be available. Typically, LfD algorithms use demonstrations to increase sample efﬁciency and aid exploration in environments with sparse rewards. (Hester et al. 2018) propose DQfD which extends DQN (Mnih et al. 2015) to the LfD setup by initializing the replay buffer with demonstrations, providing demonstrations with a priority bonus, pretraining Q-network ofﬂine, mixing 1-step and n-step losses, and regularizing the network with an auxiliary supervised loss. As an analogue of DQfD for continuous control, (Vecerik et al. 2017) propose DDPGfD by applying similar modiﬁcations to the critic of DDPG. As an alternative approach, POfD (Kang, Jie, and Feng 2018) enforces occupancy measure matching between the agent and the expert by shaping the reward with the predictions of a GAIL-like discriminator. Similar to POfD ideas are employed in (Zhu et al. 2018; Zolna et al. 2019). The state-of-the-art in LfD is the unnamed method from (Jing et al. 2020) that we denote as TRPOfD due to it being based on Trust-Region Policy Optimization (Schulman et al. 2015). TRPOfD takes a similar to POfD route of guided exploration, but instead of optimizing a mixed reward it introduces a hard constraint on the divergence from the expert policy that is relaxed overtime. Finally, supervised pretraining from demonstrations with BC is routinely used to assist solving complex tasks, e.g. Go (Silver et al. 2016) and Minecraft (Scheller, Schraner, and Vogel 2020).
+
+2.4 Self-Imitation Learning
+SIL (Oh et al. 2018) aims to reproduce agent’s past good decisions based on the experience stored in a replay buffer B = (s, a, r). The algorithm alternates between the standard on-policy update of A2C or PPO and the off-policy update that minimizes A2C loss with clipped advantages:
+
+Lspiollicy = −EB[log πθA+φ (s, a)] − αH(πθ)
+
+(1)
+
+Lsviallue = EB[A+φ (s, a)]2
+
+(2)
+
+where θ and φ are the parameters of the Actor and the Critic, (·)+ = max(·, 0) ensures that only good transi-
+tions are considered for updates, advantage is estimated as Aφ(s, a) = R − Vφ(s), H(πθ) = Eπθ [− log πθ(a|s)] denotes the entropy of the policy, and α ≥ 0.
+(Oh et al. 2018) theoretically justify SIL by connecting it
+to the lower-bound soft Q-learning, an algorithm that approximates the lower bound of the optimal soft Q-value Q∗ by
+minimizing:
+
+Llb = EB[(Rµ − Qφ(s, a))+]2
+
+(3)
+
+where Rtµ = rt +
+
+∞ n=t+1
+
+γn−t(rn
+
++
+
+αHn(µ))
+
+is
+
+the
+
+entropy-regularized return. Speciﬁcally, the authors show
+
+that minimizing Llb is equivalent to minimizing Lspiollicy and
+
+Lsviallue when α → 0. To improve training efﬁciency, SIL uses prioritized replay buffer (Schaul et al. 2016).
+
+3 Self-Imitation Learning from Demonstrations
+While SIL shines in exploiting past good experience, encountering such experience can be problematic, especially in sparse environments. An alternative source of good experience can be a set of expert demonstrations D. As an extension of SIL to the LfD setting, we propose SIL from Demonstrations (SILfD) based on one simple modiﬁcation of the original SIL: the experience replay buffer is initialized with demonstrations D that are preserved in the buffer throughout the training (Fig. 1a). The policy and value losses are accordingly modiﬁed:
+
+Lspiollicy = −EB∪D[log πθA+φ (s, a)] − αH(πθ) (4)
+
+Lsviallue = EB∪D[A+φ (s, a)]2
+
+(5)
+
+3.1 Properties of SILfD
+Despite its simplicity, the proposed method has several properties that are desirable from LfD algorithms. Speciﬁcally, SILfD discerns useful experience in demonstrations and automatically adjusts the effect of demonstrations as the agent improves, which is crucial for dealing with noise in the demonstrations and for outperforming the expert. Below we elaborate on the origin and the implications of these properties in SILfD and discuss whether the existing algorithms have these properties. We experimentally verify these properties of SILfD in Section 5.
+Discerning useful demonstrations. In order to exploit demonstrations, the existing LfD algorithms rely on additional techniques and hyperparameters that control their inﬂuence. The examples are the priority bonus for demonstrations in (Hester et al. 2018; Vecerik et al. 2017; Paine et al. 2019), the supervised loss term in (Hester et al. 2018), the reward for imitation in (Rajeswaran et al. 2017; Kang, Jie, and Feng 2018; Zhu et al. 2018; Hussenot et al. 2020), the hard constraint on imitation in (Jing et al. 2020). However, this approach forces the agent to balance the original and the imitation goals and may prevent the agent from
+
+reaching the optimal policy. A particular scenario where this approach may fail is the setting of noisy demonstrations, i.e. when the demonstrated behaviour is inconsistent and of varied quality. Overdependence on such demonstrations without discerning the useful experience may hinder the ﬁnal performance.
+Our algorithm is different from the existing LfD algorithms in that it treats demonstrations as additional learning references identical to the agent’s own experience and does not require additional hyperparameters to control the inﬂuence of the demonstrations. In the setting of noisy demonstrations, the potentially useless experience (that corresponds to negative advantages) has null contribution to the loss function (4) used in SILfD, while the prioritization mechanism ensures that such demonstrations are not sampled from the buffer at all. As a result, the agent only learns from useful demonstrations even if they are diluted with useless experience. Our experiments in Chain (Section 5.1) show that SILfD is unique among the LfD algorithms to possess this property.
+Automated scheduling. Another challenge for the LfD algorithms is the setting of suboptimal expert, i.e. when its experience is consistent and useful but can be improved upon. In this setting, biasing the agent’s goals towards expert imitation may prevent the agent from outperforming the expert. As (Jing et al. 2020) notice, efﬁciently dealing with this challenge requires to anneal the effect of demonstrations throughout the training, so that the expert behaviour could be consistently replicated without limiting further exploration. However, applying this technique to their or other existing LfD algorithms requires hand-crafted schedules and additional hyperparameter tuning. In contrast, SILfD automatically adjusts the effect of the demonstrations throughout the training depending on their current usefulness. Speciﬁcally, as the agent improves and the value function estimates increase, the contribution of demonstrations to the loss function (4) decreases, whereas the agent’s own experience becomes more useful. As a result, SILfD starts ignoring obsolete demonstrations once the agent performs on par with the expert. We conﬁrm the ability of SILfD to consistently outperform the suboptimal expert in our experiments in DMC and report the schedules of the sampling probability of demonstrations discovered by SILfD in Section 5.2.
+3.2 Demonstrations without rewards
+A drawback of SILfD is the assumption that the rewards are observed in demonstrations. This limits applicability of SILfD in the most interesting cases where demonstrations are collected by a human expert, possibly optimizing a different reward or acting in a different environment (Ziebart et al. 2008; Chentanez et al. 2018; Scheller, Schraner, and Vogel 2020; Pearce and Zhu 2021). To mitigate this drawback, we modify SILfD when the rewards are unavailable in demonstrations. Instead of directly ﬁlling the replay buffer with demonstrations, we propose to ﬁrst train BC (or other IL / ofﬂine RL algorithm) to mimic demonstrations and then initialize the buffer of SIL with its experience (Fig. 1b). We denote this modiﬁcation as SILfBC. Additionally, we explore a variation of SILfBC where the parameters of the Actor of SIL are initialized via pretrained BC instead of the replay
+
+Figure 2: Illustration of Chain environment
+buffer, which we denote as BCSIL.
+3.3 Limitations of SILfD
+We highlight two of the possible problems with our approach: value overestimation and overdependence on the reward in demonstrations.
+Overestimation of the lower-bound value by critic can occur for several reasons. First, stochasticity of policy or environment dynamics can cause high variance of return distribution in a given state, making critic estimate the highest rather than the expected return. This can be partially mitigated by using generalized SIL with n-step update (Tang 2020). Second, since value approximations for all states are conditioned on the same vector of parameters φ, for arbitrary states s1 and s2, updating φ to increase Vφ(s1) can increase Vφ(s2) as well, even if the latter is already tight. Third, naive initialization of φ can cause overestimation of the lower bounds in some states before the training even begins. While value overestimation is not speciﬁc to SILfD, it is partially alleviated in the original SIL by alternating with on-policy updates that can decrease overestimated values. In contrast, the issue can be exaggerated in SILfD: if demonstrations contain states that the agent does not reach, the value estimates of these states may rise uncontrollably.
+A distinctive feature of SILfD is prioritization of demonstrations with high returns. While this feature makes SIL robust to suboptimal demonstrations, it can also backﬁre if demonstrations contain useful behaviour that does not reach any reward. For example, consider the task of stacking three cubes by a robot manipulator. If a demonstration of successfully stacking three cubes is provided, it will be used by SILfD to recover the demonstrated behaviour. However, if a demonstration of only stacking two cubes is provided and no reward is achieved, it will be deemed useless and ignored by SILfD. This can be mitigated by using generalized SIL in which the usefulness of demonstrations is not static, i.e. a transition can have a high priority due to leading to a state with a high value, even if no reward is observed.
+
+4 Experimental Procedure
+4.1 Environments
+We have designed the experiments with the following desiderata in mind. First, SILfD should be tested in both discrete and continuous environments. To this end, we have chosen Pommerman and Chain as discrete environments and four DeepMind Control Suite tasks as continuous environments. Second, environments should have sparse rewards since in this setting demonstrations are the most helpful. While rewards in Chain and Pommerman are already sparse, we have additionally sparsiﬁed the rewards in DMC. Third, demonstrations should be imperfect to test both the robustness of algorithms and their ability to surpass the expert. To this end, we vary the proportion of suboptimal demonstrations mixed with one optimal demonstration in Chain and use a suboptimal expert in DMC. While the expert always wins in Pommerman, procedural map generation requires the agent to generalize beyond copying the expert.
+Chain (Strens 2000) is a simple but popular exploration benchmark (Osband et al. 2016; Osband, Aslanides, and Cassirer 2018). The environment represents a square grid where the agent starts at the upper-left corner, its goal is to reach the bottom-right corner, and its actions are to move diagonally either to the lower-left cell or to the lower right cell. In our modiﬁcation, the agent is penalized for moving right but receives a signiﬁcant positive reward that exceeds any achievable sum of penalties by 100 when reaching the bottom-right corner. Additionally, if the agent is located on the left edge of the grid and steps left, it simply moves one cell down and does not receive a penalty. Without speciﬁc exploration strategies or relying on demonstrations, standard RL algorithms cannot ﬁnd the positive reward and converge to the policy that avoids penalties by always moving left. We record one optimal demonstration where the expert only moves right and dilute it with n ∈ [0, 99] adversarial demonstrations where the expert only moves left. We ﬁx the size of the map at 40x40.
+DeepMind Control Suite (Tassa et al. 2018) is a set of popular benchmarks with continuous control. For our experiments, we select Cartpole Swing Up, which is a classic task where the agent needs to balance an unactuated pole by moving a cart, and three locomotive tasks: Cheetah Run, Walker Run and Hopper Hop, where the agent is supposed to control and to move forward a speciﬁc robot. In order to make exploration more challenging, we sparsify the rewards in all environments, the details of which are reported in the Appendix. We collect 25 suboptimal demonstrations with similar score in each environment. The details about the demonstrations are also reported in the Appendix.
+Pommerman (Resnick et al. 2018) is a challenging multi-agent environment with discrete control and highdimensional observations. We adapt the single-agent regime proposed in (Barde et al. 2020) where the agent needs to defeat a single random opponent. Similarly to (Barde et al. 2020), we use the champion solution of FFA 2018 competition (Zhou et al. 2018) to gather 300 demonstrations. However, we do not modify the original environment used in the competition, including its procedural generation. This
+
+ampliﬁes the difﬁculty for the algorithms as they have to generalize to unseen maps. Furthermore, the only reward signal the agent receives is +1 for defeating the opponent or -1 for being eliminated.
+4.2 Algorithms
+Each algorithm is tuned in each environment for 100 runs, each run repeated 2-3 times. The tuning procedure and the selected hyperparameters are reported in the Appendix.
+SILfD, SILfBC, BCSIL. Our algorithms are implemented according to Section 3. In SILfD, the replay buffer is initialized with demonstrations. In SILfBC, the buffer is instead initialized with experience generated by pretrained BC. In BCSIL, a variation of SILfBC, instead of modifying the buffer, the weights of SIL are initialized as the weights of pretrained BC. Online updates of SIL are based on PPO.
+SIL. Since vanilla SIL (Oh et al. 2018) does not leverage demonstrations, comparing it with our algorithms highlights the beneﬁts of demonstrations in sparse environments.
+BC. This is a classic ofﬂine RL approach based on supervised learning that predicts a demonstrated action in a given state (Pomerleau 1991). Since BC ignores rewards, it is unlikely to outperform the expert.
+GAIL and POfD. GAIL (Ho and Ermon 2016) is a modern IL algorithm that jointly trains a generator (policy) and a discriminator (reward predictor). POfD (Kang, Jie, and Feng 2018) is an extension of GAIL to the LfD setting that trains an Actor-Critic algorithm on a mixture of environmental and imitation rewards: r = (1 − λ1)renv + λ1rim, λ1 ∈ [0, 1], where the imitation reward is predicted by a GAIL-like discriminator. As an Actor-Critic algorithm we use PPO. Because annealing the effect of suboptimal demonstrations may improve the performance, we also evaluate a version of POfD marked as POfD-sc with a linear scheduling of λ.
+wGAIL and wPOfD. wGAIL (Wang et al. 2021) is a weighted modiﬁcation of GAIL and the state-of-the-art in IL from suboptimal demonstrations. We additionally propose and evaluate its straightforward extension to the LfD setting, denoted as wPOfD, where the same mixture of rewards as in POfD is optimized, but the imitation reward is predicted by a wGAIL-like discriminator.
+DQfD and DDPGfD. Similarly to SILfD, DQfD (Hester et al. 2018) and DDPGfD (Vecerik et al. 2017) store demonstrations in the replay buffer but apply several additional heuristics. Our implementations of DQN and DDPG are based on RLlib framework (Liang et al. 2018).
+TRPOfD. The method proposed in (Jing et al. 2020) that we denote as TRPOfD is the state-of-the-art in the RL from suboptimal demonstrations. The algorithm imposes a hard constraint on the divergence from the expert policy that is relaxed overtime. Our implementation is based on a public implementation of TRPO.1
+Decision Transformer. Decision Transformer (DT) is a recent application of transformers to ofﬂine RL based on a framework that casts RL as conditional sequence modelling (Chen et al. 2021). We use the authors’ implementation.2
+1github.com/ikostrikov/pytorch-trpo 2github.com/kzl/decision-transformer
+
+Figure 3: Results in Chain. We evaluate six experimental settings where one optimal demonstration is mixed with a different number of adversarial demonstrations. The maximum reward in each setting equals 100. In the table, the rows represent the settings and the columns represent the algorithms. On the plot, Y-axis measures the total score over the settings, each represented by a bar of different color. Each experiment, i.e. an algorithm in a setting, is repeated for ﬁve seeds. Performance in each experiment is evaluated as the average over the seeds and over 100 episodes within each seed. The min-max spread of the performance within the seeds is reported for each experiment as a conﬁdence interval, centered vertically at the average over the seeds and ordered horizontally in the increasing number of demonstrations. The algorithms are ordered in the decreasing summarized performance. The perfect scores are highlighted with bold font.
+
+5 Experimental results
+In this section, we ﬁrst compare our methods with modern LfD, IL, and ofﬂine RL algorithms in the settings of noisy and suboptimal demonstrations, and then further explore the properties of SILfD.
+5.1 Comparison to existing algorithms
+Chain. The results are presented in Figure 3. In these experiments, we dilute one optimal expert trajectory with adversary demonstrations.
+We ﬁnd that only our algorithms and DT perform consistently in all settings. For SILfD and SILfBC, this points towards their robustness to the useful demonstrations being diluted. Furthermore, for SILfBC the performance of BC is crucial. While overall BC approximates the expert well, in the hardest setting its score is close to 0, making its experience almost always useless. However, even a rare successful episode is sufﬁcient for SILfBC. BCSIL also leverages pretrained BC successfully but is not as stable in harder settings. Regarding DT, its ﬂawless performance is expected since it is designed to distinguish demonstrated behaviours that lead to different returns.
+The performance of the existing LfD algorithms falls off in harder settings. TRPOfD performs the best among them as it solves the easier settings consistently. However, the two hardest settings are only occasionally solved: the constraint on the divergence from the expert policy may initially force the agent to prioritize going left, which may persist even as the constraint relaxes due to the lack of the experience of going
+
+right. POfD and DQfD outperform the expert in most settings but follow the same trend of performing worse with the increased number of adversarial demonstrations. The weighted version wPOfD fails to outperform even the original POfD. Contrary to our expectations, scheduling the reward mixture coefﬁcient negatively affects POfD and wPOfD, which might be due to the objectives becoming inconsistent. These results support our discussion in Section 3.1 about the existing algorithms having difﬁculties with discerning the usefulness of demonstrations.
+Finally, the IL algorithms GAIL and wGAIL fail to even replicate the expert performance, which might be due to the adversarial training being unstable in the multi-modal regimes. Regarding wGAIL, while the algorithm is designed for suboptimal demonstrations, it relies on the optimal part of demonstrations being more consistent, whereas in our Chain experiments both optimal and adversarial demonstrations are deterministic and hence equally consistent.
+DMC. The results are presented in Table 1. Overall, our methods achieve the best results across the environments. We hypothesize that the automated scheduling is crucial for their performance. LfD algorithms without scheduling have to compromise between exploiting demonstrations early in the training and limiting their ﬁnal performance. On the other hand, simple hand-crafted schedules can still be suboptimal even with tuned hyperparameters. Likewise, IL algorithms and BC generally fail to outperform the expert, while DT only succeeds occasionally. Finally, SIL shows worst results as it struggles to ﬁnd any meaningful behaviour due to the
+
+Table 1: Results in DMC and Pommerman. The rows represent the algorithms and the columns represent the environments. The format is mean ± std, where mean and standard deviation are taken over ﬁve random seeds (DMC) or three random seeds (Pommerman), and the performance in each seed is the average over 100 episodes. The algorithms are ordered in the decreasing performance in Walker. The best score and the scores within the standard deviation of the best score are highlighted with bold font.
+
+SILFD (OURS) BCSIL (OURS) SILFBC (OURS) TRPOFD POFD-SC POFD WPOFD-SC BC DT Expert WPOFD WGAIL DQFD / DDPGFD GAIL SIL
+
+TYPE
+LFD LFD LFD LFD LFD LFD LFD OFFLINE OFFLINE LFD IL LFD IL RL
+
+CHEETAH
+392.6 ± 38.75 441.8 ± 44.66 316.56 ± 94.25 214.28 ± 149.9 410.02 ± 49.05 370.78 ± 87.38 41.32 ± 19.37 5.92 ± 1.18 14.0 ± 1.59 10.66 ± 11.05 5.03 ± 1.3 5.9 ± 0.75 94.33 ± 17.67 5.79 ± 0.63 0.0 ± 0.0
+
+WALKER
+502.32 ± 12.8 501.56 ± 8.49 497.22 ± 6.23 481.1 ± 31.09 373.58 ± 56.7 324.8 ± 13.63 313.78 ± 8.72 310.18 ± 7.76 289.6 ± 4.2 287.96 ± 42.5 282.66 ± 1.74 279.68 ± 8.62 235.8 ± 132.5 93.1 ± 9.26 70.78 ± 21.27
+
+HOPPER
+36.28 ± 8.22 18.1 ± 1.23 21.41 ± 2.42 18.1 ± 22.21 4.62 ± 2.23 13.77 ± 1.45 6.48 ± 1.99 4.32 ± 1.39 8.21 ± 0.41 0.37 ± 0.39 6.24 ± 3.13 5.28 ± 0.91 1.65 ± 1.12 6.68 ± 0.88 0.04 ± 0.01
+
+CARTPOLE
+674.48 ± 42.2 574.7 ± 288.7 765.74 ± 23.2 0.0 ± 0.0 1.8 ± 3.4 18.86 ± 35.22 0.03 ± 0.07 2.12 ± 1.51 0.44 ± 0.61 63.07 ± 9.12 6.22 ± 11.63 0.23 ± 0.47 56.21 ± 17.81 0.0 ± 0.0 0.0 ± 0.0
+
+POMMERMAN
+0.968 ± 0.003 0.326 ± 0.94 0.976 ± 0.002 0.8 ± 0.22 -0.96 ± 0.03 -0.83 ± 0.12 -0.97 ± 0.02 -0.27 ± 0.09 -0.96 ± 0.04 1.0 ± 0.0 -0.55 ± 0.36 -0.999 ± 0.001 -0.88 ± 0.02 -1.0 ± 0.0 -1.0 ± 0.0
+
+sparsity of the reward.
+Pommerman The results are presented in Table 1. We ﬁnd that only our algorithms SILfD and SILfBC successfully recover expert performance and consistently win in procedurally generated maps. BCSIL, a variation of SILfBC with pretrained weights, may suffer from the catastrophic forgetting as it only successfully trains in two of three seeds. Ofﬂine algorithms BC and DT manage to win a few matches in unseen maps, the former being sufﬁcient for SILfBC to explore the winning solution. The only other algorithm to perform well is TRPOfD. However, it struggles to stabilize its ﬁnal performance, which is likely due to the bias towards the expert behaviour. Finally, all other LfD and Imitation Learning algorithms fail to ﬁnd the optimal solution as the environment requires generalization to unseen layouts of the map.
+5.2 Additional experiments
+Automated scheduling in SILfD In this experiment we test the ability of SILfD to automatically schedule the inﬂuence of the demonstrations on the learning process discussed in Section 3.1. We train SILfD and track the proportion of the expert transitions in the batches sampled from the buffer during SIL updates. The proportion being equal to 1 corresponds to the batch consisting solely of the demonstrated data and vice versa. We run this experiment in each DMC environment for 5 seeds. The results are presented in Figure 4. We ﬁnd that during the beginning of the training when the agent fails to ﬁnd any meaningful experience in the environment, the proportion of the demonstrations is close to 1. As the agent improves, the proportion value begins to decrease. This connection of the proportion and the agent’s performance is the most visible in Cartpole (4a). In all experiments we observe that as the agent starts to outperform the expert, the proportion rapidly declines and then stays at zero. This conﬁrms
+
+our intuition that SILfD automatically anneals the inﬂuence of the demonstrations throughout the training. It is also interesting to note that the discovered schedule depends on the random seed, which is difﬁcult to hand-code.
+Varying number of demonstrations We now validate the ability of SILfD to learn from limited experience. For each DMC environment, we select the subsets of demonstrations containing 1, 5, 10, and all 25 episodes. In each subset, the trajectories are chosen by the proximity to the average expert performance. We train SILfD ﬁve times on each subset. The results are reported in Figure 5. We observe that SILfD is capable of outperforming the expert by a margin regardless of the number of the demonstrations. Furthermore, in all environments except Hopper (5d), varying the number of the demonstrations does not inﬂuence the ﬁnal performance of the agent. This experiment highlights the ability of SILfD to beneﬁt from the demonstrations even in the settings without access to large data sets of expert trajectories.
+6 Conclusion
+In this paper, we present SILfD, a novel algorithm that incorporates demonstrations into Self-Imitation Learning. We formulate and experimentally verify its crucial properties that are unique among the LfD algorithms, namely the ability to discern the most useful demonstrated behaviour and the automated scheduling of the inﬂuence of demonstrations. We show that SILfD reliably surpasses the expert and achieves state-of-the-art performance in learning from suboptimal or noisy demonstrations. Additionally, we propose SILfBC, a modiﬁcation of SILfD that relaxes the requirement to observe rewards in demonstrations. We ﬁnd it to be competitive with existing state-of-the-art approaches, making it a viable alternative to the original algorithm.
+
+(a) Cartpole
+
+(b) Cheetah
+
+(a) Cartpole
+
+(b) Cheetah
+
+(c) Walker
+
+(d) Hopper
+
+Figure 4: Automated scheduling in SILfD. Curves of the same color correspond to the same seed. Left Y-Axis corresponds to the dashed curves and measures the proportion of the demonstrated data in the batches sampled during SIL updates. Right Y-axis corresponds to the solid curves and measures the average return over 100 episodes. Solid black line indicates the expert performance.
+
+References
+Atkeson, C. G., and Schaal, S. 1997. Robot learning from demonstration. In ICML, volume 97, 12–20. Citeseer.
+Barde, P.; Roy, J.; Jeon, W.; Pineau, J.; Pal, C.; and Nowrouzezahrai, D. 2020. Adversarial soft advantage ﬁtting: Imitation learning without policy optimization. arXiv preprint arXiv:2006.13258.
+Berner, C.; Brockman, G.; Chan, B.; Cheung, V.; Debiak, P.; Dennison, C.; Farhi, D.; Fischer, Q.; Hashme, S.; Hesse, C.; et al. 2019. Dota 2 with large scale deep reinforcement learning. arXiv preprint arXiv:1912.06680.
+Brown, N.; Bakhtin, A.; Lerer, A.; and Gong, Q. 2020. Combining deep reinforcement learning and search for imperfectinformation games. arXiv preprint arXiv:2007.13544.
+Brys, T.; Harutyunyan, A.; Suay, H. B.; Chernova, S.; Taylor, M. E.; and Nowé, A. 2015. Reinforcement learning from demonstration through shaping. In Twenty-fourth international joint conference on artiﬁcial intelligence.
+Chen, L.; Lu, K.; Rajeswaran, A.; Lee, K.; Grover, A.; Laskin, M.; Abbeel, P.; Srinivas, A.; and Mordatch, I. 2021. Decision transformer: Reinforcement learning via sequence modeling. In Beygelzimer, A.; Dauphin, Y.; Liang, P.; and Vaughan, J. W., eds., Advances in Neural Information Processing Systems.
+Cheng, C.-A.; Yan, X.; Wagener, N.; and Boots, B. 2018. Fast policy learning through imitation and reinforcement. arXiv preprint arXiv:1805.10413.
+Chentanez, N.; Müller, M.; Macklin, M.; Makoviychuk, V.;
+
+(c) Walker
+
+(d) Hopper
+
+Figure 5: SILfD scores for varied number of demonstrations. Y-Axis measures the average return during the last 100 episodes. For each speciﬁc number of demonstrations, we run 5 trials. The solid curves corresponds to mean score among trials. Semitransparent areas correspond to min-max intervals. Solid black line indicates the expert performance.
+
+and Jeschke, S. 2018. Physics-based motion capture imitation with deep reinforcement learning. In Proceedings of the 11th Annual International Conference on Motion, Interaction, and Games, 1–10.
+Gao, Y.; Xu, H.; Lin, J.; Yu, F.; Levine, S.; and Darrell, T. 2018. Reinforcement learning from imperfect demonstrations. arXiv preprint arXiv:1802.05313.
+Gu, S.; Holly, E.; Lillicrap, T.; and Levine, S. 2017. Deep reinforcement learning for robotic manipulation with asynchronous off-policy updates. In 2017 IEEE international conference on robotics and automation (ICRA), 3389–3396. IEEE.
+Hester, T.; Vecerik, M.; Pietquin, O.; Lanctot, M.; Schaul, T.; Piot, B.; Horgan, D.; Quan, J.; Sendonaris, A.; Osband, I.; et al. 2018. Deep q-learning from demonstrations. In Proceedings of the AAAI Conference on Artiﬁcial Intelligence, volume 32.
+Ho, J., and Ermon, S. 2016. Generative adversarial imitation learning. arXiv preprint arXiv:1606.03476.
+Hussenot, L.; Dadashi, R.; Geist, M.; and Pietquin, O. 2020. Show me the way: Intrinsic motivation from demonstrations. arXiv preprint arXiv:2006.12917.
+Jaderberg, M.; Czarnecki, W. M.; Dunning, I.; Marris, L.; Lever, G.; Castaneda, A. G.; Beattie, C.; Rabinowitz, N. C.; Morcos, A. S.; Ruderman, A.; et al. 2019. Human-level performance in 3d multiplayer games with population-based reinforcement learning. Science 364(6443):859–865.
+Jing, M.; Ma, X.; Huang, W.; Sun, F.; Yang, C.; Fang, B.; and Liu, H. 2020. Reinforcement learning from imperfect demonstrations under soft expert guidance. In Proceedings
+
+of the AAAI Conference on Artiﬁcial Intelligence, volume 34, 5109–5116.
+Kang, B.; Jie, Z.; and Feng, J. 2018. Policy optimization with demonstrations. In International Conference on Machine Learning, 2469–2478. PMLR.
+Kingma, D. P., and Ba, J. 2015. Adam: A method for stochastic optimization. In ICLR.
+Levine, S.; Finn, C.; Darrell, T.; and Abbeel, P. 2016. Endto-end training of deep visuomotor policies. The Journal of Machine Learning Research 17(1):1334–1373.
+Liang, E.; Liaw, R.; Nishihara, R.; Moritz, P.; Fox, R.; Goldberg, K.; Gonzalez, J.; Jordan, M.; and Stoica, I. 2018. Rllib: Abstractions for distributed reinforcement learning. In International Conference on Machine Learning, 3053–3062. PMLR.
+Mnih, V.; Kavukcuoglu, K.; Silver, D.; Rusu, A. A.; Veness, J.; Bellemare, M. G.; Graves, A.; Riedmiller, M.; Fidjeland, A. K.; Ostrovski, G.; et al. 2015. Human-level control through deep reinforcement learning. nature 518(7540):529– 533.
+Mnih, V.; Badia, A. P.; Mirza, M.; Graves, A.; Lillicrap, T.; Harley, T.; Silver, D.; and Kavukcuoglu, K. 2016. Asynchronous methods for deep reinforcement learning. In International conference on machine learning, 1928–1937. PMLR.
+Moravcˇík, M.; Schmid, M.; Burch, N.; Lisy`, V.; Morrill, D.; Bard, N.; Davis, T.; Waugh, K.; Johanson, M.; and Bowling, M. 2017. Deepstack: Expert-level artiﬁcial intelligence in heads-up no-limit poker. Science 356(6337):508–513.
+Nair, A.; McGrew, B.; Andrychowicz, M.; Zaremba, W.; and Abbeel, P. 2018. Overcoming exploration in reinforcement learning with demonstrations. In 2018 IEEE International Conference on Robotics and Automation (ICRA), 6292–6299. IEEE.
+Oh, J.; Guo, Y.; Singh, S.; and Lee, H. 2018. Self-imitation learning. In International Conference on Machine Learning, 3878–3887. PMLR.
+Osband, I.; Aslanides, J.; and Cassirer, A. 2018. Randomized prior functions for deep reinforcement learning. arXiv preprint arXiv:1806.03335.
+Osband, I.; Blundell, C.; Pritzel, A.; and Van Roy, B. 2016. Deep exploration via bootstrapped dqn. arXiv preprint arXiv:1602.04621.
+Paine, T. L.; Gulcehre, C.; Shahriari, B.; Denil, M.; Hoffman, M.; Soyer, H.; Tanburn, R.; Kapturowski, S.; Rabinowitz, N.; Williams, D.; et al. 2019. Making efﬁcient use of demonstrations to solve hard exploration problems. arXiv preprint arXiv:1909.01387.
+Pearce, T., and Zhu, J. 2021. Counter-strike deathmatch with large-scale behavioural cloning. arXiv preprint arXiv:2104.04258.
+Pomerleau, D. A. 1991. Efﬁcient training of artiﬁcial neural networks for autonomous navigation. Neural computation 3(1):88–97.
+Rajeswaran, A.; Kumar, V.; Gupta, A.; Vezzani, G.; Schulman, J.; Todorov, E.; and Levine, S. 2017. Learning complex
+
+dexterous manipulation with deep reinforcement learning and demonstrations. arXiv preprint arXiv:1709.10087.
+Resnick, C.; Eldridge, W.; Ha, D.; Britz, D.; Foerster, J.; Togelius, J.; Cho, K.; and Bruna, J. 2018. Pommerman: A multi-agent playground. arXiv preprint arXiv:1809.07124.
+Schaal, S., et al. 1997. Learning from demonstration. Advances in neural information processing systems 1040–1046.
+Schaul, T.; Quan, J.; Antonoglou, I.; and Silver, D. 2016. Prioritized experience replay.
+Scheller, C.; Schraner, Y.; and Vogel, M. 2020. Sample efﬁcient reinforcement learning through learning from demonstrations in minecraft. In NeurIPS 2019 Competition and Demonstration Track, 67–76. PMLR.
+Schulman, J.; Levine, S.; Abbeel, P.; Jordan, M.; and Moritz, P. 2015. Trust region policy optimization. In International conference on machine learning, 1889–1897. PMLR.
+Schulman, J.; Moritz, P.; Levine, S.; Jordan, M.; and Abbeel, P. 2016. High-dimensional continuous control using generalized advantage estimation. International Conference on Learning Representations (ICLR).
+Schulman, J.; Wolski, F.; Dhariwal, P.; Radford, A.; and Klimov, O. 2017. Proximal policy optimization algorithms. arXiv preprint arXiv:1707.06347.
+Silver, D.; Huang, A.; Maddison, C. J.; Guez, A.; Sifre, L.; Van Den Driessche, G.; Schrittwieser, J.; Antonoglou, I.; Panneershelvam, V.; Lanctot, M.; et al. 2016. Mastering the game of go with deep neural networks and tree search. nature 529(7587):484–489.
+Strens, M. 2000. A bayesian framework for reinforcement learning. In ICML, volume 2000, 943–950.
+Tang, Y. 2020. Self-imitation learning via generalized lower bound q-learning. arXiv preprint arXiv:2006.07442.
+Tassa, Y.; Doron, Y.; Muldal, A.; Erez, T.; Li, Y.; Casas, D. d. L.; Budden, D.; Abdolmaleki, A.; Merel, J.; Lefrancq, A.; et al. 2018. Deepmind control suite. arXiv preprint arXiv:1801.00690.
+Van Hasselt, H.; Guez, A.; and Silver, D. 2016. Deep reinforcement learning with double q-learning. In Proceedings of the AAAI Conference on Artiﬁcial Intelligence, volume 30.
+Vecerik, M.; Hester, T.; Scholz, J.; Wang, F.; Pietquin, O.; Piot, B.; Heess, N.; Rothörl, T.; Lampe, T.; and Riedmiller, M. 2017. Leveraging demonstrations for deep reinforcement learning on robotics problems with sparse rewards. arXiv preprint arXiv:1707.08817.
+Vinyals, O.; Babuschkin, I.; Czarnecki, W. M.; Mathieu, M.; Dudzik, A.; Chung, J.; Choi, D. H.; Powell, R.; Ewalds, T.; Georgiev, P.; et al. 2019. Grandmaster level in starcraft ii using multi-agent reinforcement learning. Nature 575(7782):350–354.
+Wang, Z.; Schaul, T.; Hessel, M.; Hasselt, H.; Lanctot, M.; and Freitas, N. 2016. Dueling network architectures for deep reinforcement learning. In International conference on machine learning, 1995–2003. PMLR.
+Wang, Y.; Xu, C.; Du, B.; and Lee, H. 2021. Learning to
+
+weight imperfect demonstrations. In International Conference on Machine Learning, 10961–10970. PMLR.
+Zhou, H.; Gong, Y.; Mugrai, L.; Khalifa, A.; Nealen, A.; and Togelius, J. 2018. A hybrid search agent in pommerman. In Proceedings of the 13th International Conference on the Foundations of Digital Games, 1–4.
+Zhu, Y.; Wang, Z.; Merel, J.; Rusu, A.; Erez, T.; Cabi, S.; Tunyasuvunakool, S.; Kramár, J.; Hadsell, R.; de Freitas, N.; et al. 2018. Reinforcement and imitation learning for diverse visuomotor skills. arXiv preprint arXiv:1802.09564.
+Ziebart, B. D.; Maas, A. L.; Bagnell, J. A.; and Dey, A. K. 2008. Maximum entropy inverse reinforcement learning. In Aaai, volume 8, 1433–1438. Chicago, IL, USA.
+Zolna, K.; Rostamzadeh, N.; Bengio, Y.; Ahn, S.; and Pinheiro, P. O. 2019. Reinforced imitation in heterogeneous action space. arXiv preprint arXiv:1904.03438.
+A Environments
+Here we report technical details of the environments.
+A.1 Chain
+In Chain Environment, observation space is represented by a square grid. Agent’s state in the environment is deﬁned by its position on this grid and consists of two components: horizontal and vertical. Each component is normalized to be in range from −1 to 1. Thus, the initial state in the environment is [−1, −1], and for all the terminal states the second component is 1. The goal of the agent is to reach state [1, 1], i. e. the bottom right corner of the grid. Action space is discrete and speciﬁes two options: going left (0) and going right (1). The total reward for the episode lies within the range [−60, 100].
+Each algorithm was trained for 1 million transitions in the environment, which constitutes up to 30 minutes of wallclock time, depending on the algorithm. The exceptions are DQfD, which is more sample efﬁcient and was trained for 200 thousands transitions, and BC and DT, which do not require interacting with the environment. For SILfBC, we collect 1000 BC demonstrations to ﬁll the buffer of SIL.
+A.2 DeepMind Control Suite
+In the original Cartpole, a non-zero reward is given every time the pole is positioned vertically and the cart is located within a certain range. In our modiﬁcation, the agent does not receive the reward if the velocities of the pole or the cart exceed a threshold. As a result, it becomes extremely difﬁcult for the agent to ﬁnd the learning signal randomly. In order to collect demonstrations, we handcraft a heuristic PID-controller that swings the cart back and forth until the pole reaches a vertical position. In the locomotive tasks, the reward is originally given each time the robot advances forward. In our modiﬁcations, the agent receives the reward proportional to its velocity, but only if the velocity exceeds a certain threshold. As an expert, we train a PPO agent to move with a target speed that is only slightly higher than the threshold. Since it is possible to move faster than such expert, demonstrations of its behaviour are suboptimal for the agent.
+
+For SILfBC, we collect 25 BC demonstrations to ﬁll the buffer of SIL in each DMC environment. Note that we ﬁlter these demonstrations and only select those with non-zero return.
+Cartpole The state space is deﬁned by 5 components: position of the cart, cosine of the pole, sine of the pole and cart’s and pole’s velocities. Action space is continuous and one-dimensional. Action’s magnitude speciﬁes the amount of force applied to move a cart and the sign of the action speciﬁes the direction of the force. In the original implementation of the environment the reward is given whenever the horizontal position of the cart is within a range of from −0.25 to 0.25 and the pole’s cosine is within a range from 0.995 to 1. In our modiﬁcation agent does not receive any reward whenever the pole’s and cart’s velocities exceed 0.25 and 0.5 respectively. To collect demonstrations in this environment, we handcrafted a heuristic PID-controller. It receives 13 total reward per episode on average. However, we ﬁltered demonstrations containing only those episodes where the total reward exceeded 40, and thus the expert’s performance in demonstrations is approximately 65.
+Each algorithm except BC and DT is trained for 5 million transitions in the environment.
+Walker In the Walker environment, the agent controls the robot that has two actuated legs. The action space consists of 6 components, where each component represents the force applied to a certain joint of a single leg. The state space consists of 24 components that represent positions, orientations and velocities of different parts of the robot. In the original implementation of the environment the reward is divided into two parts: the ﬁrst part is the standing reward rs which increases towards 1 when the vertical position of the agent’s torso gets closer to the value of 1.2; the second part is the moving reward rm which increases up to 1 as the agent’s horizontal velocity gets closer and exceeds the threshold of 8. The ﬁnal reward is calculated using the following equation:
+r = rs (5rm + 1) (6) 6
+In order to collect demonstrations for experiments in Walker, we modify the moving part of the original reward. To train the agent run with a certain target speed, we set the reward to be 1 if the velocity of the agent lies inside the interval between 4 and 5 and we decrease the reward as it gets further from its boundaries. We train agent to maximize this reward using PPO algorithm.
+To create sparse version of the environment, we modify the moving reward to be 0 if the agent’s velocity is below the threshold of 4. In order to encourage the agent to run faster as it exceeds this threshold, we linearly increase the reward depending on agent’s velocity.
+Each algorithm except BC and DT is trained for 5 million transitions in the environment.
+Hopper In the Hopper environment, the agent controls the robot that has a single leg. The state and action spaces are represented by the vectors with 15 and 4 components respectively. The reward scheme is the same as in the Walker
+
+Environment, but the target speed for the expert lies in the interval between 1 and 2. In the sparse version of the environment the speed threshold is set to be 1.3.
+Each algorithm except BC and DT is trained for 5 million transitions in the environment.
+Cheetah In the Cheetah environment the agent controls the robot with two legs: back and front. The state and action spaces are represented by the vectors with 17 and 6 components respectively. The reward scheme is similar to Hopper’s and Walker’s reward scheme, but the standing reward is absent. The target speed for the expert lies in the interval between 5 and 6, and the velocity threshold in sparse version of the environment is set to be 5.
+Each algorithm except BC and DT is trained for 10 million transitions in the environment.
+A.3 Pommerman
+The observation space is composed of a 11x11 grid with 15 one-hot features, 2 feature maps, and an additional information vector. The one-hot feature represents an element on the map. Speciﬁcally, these features can represent the current player, an ally, an enemy, a passage, a wall, wood, a bomb, ﬂame, fog, and a power-up. The feature maps contain integers indicating bomb blast strength and bomb life for each location. Finally, the additional information vector contains the time-step, number of ammunition, whether the player can kick and blast strength for the current player. The agent has six actions: do-nothing, up, down, left, right, and lay bomb.
+We use Agent47Agent to gather expert trajectories, which is based on Monte-Carlo Tree Search.3 We only select winning trajectories from the expert.
+Each algorithm was trained for 10 million transitions in the environment. The exceptions are DQfD, which is more sample efﬁcient and was trained for 1 million transitions, and BC and DT, which do not require interacting with the environment.
+For SILfBC, we collect 400 BC demonstrations to ﬁll the buffer of SIL. These are not ﬁltered.
+B Algorithms and Hyperparameters
+Below we describe how hyperparameters were tuned. The selected hyperparameters are reported in Tables 2, 3.
+In all environments and for each algorithm, we select hyperparameters using a random search procedure. Speciﬁcally, we select a 100 random hyperparameter conﬁgurations, train an algorithm with each conﬁguration on 2 random seeds (Pommerman) or 3 random seeds (Chain, DMC), evaluate the trained algorithm for 100 episodes, and select the conﬁguration with the highest average score over the seeds and the episodes. We then rerun each experiment 3 times (Pommerman) or 5 times (Chain, DMC) with the selected hyperparameters, the results of which are reported in the main text.
+In Chain, we tune hyperparameters in the setting with one optimal and one adversary demonstrations provided (2 in total) and apply these hyperparameters in the other settings.
+3github.com/YichenGong/Agent47Agent/tree/master/pommerman
+
+We select hyperparameters for Pommerman and each environment in DMC independently.
+Below we report the tuning ranges and the additional details for each algorithm.
+All networks except DT have the following architectures: [in_dim, 32, 32, out_dim] in Chain, [in_dim, 256, 256, out_dim] in DMC, the architecture identical to (Barde et al. 2020) in Pommerman. All networks have ReLU activation functions between the layers and are trained with Adam optimizer (Kingma and Ba 2015).
+PPO. PPO is not a separate baseline but is used as a basic algorithm in the online updates of SIL, SILfD, SILfBC and BCSIL, as well as in GAIL, POfD, POfD (sc) and their weighted versions. For each of these algorithms, we select the following PPO hyperparameters: learning rate from {1e − 4, 2e − 4, 5e − 4, 1e − 3}, batch size from {128, 256, 512}, epochs per update from {3, 10, 30}. We also employ Generalized Advantage Estimation (GAE) during training (Schulman et al. 2016).
+SIL, SILfD, SILfBC, BCSIL. On top of the PPO hyperparameters reported above, for SILfD we select: epochs per SIL update from {5, 10, 20, 40}, SIL loss weight from {0.01, 0.1, 1, 10}, SIL batch size from {256, 512}. Online updates in SIL are based on PPO in all environments. We do not separately tune SIL, SILfBC and BCSIL and instead use the hyperparameters selected for SILfD and BC.
+BC. For BC, we select learning rate from {5e − 5, 1e − 4, 2e − 4, 5e − 4, 1e − 3, 2e − 3} and batch size from {64, 128, 256, 512}.
+GAIL, POfD, wGAIL, wPOfD. On top of the PPO hyperparameters reported above, for POfD we select discriminator batch size from {128, 256, 512}, discriminator epochs per update from {3, 10}, discriminator learning rate from {5e − 5, 1e − 4, 2e − 4, 5e − 4}, and reward mixing coefﬁcient λ1 ∈ {0.01, 0.1, 0.5, 0.9, 0.99}. For GAIL, we use the hyperparameters selected for POfD but remove the environmental reward and λ1. For POfD (sc), we also use the hyperparameters selected for POfD, but initially set λ1 to 1 and gradually anneal it according to a linear schedule λn1 ew = max(0, λ1 − 1/(num_updates ∗ λs1c)). The inverse speed of annealing λs1c is additionally selected from {0.2, 0.5, 1, 2, 5} with other hyperparameters ﬁxed. For the weighted versions of the algorithms, the tuning procedure is identical, except that an additional hyperparameter β is selected from {0, 1, 2}.
+DQfD, DDPGfD. For DQfD and DDPGfD, we select learning rate from {1e − 4, 2e − 4, 5e − 4, 1e − 3}, batch size from {128, 256, 512}, n-step loss weight from {0.1, 1}, l2 regularization weight from {1e − 5, 1e − 4, 1e − 3}, priority bonus of demonstrations from {0.1, 0.2, 0.5, 1}. We apply dueling (Wang et al. 2016) and double (Van Hasselt, Guez, and Silver 2016) modiﬁcations of DQN in DQfD. We train DQfD and DDPGfD 5 times as less as other algorithms to utilize their sample efﬁciency and prevent overﬁtting.
+TRPOfD. For TRPOfD, we select maximum allowable KL divergence from the previous policy aka size of the trust region δ from {1e − 4, 2e − 4, 5e − 4, 1e − 3, 2e − 3, 5e − 3, 1e−2}, initial maximum divergence from the expert policy d0 from {1e−4, 1e−3, 1e−2}, exponential annealing factor
+
+from {1e − 5, 1e − 4, 2e − 4, 5e − 4, 1e − 3, 2e − 3}, the learning rate of the recovery objective from {0.01, 0.1, 1}. This algorithm processes whole batch at once during the update. The annealing of the divergence from the expert dk is according to the exponential rule: dk+1 = dk + dk , where k is the epoch number. Each update, the whole batch is processed at once a single time.
+The original algorithm employs MMD to measure the divergence from the expert, however, we instead use the KL divergence. In effect, we maximize the log-likelihood of the expert actions under the agent policy, which is similar to BC. There are two reasons for this change. First, MMD only for continuous environments, whereas our modiﬁcation can also be applied in discrete environments. Second, in the preliminary experiments we found our modiﬁcation to perform better even in continuous environments.
+DT. For Decision Transformers, we use the hyperparameters reported in the original paper for D4RL (which contains analogues of DMC environments). We also simplify the architecture of DT in Chain by reducing the number of attention blocks.
+During evaluation, DT requires to specify the desirable returns. In each environment, we select several desirable returns, evaluate trained DT with each of the selected returns, and report the best performance. In Chain, the selected returns are 10 and 100. In Pommerman, the selected returns are 0.5 and 1. In DMC, we select ten uniformly spaced values from 0 to some maximal threshold (0 is not included). Speciﬁcally, the maximal threshold equals 500 in Cheetah and Walker, 50 in Hopper, and 800 in Cartpole.
+
+Table 2: Hyperparameters for all environments and algorithms (continued below)
+
+Hyperparameter
+
+Chain Pommerman Walker Hopper Cheetah Cartpole
+
+General parameters Transitions between updates Number of workers Discounting factor γ
+
+1000
+
+1000
+
+1
+
+8
+
+0.99
+
+0.99
+
+1000 1000 1000
+
+1000
+
+8
+
+8
+
+8
+
+8
+
+0.99 0.99
+
+0.99
+
+0.99
+
+PPO Entropy coefﬁcient Update clipping parameter GAE λ
+
+0.01
+
+0.01
+
+0.2
+
+0.2
+
+0.95
+
+0.95
+
+0
+
+0
+
+0
+
+0
+
+0.2
+
+0.2
+
+0.2
+
+0.2
+
+0.95 0.95
+
+0.95
+
+0.95
+
+SIL, SILfD, SILfBC, BCSIL
+
+Batch size
+
+32
+
+512
+
+Learning rate
+
+2e-4
+
+1e-4
+
+Epochs per update
+
+3
+
+3
+
+SIL value loss weight β
+
+0.01
+
+0.1
+
+Epochs per SIL update
+
+40
+
+40
+
+SIL loss weight
+
+10
+
+1
+
+SIL Batch size
+
+256
+
+256
+
+Buffer size
+
+1e5
+
+1e5
+
+512
+
+128
+
+512
+
+256
+
+1e-4 2e-4
+
+1e-4
+
+1e-4
+
+30
+
+10
+
+10
+
+30
+
+0.1
+
+0.1
+
+0.1
+
+0.1
+
+40
+
+10
+
+5
+
+20
+
+1
+
+10
+
+0.1
+
+0.1
+
+512
+
+512
+
+512
+
+256
+
+1e5
+
+1e5
+
+1e5
+
+1e5
+
+GAIL, POfD
+
+Batch size
+
+32
+
+256
+
+Learning rate
+
+2e-5
+
+5e-4
+
+Epochs per update
+
+3
+
+3
+
+Discriminator learning rate
+
+1e-5
+
+5e-5
+
+Discriminator batch size
+
+32
+
+128
+
+Discriminator epochs per update 3
+
+10
+
+Mixing coefﬁcient λ1 (POfD)
+
+0.9
+
+0.01
+
+Annealing coef λs1c (POfD sc)
+
+5
+
+1
+
+wGAIL, wPOfD
+
+Batch size
+
+32
+
+256
+
+Learning rate
+
+2e-5
+
+5e-4
+
+Epochs per update
+
+3
+
+3
+
+Discriminator learning rate
+
+1e-5
+
+5e-5
+
+Discriminator batch size
+
+32
+
+512
+
+Discriminator epochs per update 3
+
+10
+
+Weighting coefﬁcient β
+
+1
+
+1
+
+Mixing coefﬁcient λ1 (wPOfD) 0.9
+
+0.01
+
+Annealing coef λs1c (wPOfD sc) 1
+
+5
+
+256
+
+512
+
+512
+
+512
+
+1e-4 1e-4
+
+1e-4
+
+2e-4
+
+10
+
+10
+
+10
+
+30
+
+2e-4 2e-4
+
+2e-4
+
+5e-4
+
+512
+
+512
+
+128
+
+128
+
+10
+
+10
+
+10
+
+10
+
+0.5
+
+0.01
+
+0.01
+
+0.01
+
+0.5
+
+0.2
+
+0.2
+
+1
+
+512
+
+128
+
+512
+
+128
+
+2e-4 2e-4
+
+5e-4
+
+1e-4
+
+10
+
+10
+
+10
+
+30
+
+5e-5 5e-4
+
+5e-4
+
+5e-4
+
+256
+
+128
+
+256
+
+256
+
+10
+
+10
+
+10
+
+10
+
+0
+
+1
+
+0
+
+0
+
+0.9
+
+0.01
+
+0.5
+
+0.01
+
+2
+
+0.5
+
+0.5
+
+5
+
+Table 3: Hyperparameters for all environments and algorithms (continued)
+
+Hyperparameter
+
+Chain Pommerman Walker Hopper Cheetah Cartpole
+
+DQfD, DDPGfD
+
+Buffer size
+
+1e5
+
+1e6
+
+Q-network / Actor learning rate 2e-4
+
+1e-4
+
+Critic learning rate
+
+-
+
+-
+
+Batch size
+
+32
+
+200
+
+Epochs per update
+
+1
+
+1
+
+Demos priority bonus d
+
+0.5
+
+1
+
+Number of steps in n-step loss 10
+
+10
+
+N-step loss weight λ1
+
+0.01
+
+0.1
+
+Supervised loss weight λ2
+
+0.1
+
+0.8
+
+l2 regularization weight
+
+1e-3
+
+1e-4
+
+1e5
+
+1e5
+
+1e5
+
+1e5
+
+1e-4
+
+2e-4
+
+5e-4
+
+1e-3
+
+1e-3
+
+1e-3
+
+1e-3
+
+1e-3
+
+128
+
+128
+
+128
+
+128
+
+1
+
+1
+
+1
+
+4
+
+1
+
+1
+
+1
+
+0.2
+
+20
+
+10
+
+5
+
+10
+
+0.1
+
+0.1
+
+0.1
+
+0.1
+
+-
+
+-
+
+-
+
+-
+
+1e-4
+
+1e-4
+
+1e-3
+
+1e-3
+
+TRPOfD Max KL δ Batch size Epochs per update Max KL from expert d0 Annealing coefﬁcient Recovery learning rate
+
+1e-4
+
+2e-3
+
+1000
+
+8000
+
+1
+
+1
+
+1e-3
+
+1e-4
+
+5e-4
+
+2e-3
+
+0.1
+
+0.1
+
+2e-3
+
+2e-4
+
+5e-3
+
+2e-4
+
+8000 8000 8000
+
+8000
+
+1
+
+1
+
+1
+
+1
+
+1e-4
+
+1e-3
+
+1e-4
+
+1e-3
+
+5e-4
+
+1e-3
+
+2e-3
+
+2e-3
+
+0.1
+
+0.1
+
+0.01
+
+0.01
+
+BC Learning rate Batch size Number of epochs
+
+1e-3
+
+5e-4
+
+32
+
+256
+
+4096
+
+1000
+
+2e-4
+
+1e-4
+
+5e-4
+
+5e-5
+
+512
+
+256
+
+256
+
+256
+
+1000 1000 1000
+
+1000
+
+DT Learning rate Batch size Number of batches Number of attention layers Dropout rate
+
+1e-3 32 20000 1 0
+
+1e-4 64 100000 3 0.1
+
+1e-4 64 100000 3 0.1
+
+1e-4 64 100000 3 0.1
+
+1e-4 64 100000 3 0.1
+
+1e-4 64 100000 3 0.1
+
+

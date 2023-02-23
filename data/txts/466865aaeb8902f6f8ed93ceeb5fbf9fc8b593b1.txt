@@ -1,0 +1,1251 @@
+1
+STFT-Domain Neural Speech Enhancement with Very Low Algorithmic Latency
+Zhong-Qiu Wang, Gordon Wichern, Shinji Watanabe, and Jonathan Le Roux
+
+arXiv:2204.09911v1 [cs.SD] 21 Apr 2022
+
+Abstract—Deep learning based speech enhancement in the short-term Fourier transform (STFT) domain typically uses a large window length such as 32 ms. A larger window contains more samples and the frequency resolution can be higher for potentially better enhancement. This however incurs an algorithmic latency of 32 ms in an online setup, because the overlap-add algorithm used in the inverse STFT (iSTFT) is also performed based on the same 32 ms window size. To reduce this inherent latency, we adapt a conventional dual window size approach, where a regular input window size is used for STFT but a shorter output window is used for the overlap-add in the iSTFT, for STFTdomain deep learning based frame-online speech enhancement. Based on this STFT and iSTFT conﬁguration, we employ singleor multi-microphone complex spectral mapping for frame-online enhancement, where a deep neural network (DNN) is trained to predict the real and imaginary (RI) components of target speech from the mixture RI components. In addition, we use the RI components predicted by the DNN to conduct frameonline beamforming, the results of which are then used as extra features for a second DNN to perform frame-online post-ﬁltering. The frequency-domain beamforming in between the two DNNs can be easily integrated with complex spectral mapping and is designed to not incur any algorithmic latency. Additionally, we propose a future-frame prediction technique to further reduce the algorithmic latency. Evaluation results on a noisy-reverberant speech enhancement task demonstrate the effectiveness of the proposed algorithms. Compared with Conv-TasNet, our STFTdomain system can achieve better enhancement performance for a comparable amount of computation, or comparable performance with less computation, maintaining strong performance at an algorithmic latency as low as 2 ms.
+Index Terms—Frame-online speech enhancement, complex spectral mapping, microphone array processing, deep learning.
+I. INTRODUCTION
+D EEP learning has dramatically advanced speech enhancement in the past decade [1]. Early studies estimated target magnitudes via time-frequency (T-F) masking [2] or directly predicted target magnitude via spectral mapping [3], both using the mixture phase for signal re-synthesis. Subsequent studies strove to improve phase modelling by performing phase estimation via magnitude-driven iterative phase reconstruction [4]. Recent effort focuses on complex- and timedomain approaches [5]–[11], where magnitude and phase are modelled simultaneously through end-to-end optimization.
+Many application scenarios such as teleconferencing and hearing aids require low-latency speech enhancement. Deep
+Manuscript received on Mar. 14, 2022. Z.-Q. Wang and S. Watanabe are with the Language Technologies Institute, Carnegie Mellon University, Pittsburgh, PA 15213, USA (e-mail: wang.zhongqiu41@gmail.com, shinjiw@cmu.edu). G. Wichern and J. Le Roux are with Mitsubishi Electric Research Laboratories, Cambridge, MA 02139, USA (e-mail: {wichern,leroux}@merl.com).
+
+learning based approaches [8], [12]–[16] handle this by using causal DNN blocks, such as uni-directional LSTMs, causal convolutions, causal attention layers, and causal normalization layers. Although many previous studies along this line advocate that their system with a causal DNN model is causal, one should be aware that most of these systems are, to be more precise, frame-online, and the amount of look-ahead depends on the frame length. One major approach that can potentially achieve sample-level causal processing is by using WaveNetlike models [17]. However, their effectiveness in dealing with noise and reverberation in a sample-causal setup is unclear [18]. In addition, at run time such models need to run a forward pass for each sample, resulting in a humongous and likely unnecessary amount of computation. Popular STFT- and time-domain approaches typically split signals into overlapped frames with a reasonably large hop length before processing. One advantage is that the forward pass then only needs to be run every hop-length samples. The latency is however equal to the window length due to the use of overlap-add in signal resynthesis, plus the running time of processing one frame (see Fig. 1 and its caption for a detailed explanation of the latency). In the recent Deep Noise Suppression (DNS) challenge [19], one key requirement was that the latency of producing an estimate for the sample at index n cannot exceed 40 ms on a standard Intel Core i5 processor. For a typical STFT based system with a 32 ms window and an 8 ms hop size, a frame-online DNN based system satisﬁes the requirement if the processing of each frame can ﬁnish within 8 ms on the speciﬁed processor. We deﬁne the latency due to algorithmic reasons (such as overlap-add) as algorithmic latency, and the computing time needed to process one frame as hardware latency. The overall latency is the summation of the two and is denoted as processing latency.
+Although a 40 ms processing latency can meet the demand of many applications, for hearing aids this latency is too large to deliver a good listening experience. In the recent Clarity challenge, proposed for hearing aid design [20], the required algorithmic latency was 5 ms. Such a low-latency constraint requires new designs and signiﬁcant modiﬁcations to existing enhancement algorithms. To meet this constraint, our study aims at an enhancement system with a window that looks ahead at most 4 ms of samples, and a 2 ms hop size. We assume that the hardware latency can be within 2 ms, leading to a maximum processing delay of 6 ms, even though this computational capability might not be available right now for a computationally demanding DNN model on resourceconstrained edge devices. We emphasize that this study focuses on improving enhancement performance and reducing
+
+2
+
+Output signal
+Predicted signal for overlap-add at frame t Predicted signal for overlap-add at frame t+1 Predicted signal for overlap-add at frame t+2 Predicted signal for overlap-add at frame t+3
+
+Sample n Add
+
+Inverse DFT & apply synthesis window Frame-Online DNN
+Apply analysis window & DFT
+
+Input signal at frame t Input signal at frame t+1 Input signal at frame t+2 Input signal at frame t+3
+Input signal
+
+8 ms 32 ms
+
+Time
+
+Fig. 1: Illustration of processing latency in systems based on regular STFT and iSTFT. Each rectangular band denotes a segment of time-domain signals. We use 75% frame overlap as an example. Because of the overlap-add in the iSTFT, to get the prediction at sample n (marked in the top of the ﬁgure) at frame t, one has to ﬁrst observe all the samples of frame t + 3 and then wait until the DNN ﬁnishes processing frame t + 3. The processing delay is hence the window length plus the running time of processing one frame.
+
+algorithmic latency rather than computational efﬁciency or feasibility on current hardware.
+In the literature, some STFT-domain beamforming studies [21], [22] use small window and hop sizes to achieve enhancement with a low algorithmic latency, and a low frequency resolution is used for STFT following the short window length. However, this low frequency resolution may limit the enhancement performance [1], [23], [24]. In the recent Clarity challenge, almost all the top teams [25]–[27] adopt timedomain networks such as Conv-TasNet [7], [28], which can use very short window and hop sizes to potentially realize very low-latency enhancement. Conv-TasNet leverages DNN based end-to-end optimization to learn a set of bases for a small window of samples respectively for its encoder and decoder to replace the conventional STFT and iSTFT operations. The number of bases is set to be much larger than the number of samples in the window. Enhancement is then performed in the higher-dimensional encoded space and the decoder is used for overlap-add based signal re-synthesis. While achieving good separation performance in monaural anechoic speaker separation tasks, Conv-TasNet performs less impressively in reverberant conditions and in multi-microphone scenarios than frequency-domain approaches [11], [29], [30]. In addition, the basis learned by Conv-TasNet is not narrowband [7]. It is not straightforward how to combine Conv-TasNet with conventional STFT-domain enhancement algorithms to achieve further gains, without incurring additional algorithmic latency. Such conventional algorithms include beamforming and weighted prediction error (WPE), which rely on the narrow-band assumption and can produce reliable separation through their per-frequency processing [11], [31]–[33]. One way of combining them [23], [34], [35] is by iterating ConvTasNet, which uses a very short window, with STFT-domain
+
+Sample n Output signal
+Predicted signal for overlap-add at frame t Predicted signal for overlap-add at frame t+1 Predicted signal for overlap-add at frame t+2 Predicted signal for overlap-add at frame t+3
+
+Sub-frame at frame t Add
+4 ms
+
+Apply synthesis window Drop samples
+
+Predicted signal at frame t Predicted signal at frame t+1 Predicted signal at frame t+2 Predicted signal at frame t+3
+
+See Fig. 3
+
+Inverse DFT Frame-Online DNN
+DFT Apply analysis window
+
+Input signal at frame t Input signal at frame t+1 Input signal at frame t+2 Input signal at frame t+3
+Input signal
+
+2 ms 16 ms
+
+Time
+
+Fig. 2: Illustration of overlap-add with dual window sizes. This example uses a 16 ms input window size for STFT, a 4 ms output window size for overlapadd, and a 2 ms hop size.
+
+beamforming, which uses a regular, longer window. To use Conv-TasNet outputs to compute signal statistics for STFTdomain beamforming, one has to ﬁrst re-synthesize timedomain signals before extracting STFT spectra for beamforming. Similarly, to apply Conv-TasNet on beamforming results for post-ﬁltering, one has to apply iSTFT to get time-domain signals before feeding them to Conv-TasNet. Such an iterative procedure would however gradually build up the algorithmic latency, because the overlap-add algorithms are used multiple times in Conv-TasNet and iSTFT.
+It is commonly perceived that regular STFT based systems, which suffer from a large algorithmic latency equal to the STFT’s typically long window length, are not ideal for very low-latency speech enhancement, and time-domain models such as Conv-TasNet, which can achieve strong performance using very short windows, appear a more appropriate choice [7]. In this study, we show that our STFT based system can also produce a comparable or better enhancement performance at an algorithmic latency as low as 4 or 2 ms. This is partially achieved by combining STFT-domain, deep learning based speech enhancement with a conventional dual window approach [36], [37], which uses a regularly long window length for STFT and a shorter window length for overlap-add. This approach is illustrated in Fig. 2. More speciﬁcally, assuming a hop size (HS) of 2 ms, we use a 16 ms input window size (iWS) for STFT, and an output window size (oWS) of 4 ms for the overlap-add in iSTFT. The 16 ms input window looks 4 ms ahead and 12 ms in the past in this case. After obtaining the predicted signal at each frame, i.e., after performing inverse discrete Fourier transform (iDFT), we throw away the ﬁrst 12 ms of waveforms, apply a synthesis window, and perform
+
+3
+
+overlap-add based on the last 4 ms of signals at each frame. The DNN module is designed to be frame-online. Therefore the entire system has an algorithmic latency of 4 ms. Later in Section V-B, we will introduce a future-frame prediction technique to further reduce the algorithmic latency to 2 ms.
+When used with DNNs, this dual window size approach has several advantages. First, using a long window for STFT leads to higher frequency resolution, meaning that we could have more estimated ﬁlters (or mask values) per frame to obtain more ﬁne-grained enhancement. In addition, higher frequency resolution can better leverage the speech sparsity property in the T-F domain for enhancement [1], [24]. Second, using a longer input window can capture more reverberation at each frame, potentially leading to better dereverberation. In addition, it could lead to better spatial processing, as the interchannel phase patterns could be more stable and salient for longer signals. Third, STFT bases are narrowband in nature, meaning that we can readily use our DNN outputs (in this study, the estimated target real and imaginary components) to compute a conventional frequency-domain beamformer, whose results can be used as extra features for another DNN to better predict the target speech.
+Our study makes three major contributions. First, we adapt a conventional dual window size approach [36], [37] to reduce the algorithmic latency of STFT-domain deep learning based speech enhancement. Second, we utilize the outputs from the ﬁrst DNN for frequency-domain frame-online beamforming, and the beamforming result is fed to a second DNN for better enhancement. Compared with using the outputs from time-domain models for frequency-domain beamforming, our approach does not incur algorithmic latency because the two DNNs and the beamformer all operate in the complex T-F domain. Third, we propose a future-frame prediction technique that can further reduce the algorithmic latency caused by the output window size. In our experiments, we ﬁnd that the proposed STFT-domain system can achieve comparably good or better performance than the popular Conv-TasNet [7], [25], [28], using a similar amount of computation and at an algorithmic latency as low as 4 or 2 ms. There is a recent dual window size study on deep learning based speaker separation [24]. However, it is monaural, uses real-valued mask estimation, only reduces the algorithmic latency to 8 ms, and does not compare with time-domain models.
+An overview of our system is given in the following section.
+
+II. SYSTEM OVERVIEW
+Given an utterance of a speaker recorded in noisyreverberant conditions by a P -microphone array, the physical model in the STFT domain can be formulated as
+
+Y(t, f ) = X(t, f ) + V(t, f )
+
+= S(t, f ) + H(t, f ) + V(t, f ),
+
+(1)
+
+where Y(t, f ), V(t, f ), X(t, f ), S(t, f ) and H(t, f ) ∈ CP respectively denote the STFT vectors of the mixure, reverberant noise, reverberant target speech, direct-path and non-direct signals of the target speaker at time t and frequency f . In the rest of this paper, when dropping t and f from the notation,
+
+MCWF
+
+𝑆#"%&'(
+
+𝒀 DNN! 𝑆#"(!)
+
+DNN) 𝑆#"())
+
+Fig. 3: DNN overview. Our system contains two frame-online DNNs with a frame-online multi-channel Wiener ﬁlter (MCWF) in between.
+
+we refer to the corresponding spectrogram. In our experiments, the default iWS, oWS, and HS for STFT are respectively set to 16, 4, and 2 ms, and the sampling rate is 16 kHz. A 256-point DFT is applied to extract 129-dimensional STFT coefﬁcients at each frame. The analysis window and synthesis window will be described in Section V-A.
+Based on the input Y, we aim at recovering the target speaker’s direct-path signal captured at a reference microphone q, i.e., Sq. We use the corresponding time-domain signal of Sq, denoted as sq, as the reference signal for metric computation. Note that early reﬂections are not considered as part of target speech. In multi-microphone cases, we assume that the same array geometry is used for training and testing, following [38], [39]. This is a valid assumption as real-world products such as smart speakers have a ﬁxed array conﬁguration.
+Our best performing system, illustrated in Fig. 3, has two DNNs. Using the real and imaginary (RI) components of multiple input signals as input features, the DNNs are trained sequentially based on single- or multi-microphone complex spectral mapping [5], [38], [39] to predict the RI components of Sq. The estimated speech by DNN1 is used to compute, at each frequency, a multi-channel Wiener ﬁlter (MCWF) [23] for the target speaker. DNN2 concatenates the RI components of the beamforming results, the outputs of DNN1, and Y as features to further estimate the RI components of Sq. The DNN1, DNN2, and MCWF modules are all designed to be frame-online, so that we can readily plug our two-DNN system into Fig. 2 to achieve enhancement with very low algorithmic latency. Note that such two-DNN systems with a beamformer in between have been explored in our previous studies [11], [38]–[40], but their target was ofﬂine processing. This paper extends them for frame-online processing with a very low algorithmic latency.
+The rest of this paper is organized as follows. Section III details the DNN conﬁgurations, Section IV describes the DNN-supported beamforming, and Section V presents the proposed enhancement system with low algorithmic latency. Experimental setup and evaluation results are presented in Sections VI and VII. Section VIII concludes this paper.
+
+III. DNN CONFIGURATIONS
+Our DNNs are trained to do complex spectral mapping [5], where the real and imaginary (RI) components of multiple signals are concatenated as input for DNNs to predict the target RI components at a reference microphone. This section describes the loss functions and the DNN architectures. The key differences from our earlier studies [11], [38]–[40] include the facts that (1) we train through the dual window size approach and deﬁne the loss function on the re-synthesized
+
+4
+
+signals; and (2) we dramatically reduce the per-frame amount of computation of the DNN models used in our earlier studies.
+A. Loss Functions
+The two DNNs in Fig. 3 are trained using different loss functions. For DNN1, following [38], [39], [41] the loss function is deﬁned on the predicted RI components and their magnitude
+LRI+Mag = Rˆq(1) − Real(Sq) 1+ Iˆq(1) − Imag(Sq) 1
++ Rˆq(1)2 + Iˆq(1)2 − |Sq| , (2)
+1
+where Rˆq(1) and Iˆq(1) are the predicted RI components by DNN1, Real(·) and Imag(·) extract RI components, and · 1 computes the L1 norm. The estimated target spectrogram at the reference microphone q is Sˆq(1) = Rˆq(1) + jIˆq(1), where j denotes the imaginary unit.
+Given the predicted RI components Rˆq(2) and Iˆq(2) by DNN2, we denote Sˆq(2) = Rˆq(2) +jIˆq(2) and compute the re-synthesized signal sˆ(q2) = iSTFT(Sˆq(2)), where iSTFT(·) uses a shorter output window for overlap-add to reduce the algorithmic latency (see Fig. 2). The loss function is then deﬁned on the re-synthesized time-domain signal and its STFT magnitude
+LWav+Mag = sˆ(q2) − sq 1+ |STFTL(sˆ(q2))|−|STFTL(sq)| ,
+1
+(3)
+where STFTL(·) extracts a complex spectrogram. The loss on magnitude is found to consistently improve objective metrics such as PESQ and STOI [41]. Note that STFTL(·) here can use any window types and window and hop sizes, and can be different from the ones we use to extract Y and Sq, since it is only used for loss computation. In our experiments, we use the square-root Hann window, a 32 ms window size and an 8 ms hop size to compute this magnitude loss. Please do not confuse these STFT parameters with the STFT parameters we used to extract Y and Sq.
+In our experiments, we will compare the two-DNN system with a single-DNN system (i.e., without the beamforming module and the second DNN). In the single-DNN case, DNN1 can be trained using either Eq. (2) or (3). Differently, in the two-DNN case, DNN1 is trained only using Eq. (2). This is because the beamformer we will derive later in Eq. (4) is based on a DNN-estimated target in the complex domain.
+B. Network Architecture
+Our DNN architecture, denoted as LSTM-ResUNet, is illustrated in Fig. 4. It is a long short-term memory (LSTM) network clamped by a U-Net [42]. Residual blocks are inserted at multiple frequency scales in the encoder and decoder of the U-Net. The motivation of this network design is that U-Net can maintain ﬁne-grained local structure via its skip connections and model contextual information along frequency through down- and up-sampling, LSTM can leverage long-range information, and residual blocks can improve discriminability. We stack the RI components of different input and output signals as features maps in the network input and output. DNN1 and
+
+Reshape
+
+192×𝑇 3-layer LSTM 192×𝑇
+
+192×𝑇×1 1×3, 1,1 , 0,0 , 1,1 , 192
+64×𝑇×3 1×3, 1,2 , 0,0 , 1,1 , 64
+30×𝑇×7 ResBlock(30)
+30×𝑇×7 1×3, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×15 ResBlock(30)
+30×𝑇×15 1×3, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×31 ResBlock(30)
+30×𝑇×31 1×3, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×63 ResBlock(30)
+30×𝑇×63 1×3, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×127 ResBlock(30)
+30×𝑇×127
+
+1×1, 1,1 , 0,0 , 1,1 , 192 1×1, 1,1 , 0,0 , 1,1 , 64 1×1, 1,1 , 0,0 , 1,1 , 30 1×1, 1,1 , 0,0 , 1,1 , 30 1×1, 1,1 , 0,0 , 1,1 , 30
+1×1, 1,1 , 0,0 , 1,1 , 30 1×1, 1,1 , 0,0 , 1,1 , 30
+
+1×3, 1,1 , 1,0 , 1,1 , 30
+
+1×3, 1,1 , 1,0 , 1,1 , 30
+
+1×3, 1,1 , 1,0 , 1,1 , 30
+
+6×𝑇×129 𝒀
+
+2×𝑇×129
+
+2×𝑇×129
+
+𝑆" ( %)
+!
+
+𝑆"!& ' ( )
+
++
+
++
+
++
+
++
+
+++ +
+
+Reshape 192×T×1
+192×𝑇×1 1×3, 1,1 , 0,0 , 1,1 , 64
+64×𝑇×3 1×4, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×7 ResBlock(30)
+30×𝑇×7 1×4, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×15 ResBlock(30)
+30×𝑇×15 1×4, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×31 ResBlock(30)
+30×𝑇×31 1×4, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×63 ResBlock(30)
+30×𝑇×63 1×4, 1,2 , 0,0 , 1,1 , 30
+30×𝑇×127 ResBlock(30)
+30×𝑇×127 1×3, 1,1 , 0,0 , 1,1 , 2
+2×𝑇×129 𝑆"!(#)
+ℒ$%&'(%)
+
+Decoder
+
++ Encoder
+
+30×𝑇×127
++
+2×3, 1,1 , 16,1 , 16,1 , 30
++
+2×3, 1,1 , 8,1 , 8,1 , 30
++
+2×3, 1,1 , 4,1 , 4,1 , 30
++
+2×3, 1,1 , 2,1 , 2,1 , 30
++
+2×3, 1,1 , 1,1 , 1,1 , 30
+30×𝑇×127
+
+Deconv2D+PReLU+BN
+Conv2D+PReLU+BN
+dsConv2D+PReLU+BN
+Conv2D+cauLN Deconv2D
+Fig. 4: Network architecture of DNN2. Each one of Conv2D, Deconv2D, Conv2D+PReLU+BN, dsConv2D+PReLU+BN, and Deconv2D+PReLU+BN blocks is speciﬁed in the format: kernelTime×kernelFreq, (strideTime, strideFreq), (padTime, padFrequency), (dilationTime, dilationFreq), featureMaps. During training, the tensor shape after each block in the encoder and decoder is denoted in the format: featureMaps×timeSteps×freqChannels.
+
+DNN2 differ only in their network input. DNN1 uses the RI components of Y to predict the RI components of Sq, and DNN2 additionally uses as input the RI components of Sˆq(1) and a beamforming result SˆqMCWF, which will be described later in Section IV. The encoder contains one two-dimensional (2D) convolution followed by causal layer normalization (cauLN) for each input signal, and six convolutional blocks, each with 2D convolution, parametric ReLU (PReLU) nonlinearity, and batch normalization (BN), for down-sampling. The LSTM contains three layers, each with 300 units. The decoder includes six blocks of 2D deconvolution, PReLU, and BN, and one 2D deconvolution, for up-sampling. Each residual block in the encoder and decoder contains ﬁve depthwise separable 2D convolution (denoted as dsConv2D) blocks, where the dilation rate along time are respectively 1, 2, 4, 8 and 16. Linear activation is used in the output layer to obtain the predicted RI components.
+All the convolution and normalization layers are causal (i.e., frame-online) at run time. We use 1 × 3 or 1 × 4 kernels along time and frequency for the down- and up-sampling convolutions, following [16]. Causal 2 × 3 convolutions are used in the residual blocks, following [16].
+Note that this architecture is similar to the earlier TCNDenseUNet architecture [11], [38]–[40]. Major changes include replacing the DenseNet blocks with residual blocks
+
+5
+
+and replacing regular 2D convolutions with depthwise separable 2D convolutions. These changes dramatically reduce the amount of computation and the number of trainable parameters. The network contains around 2.3 million parameters. It uses similar amount of computation compared with the ConvTasNet used in our experiments.
+
+IV. FREQUENCY-DOMAIN BEAMFORMING
+
+Based on the DNN-estimated target RI components, we compute an online multi-channel Wiener ﬁlter (MCWF) [33] to enhance target speech (see Fig. 3). The MCWF is computed per frequency, leveraging the narrow-band property of STFT. Although the beamforming result of such a ﬁlter usually does not show better scores in terms of enhancement metrics than the immediate DNN outputs, it can provide complementary information to help DNN2 obtain better enhancement results [11], [39], [43]. Note that our main contribution here is to show that frame-online frequency-domain beamforming can be easily integrated with our STFT-domain DNNs to improve enhancement, while not incurring any algorithmic latency. We can use more advanced beamformers, or dereverberation algorithms such as WPE [11], [31], [32], to achieve even better enhancement than MCWF. They are however out of the scope of this study. This section will ﬁrst describe the ofﬂine timeinvariant implementation of the MCWF beamformer and then extend it to frame-online.
+The MCWF [33] computes a linear ﬁlter per T-F unit or per frequency to project the mixture to target speech. Assuming the target speaker does not move within each utterance and based on the DNN-estimated target speech Sˆq(1), we compute a time-invariant MCWF per frequency through the following minimization problem
+
+min |Sˆq(1)(t, f ) − w(f ; q)HY(t, f )|2,
+
+(4)
+
+w(f ;q) t
+
+where q denotes the reference microphone and w(f ; q) ∈ CP
+
+is a P -dimensional ﬁlter. Since the objective is quadratic, a
+
+closed-form solution is available
+
+−1
+
+wˆ (f ; q) = Φˆ (yy)(f ) Φˆ (ys)(f )uq,
+
+(5)
+
+Φˆ (yy)(f ) = Y(t, f )Y(t, f )H,
+
+(6)
+
+t
+
+Φˆ (ys)(f ) = Y(t, f )Sˆ(1)(t, f )H,
+
+(7)
+
+t
+
+where Φˆ (yy)(f ) denotes the observed mixture spatial covariance matrix, Φˆ (ys)(f ) the estimated covariance matrix
+between the mixture and the target speaker, and uq is a one-
+hot vector with element q equal to one. Notice that we do not need to ﬁrst fully compute the matrix Φˆ (ys)(f ) and then take its qth column by multiplying it with uq, because
+
+∗
+
+Φˆ (ys)(f )uq = Y(t, f ) Sˆq(1)(t, f ) ,
+
+(8)
+
+t
+
+where (·)∗ computes complex conjugate. The beamforming
+
+result is computed as
+
+SˆqMCWF(t, f ) = wˆ (f ; q)HY(t, f ).
+
+(9)
+
+We point out that the DNN-estimated magnitude and phase can both be used for computing the beamformer and we only need to use our DNN to estimate the target speech at the reference microphone q. Differently, to leverage DNN-estimated magnitude and phase to compute a beamformer, earlier studies estimate the target speech at all the microphones by training a multi-channel input and multi-channel output network that can predict the target speech at all the microphones at once [15], [38], or by running a well-trained multi-channel input and single-channel output network P times at inference time [30], [39], where each microphone is considered as the reference microphone in turn. However, the former approach produces worse separation at each microphone than the latter, probably because there are many more signals to predict [38], and the latter dramatically increases the amount of computation [39].
+Differently from Eqs. (5)-(7), in a frame-online setup the statistics are accumulated online, similarly to [44], and the beamformer at each time step is computed as
+
+−1
+
+wˆ (t, f ; q) = Φˆ (yy)(t, f ) Φˆ (ys)(t, f )uq,
+
+(10)
+
+Φˆ (yy)(t, f ) = Φˆ (yy)(t − 1, f ) + Y(t, f )Y(t, f )H, (11) Φˆ (ys)(t, f ) = Φˆ (ys)(t − 1, f ) + Y(t, f )Sˆ(1)(t, f )H, (12)
+
+with Φˆ (yy)(0, f ) and Φˆ (ys)(0, f ) initialized to be all-zero. Based on the online time-varying ﬁlter wˆ (t, f ; q), the beamforming result is obtained as
+
+SˆqMCWF(t, f ) = wˆ (t, f ; q)HY(t, f ).
+
+(13)
+
+Similarly to [44], in a frame-online setup Φˆ (yy)(t)−1 in Eq. (10) can be computed iteratively according to the Woodbury formula, i.e.,
+
+Φˆ (yy)(t)−1 = (Φˆ (yy)(t − 1) + Y(t)Y(t)H)−1
+
+= Φˆ (yy)(t − 1)−1
+
+Φˆ (yy)(t − 1)−1Y(t)Y(t)HΦˆ (yy)(t − 1)−1
+
+−
+
+1 + Y(t)HΦˆ (yy)(t − 1)−1Y(t)
+
+, (14)
+
+where the frequency index f is dropped to make the equation less cluttered. This way, expensive matrix inversion at each T-F unit is avoided in the frame-online case.
+
+V. ENHANCEMENT WITH LOW ALGORITHMIC LATENCY
+In Fig. 3, there are two DNNs and an MCWF in between. Since the DNNs and beamformer all operate in the complex T-F domain, without going back and forth to the time domain, we can use the same STFT resolution for all of them to obtain a two-DNN system with a low algorithmic latency. This is different from earlier studies [23], [34], [35] that combine time-domain models with beamforming and have to switch back and forth to the time domain. Given a small hop size (say 2 ms), we can use a regular, large iWS (for example 16 ms) for STFT to have a reasonably high frequency resolution for frequency-domain beamforming. To re-synthesize Sˆq(2) to a time-domain signal, we use the last 4 ms of the 16 ms signals produced by iDFT at each frame for overlap-add, following the procedure illustrated in Fig. 2. The resulting system has an algorithmic latency of 4 ms, even though the
+
+6
+
+1.0
+
+0.8
+
+0.6
+
+0.4
+
+0.2
+0.0 0
+
+Tukey sqrtHann AsqrtHann Rect
+
+50
+
+100
+
+150
+
+200
+
+250
+
+Fig. 5: Illustration of analysis windows (assuming a window size of 16 ms and a sampling rate of 16 kHz).
+
+STFT spectrograms are extracted using a window size of 16 ms. The rest of this section describes the analysis and synthesis windows, and a future-frame prediction technique that can further reduce the 4 ms algorithmic latency to 2 ms.
+
+A. Analysis and Synthesis Window Design
+
+In our experiments, we will investigate various analysis windows such as the square-root Hann (sqrtHann) window, rectangular (Rect) window, asymmetric sqrtHann (AsqrtHann) window [24], [36], [37], and Tukey window [45]. See Fig. 5 for an illustration of the windows. Our consideration for this investigation is that for windows such as the sqrtHann window, where all the last 4 ms are in the tapering range, the tapering could make the extracted frequency components in the STFT spectrograms less representative of the last 4 ms of signals, where we aim to make predictions. One solution is to use a rectangular analysis window, which does not taper samples. However, it is well-known that rectangular windows lead to more spectral leakage due to their higher sidelobes than windows with a tapering shape [45]. Such leakage could degrade per-frequency beamforming as well as the performance of DNNs. On the other hand, the rectangular window does not taper any samples in the right end and hence the signal in that region is not modiﬁed by the window. This could be helpful for very low-latency processing, as we need to make predictions for these samples. Our study also considers the Tukey window [45], deﬁned as
+
+πn
+
+g[n] = 0.5 − 0.5 cos
+
+,
+
+αN
+
+= g[N − n],
+
+= 1,
+
+if 0 ≤ n ≤ αN ;
+
+if N − αN ≤ n < N ;
+
+otherwise,
+
+(15)
+
+where 0 ≤ n < N and tapering only happens at the ﬁrst and the last αN samples. Given a 16 ms analysis window, we set α to 116 , meaning 1 ms of tapering on both ends. We also consider the AsqrtHann window proposed in [24], [36], [37], and construct a 16 ms long AsqrtHann window by combining the ﬁrst half of a 30 ms sqrtHann window and the second half of a 2 ms sqrtHann window.
+We compute a synthesis window that can achieve perfect reconstruction when used with an analysis window g, following [46]. Suppose that the run-time oWS in samples is A and the hop size in samples is B, and that A is a multiple of B,
+
+we obtain the synthesis window l ∈ RA based on the last A samples of the analysis window
+
+g[N − A + n]
+
+l[n] =
+
+, (16)
+
+A/B−1 g[N − A + (n mod B) + kB]2
+
+k=0
+
+where 0 ≤ n < A.
+
+B. Future-Frame Prediction
+We can further reduce the algorithmic latency by training the DNN to predict, say, one frame ahead. That is, at time t, the DNN predicts the target RI components at frame t+1. This can reduce the algorithmic latency from 4 to 2 ms. We use Fig. 2 to explain the idea. To get the prediction at sample n (see the top of Fig. 2), we need to overlap-add the last 4 ms of frame t and t + 1. If the DNN only predicts the current frame, we can only do the overlap-add after we fully observe frame t + 1 and ﬁnish feed-forwarding frame t + 1. In contrast, if the DNN predicts frame t + 1 at frame t, we can do the overlapadd after we observe and ﬁnish feed-forwarding frame t. The algorithmic latency is hence reduced by 2 ms. We can predict more frames ahead to reduce the algorithmic latency to 0 ms or negative, but this comes with a degradation in performance as predicting the future is often a difﬁcult task.
+In our experiments, we ﬁnd that predicting one frame ahead does not dramatically degrade the performance. This is possibly because when predicting one frame ahead and using a loss function like Eq. (3) which requires training through iSTFT, at frame t we essentially use the input signals up to frame t to predict the sub-frame (marked in the top of Fig. 2) at frame t so that a 2 ms algorithmic latency (i.e., the length of the sub-frame) can be achieved1. We ﬁnd that it is then important to use the rectangular window as the analysis window and that using tapering-shaped windows produces noticeable artifacts near the boundary of each frame. If we use an analysis window which signiﬁcantly tapers the right end of the input signal, such as the Tukey or sqrtHann window, the DNN model would have difﬁculty predicting the signals at the right boundary of the sub-frame at frame t, because the input information especially near the right boundary would be lost due to the tapering.
+Performance degradation is however signiﬁcant when predicting two frames ahead (i.e., 4 ms in the future), and even more so when predicting three, possibly because the model now has to fully predict part of the future signal. If performance could be improved to the point that three (the value of oWS/HS + 1 in our setup) frames ahead can be accurately predicted, for example via a more powerful DNN architecture, the algorithmic latency could be reduced to −2 ms. In this case, the enhancement system could potentially achieve 0 ms processing latency if the hardware latency of processing each frame can be less than the 2 ms hop size (which would be necessary to maintain real-time processing anyway).
+1In other words, our DNN model in this case can fully observe the mixture signals of the sub-frame at frame t, and it has the opportunity to correct at frame t the errors made when predicting at frame t−1 the (then in the future) sub-frame at frame t. This could be the key reason why predicting one frame ahead performs reasonably well in our experiments.
+
+7
+
+In our two-DNN system in Fig. 3, only DNN2 can choose to predict future frames and DNN1 always predicts the current frame.
+VI. EXPERIMENTAL SETUP
+We evaluate the proposed algorithm on a noisy-reverberant speech enhancement task, using a single microphone or an array of microphones. This section describes the dataset, benchmark systems, and miscellaneous conﬁgurations.
+A. Dataset for Noisy-Reverberant Speech Enhancement
+Due to the lack of a widely adopted benchmark for multichannel noisy-reverberant speech enhancement, we build a custom dataset based on the WSJCAM0 [47] and FSD50k [48] corpora. The clean signals in WSJCAM0 are used as the speech sources. The corpus contains 7,861, 742, and 1,088 utterances respectively in its training, validation, and test sets. Using the same split of clean signals as in WSJCAM0, we simulate 39,245 (∼77.7 hours), 2,965 (∼5.6 hours), and 3,260 (∼8.5 hours) noisy-reverberant mixtures as our training, validation, and test sets, respectively. The noise sources are from the FSD50k dataset, which contains around 50,000 Freesound clips with human-labeled sound events distributed in 200 classes drawn from the AudioSet ontology [49]. We sample the clips in the development set of FSD50k to simulate the noises for training and validation, and those in the evaluation set to simulate the noises for testing. Since our task is single-speaker speech enhancement, following [50] we ﬁlter out clips containing any sounds produced by humans, based on the provided sound event annotation of each clip. Such clips have annotations such as Human voice, Male speech and man speaking, Chuckle and chortle, Yell, etc2. To generate multi-microphone noise signals, for each mixture we randomly sample up to seven noise clips. We treat each sampled clip as a point source, convolve each source with the corresponding RIR, and summate the convolved signals to create the mixture. The directions of each noise source and the target speaker to the array are independently sampled from the range [0, 2π], so the speaker and some noises could have a similar azimuth. Following the setup in the FUSS dataset [51], which is designed for universal sound separation, we consider noise clips as background noises if they are more than 10 seconds long, and as foreground noises otherwise. Each simulated mixed noise ﬁle has one background noise and the rest are foreground noises. The energy level between the dry background noise and each dry foreground noise is drawn from the range [−3, 9] dB. Considering that some FSD50k clips contain silence or digital zeros, the energy level is computed by ﬁrst removing silent segments in each clip, next computing a sample variance from the remaining samples, and then scaling the clips to an energy level based on the sample variances. After summing up all the spatialized noises, we scale the summated reverberant noise such that the SNR between the target direct-path speech and
+2See https://github.com/etzinis/fedenhance/blob/master/fedenhance/dataset maker/make librifsd50k.py for the full list.
+
+the summated reverberant noise is equal to a value sampled from the range [−8, 3] dB. Besides the FSD50k clips, in each mixture we always include a weak, diffuse, stationary airconditioning noise drawn from the REVERB corpus, where the SNR between the target direct-path speech and the noise is equal to a value sampled from the range [10, 30] dB.
+The distance between each source and the array center is drawn from the range [0.75, 2.5] m. The reverberation time (T60) is drawn from the range [0.2, 1.0] s. The simulated array is a six-microphone uniform circular array with a 20 cm diameter. The sampling rate is 16 kHz.
+
+B. Benchmark Systems
+We consider the frame-online Conv-TasNet [7] as the monaural benchmark system. Conv-TasNet is an excellent model. It can achieve enhancement with very low algorithmic latency through its very short window length, using a very small amount of computation. We considered other monaural time-domain approaches such as [13], which uses window sizes as large as typical STFT window sizes and also leverages overlap-add for signal re-synthesis. It has the same algorithmic latency as regular STFT based systems due to the overlap-add. The proposed dual window size approach can be straightforwardly applied to reduce its latency, but the model itself requires drastically more computation than Conv-TasNet, mainly due to its DenseNet modules. Another recent study [52] proposes to use low-overlap window for Wave-U-Net. However, a large window is used and their algorithmic latency is at least 38.4 ms. We therefore only consider Conv-TasNet as the monaural baseline. We also considered other frame-online T-F domain models such as the winning solutions in the DNS challenges [19]. However, they are targeted at teleconferencing scenarios, where a processing latency as large as 40 ms is allowed. For example, DCCRN [14] has an algorithmic latency of 62.5 ms and TSCN-PP [53] 20 ms. In addition, these models share many similarities with our complex T-F domain DNN models and can straightforwardly leverage our proposed techniques to reduce their algorithmic latency. We therefore do not include them as baselines.
+We consider the frame-online multi-channel Conv-TasNet [25], [28], denoted as MC-Conv-TasNet, as the main multichannel baseline. Compared with monaural Conv-TasNet, MCConv-TasNet introduces a spatial encoder in addition to the spectral encoder in the original Conv-TasNet to exploit spatial information. The spatial embedding produced by the spatial encoder is used as extra features for the network to better mask the spectral embedding. Following [25], [28], we set the spatial embedding dimension to 60 for two-channel processing and to 360 for six-channel processing. Note that MC-ConvTasNet is also the enhancement component within the winning system [25] of the recent Clarity challenge, a major effort in advancing very low-latency speech enhancement.
+The Conv-TasNet models are trained either by
+
+LWav = sˆq − sq 1,
+
+(17)
+
+where sˆq denotes the predicted signal, or by Eq. (3). The magnitude loss in Eq. (3) can signiﬁcantly improve speech
+
+8
+
+TABLE I #PARAMS (M), FLOPS (G), SI-SDR (DB), PESQ, AND ESTOI (%) RESULTS FOR MONAURAL ENHANCEMENT.
+
+Entry Systems
+
+DNN1 Loss
+
+Window
+
+Last DNN predicts Algorithmic
+
+type #DFT iWS oWS HS #frames ahead latency (ms) #params FLOPs SI-SDR PESQ
+
+0 Unprocessed
+
+-
+
+-
+
+- - --
+
+-
+
+-
+
+-
+
+- −6.2 1.44
+
+1a DNN1 1b DNN1 1c DNN1
+
+RI+Mag Tukey 256 16 4 2
+
+0
+
+Wav+Mag Tukey 256 16 4 2
+
+0
+
+Wav+Mag Tukey 256 16 4 2
+
+1
+
+4
+
+2.32 27.8 2.8 1.85
+
+4
+
+2.32 27.8 2.9 1.91
+
+2
+
+2.32 27.8 2.2 1.79
+
+2a DNN1 2b DNN1 2c DNN1 2d DNN1
+
+Wav+Mag Rect 256 16 4 2
+
+0
+
+Wav+Mag Rect 256 16 4 2
+
+1
+
+Wav+Mag Rect 256 16 4 2
+
+2
+
+Wav+Mag Rect 256 16 4 2
+
+3
+
+4
+
+2.32 27.8 2.8 1.90
+
+2
+
+2.32 27.8 2.5 1.85
+
+0
+
+2.32 27.8 −3.6 1.71
+
+−2
+
+2.32 27.8 −5.5 1.63
+
+3a Conv-TasNet [7]
+
+Wav
+
+-
+
+- 4 42
+
+0
+
+3b Conv-TasNet [7]
+
+Wav+Mag -
+
+- 4 42
+
+0
+
+3c Conv-TasNet [7]
+
+Wav+Mag -
+
+- 4 41
+
+0
+
+3d Conv-TasNet [7]
+
+Wav+Mag -
+
+- 2 21
+
+0
+
+4
+
+6.18 29.4 2.3 1.58
+
+4
+
+6.18 29.4 2.2 1.78
+
+4
+
+6.18 54.5 2.4 1.83
+
+2
+
+6.14 52.2 2.2 1.77
+
+4a Oracle Monaural SMM
+
+-
+
+sqrtHann 512 32 32 8
+
+-
+
+4b Oracle Monaural PSM
+
+-
+
+sqrtHann 512 32 32 8
+
+-
+
+-
+
+-
+
+-
+
+1.0 3.31
+
+-
+
+-
+
+-
+
+5.9 3.55
+
+eSTOI
+41.1
+67.0 68.4 64.9
+68.2 66.6 62.2 58.7
+61.7 65.7 66.7 65.1
+90.3 90.3
+
+TABLE II SI-SDR (DB), PESQ, AND ESTOI (%) RESULTS USING VARIOUS ANALYSIS WINDOWS FOR SIX-MICROPHONE ENHANCEMENT.
+
+Entry Systems
+
+DNN1 Loss
+
+Window
+
+Last DNN predicts Algorithmic
+
+type #DFT iWS oWS HS #frames ahead latency (ms) #params FLOPs SI-SDR PESQ
+
+0 Unprocessed
+
+-
+
+-
+
+- - --
+
+-
+
+-
+
+-
+
+- −6.2 1.44
+
+1a DNN1
+
+RI+Mag sqrtHann 256 16 4 2
+
+0
+
+1b DNN1
+
+RI+Mag AsqrtHann 256 16 4 2
+
+0
+
+1c DNN1
+
+RI+Mag Rect 256 16 4 2
+
+0
+
+1d DNN1
+
+RI+Mag Tukey 256 16 4 2
+
+0
+
+4
+
+2.33 28.3 5.9 2.17
+
+4
+
+2.33 28.3 6.0 2.13
+
+4
+
+2.33 28.3 6.0 2.13
+
+4
+
+2.33 28.3 6.0 2.16
+
+2a DNN1
+
+Wav+Mag sqrtHann 256 16 4 2
+
+0
+
+2b DNN1
+
+Wav+Mag AsqrtHann 256 16 4 2
+
+0
+
+2c DNN1
+
+Wav+Mag Rect 256 16 4 2
+
+0
+
+2d DNN1
+
+Wav+Mag Tukey 256 16 4 2
+
+0
+
+4
+
+2.33 28.3 6.4 2.25
+
+4
+
+2.33 28.3 6.3 2.25
+
+4
+
+2.33 28.3 6.2 2.23
+
+4
+
+2.33 28.3 6.4 2.26
+
+eSTOI
+41.1
+75.7 75.9 75.1 76.0
+77.3 77.2 76.7 77.3
+
+intelligibility and quality metrics [41]. Using the notations of Conv-TasNet (in Table I of [7]), the hyper-parameters are set to N = 512, B = 158, Sc = 158, H = 512, P = 3, X = 8, and R = 3 for the single- and multi-channel Conv-TasNets. B and Sc here are slightly larger than the default 128 in [7], since in multi-channel processing there are additional spatial embeddings concatenated to the 512-dimensional spectral embedding as the input to the TCN module of Conv-TasNet.
+C. Miscellaneous Conﬁgurations
+The MCWF beamforming ﬁlter is updated at each frame. We pad (iWS − HS) ms of zero samples at the beginning of each mixture. Without the padding, the algorithmic latency for the starting samples would be higher.
+For metric computation, we always use the target directpath signal as the reference. It is obtained by setting the T60 parameter to zero when generating RIRs. Our main evaluation metric is the scale-invariant signal-to-distortion ratio (SI-SDR) [54], which measures the quality of time-domain samplelevel predictions. We also report extended short-time objective intelligibility (eSTOI) [55] and perceptual evaluation of speech quality (PESQ) scores. For PESQ, narrow-band MOS-LQO scores based on the ITU P.862.1 standard [56] are reported using the python-pesq toolkit3.
+For the DNN models, we use the ptﬂops toolkit4 to count the number of ﬂoating-point operations (FLOPs) to process
+3https://github.com/ludlows/python-pesq, v0.0.2 4https://github.com/sovrasov/ﬂops-counter.pytorch
+
+a 4-second mixture. When reporting the FLOPs of an STFTbased system, we summate the DNN FLOPs and the FLOPs of beamforming, STFT, and iSTFT. Note that two FLOPs is roughly equivalent to one multiply–accumulate operation.
+VII. EVALUATION RESULTS
+Tables I, III and IV report the results of one-, six- and two-microphone enhancement, respectively. In each table, we provide the algorithmic latency of each model, along with the number of model parameters and FLOPs. When comparing the results, we always take into account the algorithmic latency and the amount of computation.
+A. Comparison of Loss Functions
+We observe that training through the proposed overlap-add procedure using the Wav+Mag loss function in Eq. (3) leads to clear improvement over using the RI+Mag loss in Eq. (2), which does not train through the signal re-synthesis procedure. This can be observed from entries 1a vs. 1b in Table I, 1a1d vs. 2a-2d in Table II, and 1a vs. 1b in Table III and IV. Using the Wav+Mag loss in Eq. (3) rather than the Wav loss in Eq. (17) dramatically improves Conv-TasNet’s scores on PESQ and STOI (see 3a vs. 3b in Table I, and 5a vs. 5b in III and IV). This aligns with our ﬁndings in [41], which only deals with ofﬂine enhancement.
+B. Comparison of Analysis Windows
+We ﬁrst look at the case where, at each frame, the DNNs are trained to make predictions for the current frame. When using
+
+9
+
+TABLE III #PARAMS (M), FLOPS (G), SI-SDR (DB), PESQ, AND ESTOI (%) RESULTS ON SIX-MICROPHONE ENHANCEMENT.
+
+Entry Systems
+
+DNN1 Loss
+
+DNN2 Loss
+
+Window
+
+Last DNN predicts Algorithmic
+
+type #DFT iWS oWS HS #frames ahead latency (ms) #params FLOPs SI-SDR PESQ
+
+0 Unprocessed
+
+-
+
+-
+
+-
+
+- - --
+
+-
+
+-
+
+-
+
+- −6.2 1.44
+
+1a DNN1
+
+RI+Mag
+
+-
+
+Tukey 256 16 4 2
+
+0
+
+1b DNN1
+
+Wav+Mag
+
+-
+
+Tukey 256 16 4 2
+
+0
+
+1c DNN1
+
+Wav+Mag
+
+-
+
+Tukey 256 16 4 2
+
+1
+
+2a DNN1+MCWF+DNN2 RI+Mag Wav+Mag Tukey 256 16 4 2
+
+0
+
+2b DNN1+MCWF+DNN2 RI+Mag Wav+Mag Tukey 256 16 4 2
+
+1
+
+4
+
+2.33 28.3 6.0 2.16
+
+4
+
+2.33 28.3 6.4 2.26
+
+2
+
+2.33 28.3 5.2 2.10
+
+4
+
+4.67 57.1 7.9 2.70
+
+2
+
+4.67 57.1 6.8 2.47
+
+3a DNN1
+
+Wav+Mag
+
+-
+
+Rect 256 16 4 2
+
+0
+
+3b DNN1
+
+Wav+Mag
+
+-
+
+Rect 256 16 4 2
+
+1
+
+3c DNN1
+
+Wav+Mag
+
+-
+
+Rect 256 16 4 2
+
+2
+
+4a DNN1+MCWF+DNN2 RI+Mag Wav+Mag Rect 256 16 4 2
+
+0
+
+4b DNN1+MCWF+DNN2 RI+Mag Wav+Mag Rect 256 16 4 2
+
+1
+
+4c DNN1+MCWF+DNN2 RI+Mag Wav+Mag Rect 256 16 4 2
+
+2
+
+4d DNN1+MCWF+DNN2 RI+Mag Wav+Mag Rect 256 16 4 2
+
+3
+
+4
+
+2.33 28.3 6.2 2.23
+
+2
+
+2.33 28.3 5.9 2.20
+
+0
+
+2.33 28.3 −2.1 1.94
+
+4
+
+4.67 57.1 7.7 2.64
+
+2
+
+4.67 57.1 7.1 2.50
+
+0
+
+4.67 57.1 −1.2 2.23
+
+−2
+
+4.67 57.1 −2.8 2.11
+
+5a MC-Conv-TasNet [25] Wav
+
+-
+
+-
+
+- 4 42
+
+0
+
+5b MC-Conv-TasNet [25] Wav+Mag
+
+-
+
+-
+
+- 4 42
+
+0
+
+5c MC-Conv-TasNet [25] Wav+Mag
+
+-
+
+-
+
+- 4 41
+
+0
+
+5d MC-Conv-TasNet [25] Wav+Mag
+
+-
+
+-
+
+- 2 21
+
+0
+
+4
+
+6.37 30.1 5.5 1.96
+
+4
+
+6.37 30.1 5.2 2.24
+
+4
+
+6.37 56.1 5.7 2.33
+
+2
+
+6.27 53.2 5.7 2.29
+
+eSTOI
+41.1
+76.0 77.3 74.0 84.0 80.7
+76.7 76.2 70.0 83.2 81.1 76.4 73.4
+73.2 76.4 77.9 77.3
+
+TABLE IV #PARAMS (M), FLOPS (G), SI-SDR (DB), PESQ, AND ESTOI (%) RESULTS ON TWO-MICROPHONE ENHANCEMENT.
+
+Entry Systems
+
+DNN1 Loss
+
+DNN2 Loss
+
+Window
+
+Last DNN predicts Algorithmic
+
+type #DFT iWS oWS HS #frames ahead latency (ms) #params FLOPs SI-SDR PESQ
+
+0 Unprocessed
+
+-
+
+-
+
+-
+
+- - --
+
+-
+
+-
+
+-
+
+- −6.2 1.44
+
+1a DNN1
+
+RI+Mag
+
+-
+
+Tukey 256 16 4 2
+
+0
+
+1b DNN1
+
+Wav+Mag
+
+-
+
+Tukey 256 16 4 2
+
+0
+
+1c DNN1
+
+Wav+Mag
+
+-
+
+Tukey 256 16 4 2
+
+1
+
+2a DNN1+MCWF+DNN2 RI+Mag Wav+Mag Tukey 256 16 4 2
+
+0
+
+2b DNN1+MCWF+DNN2 RI+Mag Wav+Mag Tukey 256 16 4 2
+
+1
+
+4
+
+2.32 28.0 4.0 1.97
+
+4
+
+2.32 28.0 4.2 2.05
+
+2
+
+2.32 28.0 3.3 1.92
+
+4
+
+4.66 56.1 4.8 2.17
+
+2
+
+4.66 56.1 4.1 2.06
+
+3a DNN1
+
+Wav+Mag
+
+-
+
+Rect 256 16 4 2
+
+0
+
+3b DNN1
+
+Wav+Mag
+
+-
+
+Rect 256 16 4 2
+
+1
+
+3c DNN1
+
+Wav+Mag
+
+-
+
+Rect 256 16 4 2
+
+2
+
+4a DNN1+MCWF+DNN2 RI+Mag Wav+Mag Rect 256 16 4 2
+
+0
+
+4b DNN1+MCWF+DNN2 RI+Mag Wav+Mag Rect 256 16 4 2
+
+1
+
+4c DNN1+MCWF+DNN2 RI+Mag Wav+Mag Rect 256 16 4 2
+
+2
+
+4d DNN1+MCWF+DNN2 RI+Mag Wav+Mag Rect 256 16 4 2
+
+3
+
+4
+
+2.33 28.0 4.3 2.06
+
+2
+
+2.33 28.0 3.7 1.97
+
+0
+
+2.33 28.0 −3.2 1.81
+
+4
+
+4.66 56.1 4.8 2.19
+
+2
+
+4.66 56.1 4.3 2.07
+
+0
+
+4.66 56.1 −2.4 1.88
+
+−2
+
+4.66 56.1 −4.1 1.82
+
+5a MC-Conv-TasNet [25] Wav
+
+-
+
+-
+
+- 4 42
+
+0
+
+5b MC-Conv-TasNet [25] Wav+Mag
+
+-
+
+-
+
+- 4 42
+
+0
+
+5c MC-Conv-TasNet [25] Wav+Mag
+
+-
+
+-
+
+- 4 41
+
+0
+
+5d MC-Conv-TasNet [25] Wav+Mag
+
+-
+
+-
+
+- 2 21
+
+0
+
+4
+
+6.19 29.4 3.6 1.73
+
+4
+
+6.19 29.4 3.6 2.00
+
+4
+
+6.19 54.6 3.8 2.04
+
+2
+
+6.15 52.3 3.8 2.02
+
+eSTOI
+41.1
+70.8 72.1 68.7 74.5 72.2
+72.6 70.1 65.5 74.9 72.4 67.7 65.5
+67.0 71.1 72.0 71.4
+
+the Wav+Mag loss and training through the re-synthesis procedure, we ﬁnd that using different window functions including sqrtHann, AsqrtHann, rectangular, and Tukey windows does not produce notable differences in performance. This can be observed from 2a-2d in Table II. This is likely because, via the training-through procedure, the DNNs could learn to deal with the slight differences in the synthesis windows. Among all the considered windows, the Tukey window appears slightly better than the others. This can also be observed from 1a-1d in Table II.
+We then look at the results when using the DNNs to predict one frame ahead, which can reduce the algorithmic latency from 4 to 2 ms. We observe that using the Tukey window leads to more degradation (see 1b vs. 1c in Tables I, III and IV and check the “Last DNN predicts #frames ahead” column) than the rectangular window (see 2a vs. 2b in Table I, 3a vs. 3b in III and IV). In the end, the Tukey window leads to worse performance than the rectangular window (see 1c vs. 2b in Table I, 1c vs. 3b in III and IV). Predicting two frames ahead, which can reduce the algorithmic latency to 0 ms, does not work very well (see 2a and 2b vs. 2c in Table I, and 3a and
+
+3b vs. 3c in III and IV), especially in terms of SI-SDR.
+C. Effectiveness of Beamforming
+Comparing 1b and 2a, and 3a and 4a of Table III, we can see that with a beamformer and a post-ﬁltering network, DNN1+MCWF+DNN2 leads to clear improvements especially on PESQ and eSTOI over using DNN1. Similar trend is observed by comparing 1b and 2a, as well as 3a and 4a of Table IV.
+D. Comparison with Conv-TasNet
+In Tables I, III, and IV, we provide the results obtained by single- or multi-channel Conv-TasNet [7], [25]. We experiment with 4/2, 4/1, and 2/1 ms window/hop sizes. Their algorithmic latencies are respectively 4, 4, and 2 ms, and the latter two approximately double the amount of computation used by the ﬁrst one due to their reduced hop size. In all tables, we found that using 4/1 ms window/hop sizes yields consistently better enhancement scores than the other two, possibly because of its higher frame overlap.
+
+10
+
+Let us ﬁrst look at Table I, the monaural results. Our models use fewer number of parameters than Conv-TasNet (i.e., 2.32 M vs. 6.18 M). When the algorithmic latency is restrained to 4 ms, our system 1b (and 2a) produces better enhancement performance not only than 3b, using a similar number of FLOPs, but also than the best Conv-TasNet model 3c, using around half of the FLOPs. When the algorithmic latency is limited to 2 ms, the proposed 2b, which predicts one frame ahead, shows better scores than 3d, using around half of the FLOPs.
+We now look at Table III. At 4 ms algorithmic latency, 1b and 3a show slightly better (or comparable in some metrics) results than 5b, using a similar number of FLOPs. The DNN1+MCWF+DNN2 model contains two DNNs and hence at least doubles the amount of computation of DNN1. At 4 ms algorithmic latency, our systems in 2a and 4a show clearly better enhancement scores than 5c, using a comparable number of FLOPs. In 4b, DNN2 predicts one frame ahead and reduces the algorithmic latency to 2 ms. The enhancement scores are clearly better than those in 5d, which also have an algorithmic latency of 2 ms, again using a similar number of FLOPs. Indeed, 4b uses two DNNs, each operating at a hop size of 2 ms, and 5d only uses one DNN but the DNN operates at a hop size of 1 ms. The comparison between 4b and 5d suggests a new and promising way of achieving speech enhancement with a very low algorithmic latency. Earlier studies like time-domain methods [7], [9] tend to use very small window and hop sizes to reduce the algorithmic latency and improve the performance, but this signiﬁcantly increases the amount of computation due to an increased number of frames. Differently, we could use larger window and hop sizes (and hence fewer frames) together with more powerful DNN models (such as the proposed two-DNN system with a beamformer in between, which uses more computation at each frame), and at the same time use the proposed future-frame prediction technique to reduce the algorithmic latency.
+Similar trends as in Table III can be observed in IV for two-microphone enhancement.
+These comparisons suggest that we can achieve reasonably good speech enhancement with an algorithmic latency as low as 2 ms in the STFT domain, and that operating in the STFT domain may rival or even outperform processing in the time domain for speech enhancement with very low algorithmic latency.
+E. Towards Zero Processing Latency
+In systems 2c and 2d of Table I and 4c and 4d of Tables III and IV, we train our DNNs to predict two or three frames ahead. This further reduces the algorithmic latency at the cost of a degradation in performance, compared with the case when we predict one frame ahead. The degradation is particularly large for SI-SDR, likely because predicting the phase of future frames is difﬁcult. PESQ and eSTOI, which are less inﬂuenced by phase, maintain a decent level of performance, even rivaling at 0 ms algorithmic latency in the six-microphone case with a single-DNN system or an MC-Conv-TasNet system with 4 ms algorithmic latency (see 4c vs. 1b and 5c in Table III).
+
+One notable advantage of predicting three frames ahead is that the enhancement system could potentially have a zero processing latency, if the hardware is powerful enough such that the hardware latency can be less than the 2 ms hop size.
+VIII. CONCLUSION
+We have adapted a dual window size approach for deep learning based speech enhancement with very low algorithmic latency in the STFT domain. Our approach can easily integrate complex T-F domain DNNs with frequency-domain beamforming to achieve better enhancement, without introducing additional algorithmic latency. A future-frame prediction technique is proposed to further reduce the algorithmic latency. Evaluation results on a simulated speech enhancement task in noisy-reverberant conditions demonstrate the effectiveness of our algorithms, and show that our STFT-based system can work well at an algorithmic latency as low as 2 ms. The proposed algorithms can be straightforwardly utilized by, or modiﬁed for, many T-F domain or time-domain speech enhancement and source separation systems to reduce their algorithmic latency.
+The major limitation of our current study comes from the assumption that each frame can be processed within the hop time by hardware in an online streaming setup. This assumption may not be realistic for edge devices, such as standalone hearing aids with limited computing capability, or even for modern GPUs, unless there is careful design that can enable the system to achieve frame-by-frame online processing, especially for heavy-duty DNN models. An ideal speech enhancement system would have a small number of trainable parameters and require a small amount of run-time memory and computation, at the same time achieving high enhancement performance with very low processing latency. A practical system will likely have to strike a trade-off among these goals, and requires good engineering skills. Our current study focuses on improving enhancement performance and achieving very low algorithmic latency. Moving forward, we will consider (a) reducing the DNN complexity and using light-weight DNN blocks [57]; (b) pruning network connections [16] or quantizing DNN weights [58]; (c) reducing frequency resolution by using a shorter analysis window; and (d) performing less frequent updates of the beamforming ﬁlters.
+REFERENCES
+[1] D. Wang and J. Chen, “Supervised Speech Separation Based on Deep Learning: An Overview,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 26, no. 10, pp. 1702–1726, 2018.
+[2] Y. Wang and D. Wang, “Towards Scaling Up Classiﬁcation-Based Speech Separation,” IEEE Trans. Audio, Speech, Lang. Process., vol. 21, no. 7, pp. 1381–1390, 2013.
+[3] Y. Xu, J. Du, L.-R. Dai, and C.-H. Lee, “A Regression Approach to Speech Enhancement Based on Deep Neural Networks,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 23, no. 1, pp. 7–19, 2015.
+[4] J. Le Roux, G. Wichern, S. Watanabe, A. Sarroff, and J. R. Hershey, “Phasebook and Friends: Leveraging Discrete Representations for Source Separation,” IEEE Journal on Selected Topics in Signal Processing, vol. 13, no. 2, pp. 370–382, 2019.
+[5] D. S. Williamson, Y. Wang, and D. Wang, “Complex Ratio Masking for Monaural Speech Separation,” IEEE/ACM Trans. Audio, Speech, Lang. Process., pp. 483–492, 2016.
+
+11
+
+[6] S. Pascual, A. Bonafonte, and J. Serr, “SEGAN : Speech Enhancement Generative Adversarial Network,” in Proc. Interspeech, 2017, pp. 3642– 3646.
+[7] Y. Luo and N. Mesgarani, “Conv-TasNet: Surpassing Ideal TimeFrequency Magnitude Masking for Speech Separation,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 27, no. 8, pp. 1256–1266, 2019.
+[8] K. Tan and D. Wang, “Learning Complex Spectral Mapping With Gated Convolutional Recurrent Networks for Monaural Speech Enhancement,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 28, pp. 380–390, 2020.
+[9] Y. Luo, Z. Chen, and T. Yoshioka, “Dual-Path RNN: Efﬁcient Long Sequence Modeling for Time-Domain Single-Channel Speech Separation,” in Proc. ICASSP, 2020, pp. 46–50.
+[10] C. Subakan, M. Ravanelli, S. Cornell et al., “Attention Is All You Need In Speech Separation,” in Proc. ICASSP, 2021, pp. 21–25.
+[11] Z.-Q. Wang, G. Wichern, and J. Le Roux, “Convolutive Prediction for Monaural Speech Dereverberation and Noisy-Reverberant Speaker Separation,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 29, pp. 3476–3490, 2021.
+[12] K. Wilson, M. Chinen et al., “Exploring Tradeoffs in Models for LowLatency Speech Enhancement,” in Proc. IWAENC, 2018, pp. 366–370.
+[13] A. Pandey and D. Wang, “Densely Connected Neural Network with Dilated Convolutions for Real-Time Speech Enhancement in The Time Domain,” in Proc. ICASSP, 2020, pp. 6629–6633.
+[14] Y. Hu, Y. Liu, S. Lv et al., “DCCRN: Deep Complex Convolution Recurrent Network for Phase-Aware Speech Enhancement,” in Proc. Interspeech, 2020, pp. 2472–2476.
+[15] C. Han et al., “Real-Time Binaural Speech Separation with Preserved Spatial Cues,” in Proc. ICASSP, 2020, pp. 6404–6408.
+[16] K. Tan, X. Zhang, and D. Wang, “Deep Learning Based Real-Time Speech Enhancement for Dual-Microphone Mobile Phones,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 29, pp. 1853–1863, 2021.
+[17] A. van den Oord, S. Dieleman, H. Zen et al., “WaveNet: A Generative Model for Raw Audio,” in arXiv preprint arXiv:1609.03499, 2016.
+[18] D. Rethage, J. Pons et al., “A WaveNet for Speech Denoising,” in Proc. ICASSP, 2018, pp. 5069–5073.
+[19] C. K. A. Reddy, V. Gopal, R. Cutler et al., “The INTERSPEECH 2020 Deep Noise Suppression Challenge: Datasets, Subjective Speech Quality and Testing Framework,” in Proc. Interspeech, 2020, pp. 2492–2496.
+[20] “Clarity Challenge: Machine learning Challenges for Hearing Devices.” [Online]. Available: http://claritychallenge.org/
+[21] Y. A. Huang and J. Benesty, “A Multi-Frame Approach to The Frequency-Domain Single-Channel Noise Reduction Problem,” IEEE Trans. Audio, Speech, Lang. Process., vol. 20, no. 4, pp. 1256–1269, 2012.
+[22] H. Gode, M. Tammen, and S. Doclo, “Combining Binaural LCMP Beamforming and Deep Multi-Frame Filtering for Joint Dereverberation and Interferer Reduction in The Clarity-2021 Challenge,” in Proc. Clarity, 2021, pp. 2–3.
+[23] Z.-Q. Wang, H. Erdogan, S. Wisdom et al., “Sequential Multi-Frame Neural Beamforming for Speech Separation and Enhancement,” in Proc. SLT, 2021, pp. 905–911.
+[24] S. Wang, G. Naithani, A. Politis, and T. Virtanen, “Deep Neural Network Based Low-latency Speech Separation with Asymmetric analysisSynthesis Window Pair,” in Proc. EUSIPCO, 2021.
+[25] Z. Tu, J. Zhang et al., “A Two-Stage End-to-End System for Speechin-Noise Hearing Aid Processing,” in Proc. Clarity, 2021, pp. 3–5.
+[26] K. Zmolikova and J. H. Cernock, “BUT System for the First Clarity Enhancement Challenge,” in Proc. Clarity, 2021, pp. 1–3.
+[27] T. Gajecki and W. Nogueira, “Binaural Speech Enhancement Based on Deep Attention Layers,” in Proc. Clarity, 2021, pp. 6–8.
+[28] J. Zhang, C. Zorila, R. Doddipatla, and J. Barker, “On End-to-End Multi-Channel Time Domain Speech Separation in Reverberant Environments,” in Proc. ICASSP, 2020, pp. 6389–6393.
+[29] J. Heitkaemper, D. Jakobeit et al., “Demystifying TasNet: A Dissecting Approach,” in Proc. ICASSP, 2020, pp. 6359–6363.
+[30] W. Zhang, J. Shi, C. Li, S. Watanabe, and Y. Qian, “Closing The Gap Between Time-Domain Multi-Channel Speech Enhancement on Real and Simulation Conditions,” in Proc. WASPAA, 2021, pp. 146–150.
+[31] T. Yoshioka, A. Sehr, M. Delcroix et al., “Making Machines Understand Us in Reverberant Rooms: Robustness against Reverberation for Automatic Speech Recognition,” IEEE Signal Processing Magazine, vol. 29, no. 6, pp. 114–126, 2012.
+[32] R. Haeb-Umbach, J. Heymann, L. Drude et al., “Far-Field Automatic Speech Recognition,” Proc. IEEE, 2020.
+
+[33] S. Gannot, E. Vincent, S. Markovich-Golan, and A. Ozerov, “A Consolidated Perspective on Multi-Microphone Speech Enhancement and Source Separation,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 25, pp. 692–730, 2017.
+[34] T. Ochiai, M. Delcroix, R. Ikeshita et al., “Beam-TasNet: Time-Domain Audio Separation Network Meets Frequency-Domain Beamformer,” in Proc. ICASSP, 2020, pp. 6384–6388.
+[35] H. Chen and P. Zhang, “Beam-Guided TasNet: An Iterative Speech Separation Framework with Multi-Channel Output,” in arXiv preprint arXiv:2102.02998v3, 2021.
+[36] D. Mauler and R. Martin, “A Low Delay, Variable Resolution, Perfect Reconstruction Spectral Analysis-Synthesis System for Speech Enhancement,” in Proc. EUSIPCO, 2007, pp. 222–226.
+[37] S. U. Wood and J. Rouat, “Unsupervised Low Latency Speech Enhancement With RT-GCC-NMF,” IEEE Journal on Selected Topics in Signal Processing, vol. 13, no. 2, pp. 332–346, 2019.
+[38] Z.-Q. Wang and D. Wang, “Multi-Microphone Complex Spectral Mapping for Speech Dereverberation,” in Proc. ICASSP, 2020, pp. 486–490.
+[39] Z.-Q. Wang, P. Wang, and D. Wang, “Multi-Microphone Complex Spectral Mapping for Utterance-Wise and Continuous Speech Separation,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 29, pp. 2001– 2014, 2021.
+[40] ——, “Complex Spectral Mapping for Single- and Multi-Channel Speech Enhancement and Robust ASR,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 28, pp. 1778–1787, 2020.
+[41] Z.-Q. Wang, G. Wichern, and J. Le Roux, “On The Compensation Between Magnitude and Phase in Speech Separation,” IEEE Signal Process. Lett., vol. 28, pp. 2018–2022, 2021.
+[42] O. Ronneberger, P. Fischer, and T. Brox, “U-Net: Convolutional Networks for Biomedical Image Segmentation,” in Proc. MICCAI, 2015.
+[43] Z.-Q. Wang, G. Wichern, and J. Le Roux, “Leveraging Low-Distortion Target Estimates for Improved Speech Enhancement,” arXiv preprint arXiv:2110.00570, 2021.
+[44] T. Higuchi, K. Kinoshita, N. Ito, S. Karita, and T. Nakatani, “Frame-byFrame Closed-Form Update for Mask-Based Adaptive MVDR Beamforming,” in Proc. ICASSP, 2018, pp. 531–535.
+[45] “Window Function.” [Online]. Available: https://en.wikipedia.org/wiki/ Window function
+[46] D. W. Grifﬁn and J. S. Lim, “Signal Estimation from Modiﬁed ShortTime Fourier Transform,” IEEE Trans. Acoust., Speech, Signal Process., vol. 32, no. 2, pp. 236–243, 1984.
+[47] T. Robinson, J. Fransen, D. Pye, J. Foote, and S. Renals, “WSJCAM0: A British English Speech Corpus for Large Vocabulary Continuous Speech Recognition,” in Proc. ICASSP, vol. 1, 1995, pp. 81–84.
+[48] E. Fonseca, X. Favory, J. Pons, F. Font, and X. Serra, “FSD50K: An Open Dataset of Human-Labeled Sound Events,” IEEE/ACM Trans. Audio, Speech, Lang. Process., 2021.
+[49] J. F. Gemmeke, D. P.W. Ellis, D. Freedman et al., “Audio Set: An Ontology and Human-Labeled Dataset for Audio Events,” in Proc. ICASSP, 2017, pp. 776–780.
+[50] E. Tzinis, J. Casebeer, Z. Wang, and P. Smaragdis, “Separate But Together: Unsupervised Federated Learning for Speech Enhancement from Non-IID Data,” in Proc. WASPAA, 2021.
+[51] S. Wisdom, H. Erdogan, D. P. W. Ellis et al., “What’s All The Fuss About Free Universal Sound Separation Data?” in Proc. ICASSP, 2021, pp. 186–190.
+[52] S. Nakaoka, L. Li, S. Makino, and T. Yamada, “Reducing Algorithmic Delay using Low-Overlap Window for Online Wave-U-Net,” in Proc. APSIPA, 2021, pp. 1210–1214.
+[53] A. Li, W. Liu, X. Luo et al., “ICASSP 2021 Deep Noise Suppression Challenge: Decoupling Magnitude and Phase Optimization with a TwoStage Deep Network,” in Proc. ICASSP, 2021, pp. 6628–6632.
+[54] J. Le Roux, S. Wisdom, H. Erdogan, and J. R. Hershey, “SDR - HalfBaked or Well Done?” in Proc. ICASSP, 2019, pp. 626–630.
+[55] C. H. Taal, R. C. Hendriks et al., “An Algorithm for Intelligibility Prediction of Time-Frequency Weighted Noisy Speech,” IEEE Trans. Audio, Speech, Lang. Process., vol. 19, no. 7, pp. 2125–2136, 2011.
+[56] “P.862.1 : Mapping function for transforming P.862 raw result scores to MOS-LQO,” 2003. [Online]. Available: https://www.itu.int/ rec/T-REC-P.862.1-200311-I/en
+[57] Y. Luo, C. Han, and N. Mesgarani, “Group Communication with Context Codec for Lightweight Source Separation,” IEEE/ACM Trans. Audio, Speech, Lang. Process., vol. 29, pp. 1752–1761, 2021.
+[58] M. Kim and P. Smaragdis, “Bitwise Neural Networks for Efﬁcient Single-Channel Source Separation,” in Proc. ICASSP, 2018, pp. 701– 705.
+
+

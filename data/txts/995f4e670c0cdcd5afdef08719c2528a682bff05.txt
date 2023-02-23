@@ -1,0 +1,843 @@
+FAST-MD: FAST MULTI-DECODER END-TO-END SPEECH TRANSLATION WITH NON-AUTOREGRESSIVE HIDDEN INTERMEDIATES
+Hirofumi Inaguma1, Siddharth Dalmia2, Brian Yan2, Shinji Watanabe2
+1Kyoto University, Japan 2Carnegie Mellon University, USA
+
+arXiv:2109.12804v1 [eess.AS] 27 Sep 2021
+
+ABSTRACT
+The multi-decoder (MD) end-to-end speech translation model has demonstrated high translation quality by searching for better intermediate automatic speech recognition (ASR) decoder states as hidden intermediates (HI). It is a two-pass decoding model decomposing the overall task into ASR and machine translation sub-tasks. However, the decoding speed is not fast enough for real-world applications because it conducts beam search for both sub-tasks during inference. We propose Fast-MD, a fast MD model that generates HI by non-autoregressive (NAR) decoding based on connectionist temporal classiﬁcation (CTC) outputs followed by an ASR decoder. We investigated two types of NAR HI: (1) parallel HI by using an autoregressive Transformer ASR decoder and (2) masked HI by using Mask-CTC, which combines CTC and the conditional masked language model. To reduce a mismatch in the ASR decoder between teacher-forcing during training and conditioning on CTC outputs during testing, we also propose sampling CTC outputs during training. Experimental evaluations on three corpora show that FastMD achieved about 2× and 4× faster decoding speed than that of the na¨ıve MD model on GPU and CPU with comparable translation quality. Adopting the Conformer encoder and intermediate CTC loss further boosts its quality without sacriﬁcing decoding speed.
+Index Terms— End-to-end speech translation, multi-decoder, non-autoregressive decoding, CTC, Mask-CTC
+1. INTRODUCTION
+End-to-end speech translation (E2E-ST) from source audio to target language text is an active research area for replacing conventional cascade systems [1], which stack automatic speech recognition (ASR) and machine translation (MT) models in a pipeline. The E2E approach has several advantages over the cascade approach, such as robustness against ASR errors and low-latency inference because source transcription is bypassed. However, E2E-ST models are generally affected by optimization because of a lack of training data and complex tasks, and many solutions have been investigated, such as pre-training and multi-task learning with auxiliary sub-tasks [2–5].
+Beyond the simple multi-task learning sharing some of the parameters among the sub-tasks, two-pass decoding approaches with an intermediate ASR decoder have been studied [6–12]. They exploit the compositionality [13] in sequence tasks and take advantage of both E2E and cascade approaches. They can also display transcripts and translations to users simultaneously. These approaches can be categorized into interactive decoding [6–8] and hierarchical decoding [9–12]. The multi-decoder (MD) architecture [12, 14] is attractive because it avoids intermediate ASR error propagation by dual cross-attention to both acoustic and textual encoder representations. During inference, it can further fuse scores from an external
+
+language model (LM) and auxiliary connectionist temporal classiﬁcation (CTC) [15] module. Despite the improved translation quality, however, the decoding speed lags behind that of vanilla E2E-ST models. This is because of the introduction of an additional search space in the ASR sub-task, which is an additional ﬁxed overhead.
+Studies on fast decoding for the E2E-ST task have also attracted attention. Most studies focused on the encoder and proposed to shrink encoder output lengths by using CTC probabilities [8, 16–18] or L0 regularization [19]. This is also important for bridging the modality gap between speech and text to make the most of pretrained ASR and MT models [16,20]. A few studies instead adopted non-autoregressive (NAR) decoding at the cost of accuracy [21, 22].
+Our goal in this study was to increase the decoding speed of the intermediate ASR module in the MD model while maintaining the beneﬁts of better accuracy and compositionality. We propose FastMD, a fast MD model that performs NAR decoding led by CTC predictions in the ASR sub-net. Instead of feeding the CTC output to the MT sub-net directly [16, 20], we feed intermediate ASR decoder states as hidden intermediates (HI) after conditioning an additional Transformer ASR decoder on the CTC output in parallel (parallel HI). By doing this, we can avoid information loss while compressing the sequence length of acoustic representations. If the decoding speed is not a concern, we can search for better HI by conducting beam search even with an external LM while maintaining the searchability of the MD architecture. We also investigate the use of Mask-CTC [23], an iterative reﬁnement-based NAR model with CTC and the conditional masked language model (CMLM) [24], as the ASR sub-net (masked HI).
+To reduce the gap in training and test conditions, where teacherforcing [25] is performed during training while CTC outputs are used to condition the ASR decoder at test time, we also introduce sampling CTC outputs from the CTC module during training, referred to as CTC sampling. We also improved the performance of CTC in Fast-MD by adopting the Conformer encoder [26] and intermediate CTC loss [27], which eventually improved the overall translation quality without sacriﬁcing decoding speed.
+Experimental evaluations on three benchmark datasets demonstrate that Fast-MD achieved about 2× and 4× faster decoding speed than that of the na¨ıve MD model on a GPU and CPU without sacriﬁcing translation quality. The Conformer encoder and InterCTC loss also improved both recognition and translation accuracy. We ﬁnally show that Fast-MD does not lose the searchability of better HI and is robust against long-form speech.
+2. BACKGROUND
+2.1. MD E2E-ST architecture
+The MD architecture decomposes an E2E-ST model into ASR and MT sub-nets while retaining E2E differentiability. Let X be an input source speech sequence, Ysrc be the ground-truth source transcript, and Ytgt be the corresponding ground-truth target translation. The
+
+ASR sub-net has the same structure as the Transformer ASR model with an auxiliary CTC layer CTCASR [28] and generates continuous ASR decoder states sASR as HI as follows:
+
+hASR = EncASR(X), sASR = DecASR(hASR),
+
+where EncASR, DecASR, and hASR are an ASR encoder, ASR decoder, and encoder outputs, respectively. The MT sub-net consists of a shallow ST encoder and ST decoder. The ST encoder directly takes sASR as inputs and generates textual representations hST. Each block in the ST decoder has an additional cross-attention layer over hASR (speech attention) right before a cross-attention layer over hST as follows:
+
+hST = EncST(sASR), sST = DecST(hASR, hST),
+
+where EncST, DecST, and sST are an ST encoder, ST decoder, and
+
+decoder states, respectively. The speech attention is important for
+
+alleviating error propagation from the ASR sub-net.
+
+The training objective is formulated as a linear interpolation of
+
+an
+
+E2E-ST
+
+cross-entropy
+
+(CE)
+
+loss
+
+LST ,
+
+ASR
+
+CTC
+
+loss
+
+L , CTC ASR
+
+and
+
+ASR
+
+CE
+
+loss
+
+LTRF ASR
+
+as
+
+follows:
+
+Ltotal = (1 − λASR)LST(Ytgt|X)
++ λASR((1 − λCTC)LTARSFR(Ysrc|X ) + λCTCLCATSCR(Ysrc|X )), (1)
+where λ∗ is a loss weight. During inference, the ASR sub-net performs beam search
+BeamSearchASR with a beam width of BASR to ﬁnd better sASR. The states corresponding to the most plausible transcript are fed to the MT sub-net. If an external LM is available, we can also integrate the LM scores, which is effective for domain adaptation [12]. The complete decoding algorithm is shown in Algorithm 1. To differentiate the inference from the Fast-MD inference, we refer to the former as Slow-MD inference.
+The introduction of the intermediate Transformer ASR decoder can compress frame-level ASR encoder representations hASR to token-level HI sASR (|sASR| |hASR|) through multiple crossattention operations. This is more memory-efﬁcient than feeding frame-level acoustic representations to the MT sub-net directly [20] and enables injection of LM scores for searching better HI. Compared with CTC-based shrinking [16, 18] and adaptive feature selection [19], information loss can be avoided thanks to the ﬁne-grained cross-attention in DecASR and an additional cross-attention in DecST.
+
+2.2. NAR ASR
+2.2.1. Mask-CTC
+Mask-CTC is an iterative NAR ASR model that combines CTC and the CMLM. During inference, it ﬁrst obtains CTC outputs YˆCTC by greedy search GreedyCTC, where the most plausible label is taken from the CTC layer at each time frame, and all blank labels are removed after collapsing repeated non-blank labels. Next, less-conﬁdent tokens, the probabilities PCTC of which are smaller than Pthres, are replaced with a mask token [MASK], generating Yˆmask. Then, the bidirectional Transformer decoder predicts tokens at the masked positions in Yˆmask by leveraging surrounding contexts through a constant number of iterations Kmask (≥ 1) as
+YˆCTC = GreedyCTC(PCTC(X)), Yˆmask = {yl ∈ YˆCTC|PCTC(yl|X) < Pthres},
+sˆASR = MaskCTCASR(DecASR(hASR), YˆCTC, Yˆmask, Kmask),
+
+Algorithm 1 Decoding algorithm of MD and Fast-MD
+
+1: function DECODE(X, BASR, BST, Kmask, Pthres)
+
+2: hASR ← EncASR(X)
+
+3: PCTC ← CTCASR(hASR)
+
+4:
+
+5: if f astmd parallel then
+
+6:
+
+// Fast-MD (parallel HI), O(1)
+
+7: YˆCTC ← GreedyCTC(X)
+
+8:
+
+sˆASR ← TeacherForceASR(DecASR(hASR), YˆCTC)
+
+9: else if f astmd masked then
+
+10:
+
+// Fast-MD (masked HI), Kmask × O(1)
+
+11: YˆCTC ← GreedyCTC(X)
+
+12:
+
+Yˆmask ← {yl ∈ YˆCTC|PCTC(yl|X) < Pthres}
+
+13:
+
+sˆASR ← MaskCTCASR(DecASR(hASR), YˆCTC, Yˆmask, Kmask)
+
+14: else
+
+15:
+
+// Slow-MD inference, O(N ) or O(N T )
+
+16:
+
+sˆASR ← BeamSearchASR(DecASR(hASR), PCTC, BASR)
+
+17: end if
+
+18:
+
+19: hST ← EncST(sˆASR)
+
+20: return BeamSearchST(DecST(hASR, hST), BST)
+
+O(N )
+
+21: end function
+
+where MaskCTCASR is a search operation of Mask-CTC.
+
+2.2.2. Intermediate CTC loss
+Intermediate CTC (InterCTC) loss LInter [27] is a regularization method for CTC by calculating CTC losses at multiple intermediate encoder layers SInter as
+
+LInter = (1 − λInter)LCATSCR(Ysrc|hASR)
+
+1 + λInter(
+|SInter|
+
+LCATSCR(Ysrc|hlASR)), (2)
+
+l∈SInter
+
+where
+
+hl ASR
+
+are
+
+the
+
+encoder
+
+outputs
+
+at
+
+the
+
+l-th
+
+layer,
+
+and
+
+λInter
+
+is
+
+a weight for the InterCTC loss. During inference, only the CTC
+
+probabilities from the top layer are used; therefore, InterCTC does
+
+not slow the decoding speed.
+
+3. FAST-MD
+
+In this section, we explain Fast-MD for increasing the decoding speed of the MD model by generating intermediate ASR decoder states, HI, in a non-autoregressive manner.
+3.1. NAR HI
+Although the MD architecture improves translation quality, the decoding speed is much slower than a vanilla E2E-ST model because beam search is conducted in both source and target language spaces. The optimal beam width of the ASR sub-net BASR is relatively larger than that of the MT sub-net BST (e.g., BASR = 16 vs. BST = 10 in [12]), and integration of CTC and LM scores also makes the ASR decoding more complex [29]. Therefore, search in the ASR subnet is a dominant factor for the overall decoding speed in the na¨ıve MD model. Motivated by this, we focus on improving the decoding speed of the ASR sub-net while minimizing translation-quality degradation. To this end, we have parallel HI and masked HI versions of Fast-MD by extracting HI by NAR decoding led by CTC.
+3.1.1. Parallel HI
+The ﬁrst version of Fast-MD obtains HI in parallel from an AR Transformer ASR decoder conditioned on CTC outputs. This does
+
+not change the MD architecture, but HI are obtained in a different manner at test time. Unlike the na¨ıve MD model, Fast-MD conducts greedy search with CTCASR instead of beam search with DecASR (line:7 in Algorithm 1). The resulting CTC outputs YˆCTC are used to obtain HI by conditioning DecASR on them, i.e., teacher-forcing (line:8), as
+
+sˆASR ← TeacherForceASR(DecASR(hASR), YˆCTC),
+
+(3)
+
+where TeacherForceASR is a teacher-forcing operation. We refer to the HI obtained with Eq. (3) as parallel HI. Although DecASR is still
+an AR model, we regard parallel HI as a family of NAR HI because we can feed YˆCTC to DecASR in parallel at all positions [30–34].
+
+3.1.2. Masked HI
+The second version of Fast-MD uses Mask-CTC as DecASR instead of the AR Transformer decoder as follows:
+sˆASR ← MaskCTCASR(DecASR(hASR), YˆCTC, Yˆmask, Kmask). (4)
+
+We refer to the HI obtained from the Mask-CTC decoder as masked HI. In this case, we can improve YˆCTC through Kmask iterations, which corresponds to line 10-13 in Algorithm 1. We use HI right after the last iteration. Therefore, some decoder input tokens used to obtain the HI would be [MASK] in accordance with the CTC conﬁdence scores. This is desirable to avoid error propagation from CTC because such low-conﬁdent predictions are more likely to be wrong. Therefore, the ST decoder should rely on hASR more to complement the masked parts.
+
+3.2. ASR error robust training
+While NAR ASR decoding can accelerate decoding speed, recognition accuracy still lags behind that of the AR decoding [23, 35]. Moreover, the ST encoder in the na¨ıve MD model always consumes HI obtained by teacher-forcing with ground-truth transcripts during training. Therefore, the NAR decoding in the ASR sub-net would enlarge the gap in training and test conditions and ultimately degrade the subsequent translation quality.
+
+3.2.1. CTC sampling
+
+To overcome this problem, we introduce CTC sampling, where
+
+greedy CTC outputs YˆCTC are sampled on the ﬂy during training and used to condition DecASR.1 We carry out greedy search with
+
+CTCASR for each utterance and use the resulting tokens YˆCTC to
+
+obtain HI sˆASR. These HI are fed to EncST, and LST is calculated accordingly. For masked HI, we ﬁrst sample YˆCTC then apply a
+
+random mask to them. This was more effective than generating
+
+a token mask based on CTC conﬁdence scores in our preliminary
+
+experiments. Note that we must pass source language tokens to the
+
+ASR
+
+decoder
+
+twice
+
+to
+
+calculate
+
+LTRF ASR
+
+and
+
+obtain
+
+sˆASR .
+
+However,
+
+because the greedy search with CTC is fast enough and we can feed
+
+YˆCTC to DecASR in parallel, the additional computation time for CTC
+
+sampling is small (+38%). Although the argmax operation in CTC
+
+sampling is not differentiable, we can still keep a gradient path from
+
+EncST to EncASR via cross-attention in DecASR.
+
+1Concurrently, CTC sampling was also investigated in [30] to improve the recognition performance of NAR ASR models. However, our motivation to introduce CTC sampling is to make the MD architecture robust against errors from the intermediate ASR component.
+
+3.2.2. Character-error-rate thresholding
+In the early training stage, the greedy CTC outputs YˆCTC would not be very accurate. Therefore, it would have a negative impact on the training, especially when training all parameters from random initialization. To control the quality of YˆCTC, we ﬁlter out noisy YˆCTC by thresholding on the basis of the character error rate (CER). Speciﬁcally, for each utterance in every mini-batch, we calculate the CER of YˆCTC with the corresponding Ysrc. If the CER is larger than θcer, we replace YˆCTC in Eq. (3) and Eq. (4) with Ysrc.
+3.3. Improvements in CTC
+Because the ﬁnal translation quality of Fast-MD is dependent of CTC accuracy, it is reasonable to expect that the better the CTC performance, the better the translation quality we can obtain. Dejavu [36], InterCTC, and self-conditioned CTC [37] improve CTC performance by enhancing intermediate encoder representations by calculating CTC losses for intermediate layers as well. Adapting a better encoder architecture, such as Conformer [26], is also simple yet effective [35, 38]. We investigated combining Fast-MD with the Conformer encoder and InterCTC loss and studied how important they are to improve translation quality.
+4. EXPERIMENTAL EVALUATION
+4.1. Experimental setting
+4.1.1. Dataset
+Fisher-CallHome Spanish [40] (Es→En) contains 170 h of Spanish conversational telephone speech as well as the transcripts and English translations. All punctuation marks except for apostrophes were removed from both transcripts and translations following the standard practice of this corpus [2]. We report case-insensitive detokenized BLEU scores [41] on Fisher-{dev, dev2, test}, and CallHome-{devtest, evltest}. Note that the Fisher splits were evaluated with four English references.
+Libri-trans [42] (En→Fr) includes 100 h of English read speech as well as the transcripts and French translations. Each translation in the ofﬁcial training set is augmented with Google Translate, and we used two French translations per speech utterance. We report caseinsensitive detokenized BLEU scores on the test set.
+Must-C [43] contains English speech extracted from TED talks as well as the transcripts and translations. We used the En→De part of this corpus, which has 408 h of speech data. Non-verbal speech labels such as “(Applause)” and “(Laughter)” were removed during evaluation. We report case-sensitive detokenized BLEU scores on the tst-COMMON set.
+4.1.2. Pre-processing
+We conducted experiments on the basis of recipes in the ESPnetST toolkit [39]. We extracted 80-dimensional log-mel ﬁlterbank coefﬁcients computed with a 25-ms window and shifted every 10ms with three-dimensional pitch features with the Kaldi toolkit [44]. We augmented speech data with three-fold speed perturbation [45] and SpecAugment [46]. We used SpecAugment hyperparameters of (MsTp, MsFp, Tsp, Fsp) = (2, 2, 40, 30) but did not use time-warping. We removed utterances having more than 3000 speech frames or more than 400 characters to ﬁt the GPU memory.
+All sentences (both transcripts and translations) were tokenized with the tokenizer.perl script in the Moses toolkit [47]. Punc-
+
+Table 1: BLEU scores on Fisher-CallHome Spanish Es→En. Decoding speed was measured with batch size of 1 on Fisher-test set.
+
+Model
+
+Intermediate decoding
+complexity
+
+BLEU (↑)
+
+Fisher
+
+CallHome
+
+dev dev2 test devtest evltest
+
+Decoding speed GPU / CPU
+RTF (↓) Speedup (↑)
+
+Previous studies ESPnet-ST [39] Cascade [12] Transformer MD [12] (BST=10) + CTC scores + LM fusion
+
+– – O(N ) O(N T )
+
+48.9 49.3 48.4 18.8 50.4 51.2 50.7 19.6 54.6 54.6 54.1 21.7 55.2 55.2 55.0 21.7
+
+18.7
+
+–
+
+–
+
+19.2
+
+–
+
+–
+
+21.4 0.12 / 4.84 1.00× / 1.00×
+
+21.5
+
+–
+
+–
+
+Transformer encoder Vanilla E2E (BST=4) MD (BASR=16, BST=4) + BASR=1 + Fast-MD inference Fast-MD (parallel HI) Fast-MD (masked HI)
+
+– O(N ) O(N ) O(1) O(1) O(1)
+
+49.4 50.6 49.4 18.6 53.8 54.5 54.3 21.5 53.1 53.7 53.2 21.1 51.8 52.4 52.3 19.7 54.0 54.8 53.9 20.9 54.8 55.1 54.4 21.3
+
+18.4 0.05 / 1.06 2.59× / 4.55× 21.5 0.10 / 3.52 1.16× / 1.38× 20.8 0.08 / 1.46 1.52× / 3.32× 19.7 0.06 / 1.20 2.00× / 4.02× 20.7 0.06 / 1.20 2.00× / 4.02× 21.3 0.06 / 1.24 1.94× / 3.92×
+
+tuation marks except for apostrophes and case information were removed from all source transcripts. We constructed joint source and target vocabularies on the basis of the byte pair encoding algorithm [48] with the Sentencepiece toolkit [49]. However, we built the vocabulary on the basis of transcripts only for the ASR sub-net. One thousand units were used for both ASR and MT sub-nets on Fisher and Libri-trans while 5k and 8k units were used for ASR and MT sub-nets on Must-C, respectively.
+
+4.1.3. Architecture
+We used Transformer [50] and Conformer [26] models, and the implementations were based on previous studies [28, 51]. The only difference between the Transformer and Conformer models is the speech encoder, and the rest of the architecture is the same. Following Dalmia et al.’s study [12], we used 12 ASR encoder blocks, 6 ASR decoder blocks, 2 ST encoder blocks, and 6 ST decoder blocks. We increased the number of ST encoder blocks to four on Must-C. The ASR encoder had 2 CNN blocks with a kernel size of 3 and channel size of 256 before the ﬁrst encoder block, resulting in fourfold down-sampling on both time and frequency axes. The dimensions of the self-attention layer dmodel and feed-forward network dﬀ were set to 256 and 2048 in all sub-nets, respectively. The number of attention heads H was set to four. For the Conformer encoder, we set the kernel size of depthwise separable convolution in each convolutional module to 15.
+Unlike Dalmia et al.’s study [12], where both ASR and MT subnets shared the same joint source and target vocabulary, we used the source-language-only vocabulary for the ASR sub-net. We found that this improves both ASR and ST performances.
+
+4.1.4. Training
+
+The Adam optimizer [52] with β1 = 0.9, β2 = 0.98, and = 10−9
+
+was used for training with a Noam learning rate schedule [50]. The
+
+warmup step was set to 25k. We trained all MD models for 50 epochs
+
+with an effective batch size of 384 utterances and learning-rate scale
+
+of 12.5. Regularization hyperparameters, such as dropout rate and
+
+label smoothing probability, were the same as those in Dalmia et al.’s
+
+study [12]. We set λASR and λCTC in Eq. (1) to 0.5 and 0.3, respec-
+
+tively.
+
+When
+
+using
+
+InterCTC
+
+loss,
+
+LCTC ASR
+
+in
+
+Eq.
+
+(1)
+
+was
+
+replaced
+
+with
+
+LInter in Eq. (2) with λInter = 0.3. We tuned θcer from {0.2,
+
+0.3, 0.4} on the basis of the validation BLEU score. MD models
+
+were trained from random initialization [12], except for Fast-MD
+
+(masked HI), the ASR sub-net of which was initialized with a pre-
+
+trained Mask-CTC ASR model. The last ten checkpoints were used for model averaging of the MD models.
+4.1.5. Decoding
+The Slow-MD inference used BASR = 16 without CTC or LM scores unless otherwise speciﬁed. For both Fast-MD and Slow-MD inferences, we used BST = 4, where BST was reduced from 10 to 4 unlike in Dalmia et al.’s study [12]. The Kmask was set to 1 for Mask-CTC in Fast-MD (masked HI). Therefore, both Fast-MD (parallel HI) and Fast-MD (masked HI) have the same decoding complexity theoretically. The decoding speed was measured with a batch size of 1 on an NVIDIA TITAN RTX GPU and Intel(R) Xeon(R) Gold 6128 CPU @ 3.4GHz by averaging on ﬁve runs. Note that beam search was implemented efﬁciently by updating decoder states with a batch-level matrix multiplication [53]. We calculated detokenized BLEU scores with SacreBLEU [54].
+4.2. Main results: Fisher-CallHome Spanish Es→En
+4.2.1. ST performance evaluation
+The results of the ST performance are shown in Table 1. Note that we re-implemented the na¨ıve MD model and were able to reproduce similar BLEU scores. When reducing the search space of the ASR sub-net in the na¨ıve MD model by greedy search (BASR = 1) or the Fast-MD inference, we observed severe degradation in BLEU scores by about 2 BLEU. This is because the model did not recognize ASR errors during training, which was our motivation to introduce CTC sampling. Fast-MD (parallel HI), however, could recover the degradation by 80% and achieved 1.72× and 2.91× faster decoding over the MD model (BST = 4) on the GPU and CPU, respectively. The speed increase was much larger on the CPU, which is important for on-device applications.
+Fast-MD (masked HI) outperformed Fast-MD (parallel HI) in BLEU scores. It even surpassed the na¨ıve MD model on the Fisher test sets. A possible explanation of this behavior is that the MT sub-net could ignore less-conﬁdent and noisy predictions from the ASR sub-net, which overcame ASR error propagation effectively. Because of Kmask = 1, the decoding cost is almost same as FastMD (parallel HI). One limitation of masked HI is that any successful method to fuse external LM scores to Mask-CTC has not been established, which we leave future work. Compared with the vanilla E2E model, Fast-MD achieved much higher BLEU scores with a small decrease of the decoding speed.
+
+Table 2: Improving CTC in MD models with Conformer encoder and intermediate CTC loss on Fisher-CallHome Spanish corpus
+
+Model
+
+BLEU (↑)
+
+Fisher
+
+CallHome
+
+dev dev2 test devtest evltest
+
+MD + Conformer Enc. ++ InterCTC loss
+
+53.8 54.5 54.3 21.5 21.5 55.0 55.3 54.6 22.3 21.5 55.0 55.6 55.6 22.4 22.1
+
+MD + Fast-MD inference 51.8 52.4 52.3 19.7 19.7
+
++ Conformer Enc.
+
+55.2 55.6 54.8 22.1 21.6
+
+++ InterCTC loss
+
+55.3 55.7 55.6 22.6 22.0
+
+Fast-MD (parallel HI) + Conformer Enc. ++ InterCTC loss
+
+54.0 54.8 53.9 20.9 20.7 55.7 56.2 55.2 22.6 22.3 56.3 56.4 56.2 23.3 22.2
+
+Fast-MD (masked HI) + Conformer Enc. ++ InterCTC loss
+
+54.8 55.1 54.4 21.3 21.3 55.2 56.0 55.3 22.2 22.0 56.3 57.4 56.2 22.8 22.8
+
+Table 3: Word error rate (WER) of ASR sub-net in na¨ıve MD model on Fisher-CallHome Spanish corpus
+
+Model
+
+WER (↓)
+
+Fisher
+
+CallHome
+
+dev dev2 test devtest evltest
+
+Slow-MD inference Transformer MD 23.1 22.3 20.4 38.8 39.5 + Conformer Enc. 23.1 23.0 21.4 37.6 38.9 ++ InterCTC loss 22.2 21.5 20.1 36.8 38.2
+
+Fast-MD inference Transformer MD 26.2 25.6 23.5 43.1 43.6 + Conformer Enc. 21.4 21.2 19.6 37.5 37.9 ++ InterCTC loss 20.7 20.5 19.1 36.5 36.2
+
+4.2.2. Does better CTC lead to better ST performance?
+Next, we investigated the effectiveness of the Conformer encoder and InterCTC loss for MD and Fast-MD. For Fast-MD (masked HI), we applied InterCTC loss to ASR pre-training as well. The results in Table 2 indicate that the Conformer encoder improved the BLEU scores in all the settings by a large margin. Interestingly, the Fast-MD inference outperformed the Slow-MD inference for the Conformer-based MD. This was because the CTC performance was better than that of the Transformer ASR decoder, as mentioned in Section 4.2.3. However, we conﬁrmed that CTC sampling in the Conformer-based Fast-MD was still effective. Parallel HI was as effective as masked HI when using the Conformer encoder, unlike the results shown in Table 1. To the best of our knowledge, the best Conformer-based Fast-MD models achieved state-of-the-art BLEU scores on all test sets.
+
+4.2.3. ASR performance evaluation
+We evaluate the word error rate (WER) of the ASR sub-net in the na¨ıve MD models. The results in Table 3 indicate that the Conformer encoder and InterCTC reduced WER consistently regardless of the search method. However, CTC greedy search with the Conformer encoder outperformed beam search with the Transformer decoder, which was consistent with the observations in Table 2. Therefore, we conclude that improvement in the ASR sub-net can improve overall translation quality. We also observed a similar trend in WER for the Fast-MD models.
+
+Table 4: BLEU scores on Libri-trans En→Fr test set. *Tokenized BLEU scores. For Slow-MD inference, CTC scores were also used.
+
+Model
+
+BLEU (↑) WER (↓)
+
+Speedup (↑) GPU / CPU
+
+Previous studies
+
+ESPnet-ST [39]
+
+16.8
+
+–
+
+–
+
+WordKD [55]
+
+17.0*
+
+–
+
+–
+
+TCEN-LSTM [56]
+
+17.0
+
+–
+
+–
+
+NeurST [57]
+
+17.2
+
+–
+
+–
+
+Curriculum PT [58]
+
+17.7*
+
+–
+
+–
+
+LUT [59]
+
+17.8*
+
+–
+
+–
+
+STAST [16]
+
+17.8*
+
+–
+
+–
+
+COSTT [8]
+
+17.8
+
+–
+
+–
+
+SATE [20]
+
+18.3
+
+–
+
+–
+
+Transformer encoder
+
+MD
+
+18.2
+
++ Fast-MD inference
+
+17.4
+
+Fast-MD (parallel HI) 18.1
+
++ Slow-MD inference 18.3
+
+Fast-MD (masked HI) 18.5
+
+6.8 1.00× / 1.00× 10.7 4.98× / 3.98× 10.5 4.98× / 3.98×
+6.7 1.00× / 1.00× 9.0 4.88× / 3.96×
+
+Conformer encoder
+
+MD
+
+18.5
+
++ Fast-MD inference
+
+18.3
+
+Fast-MD (parallel HI) 18.7
+
++ InterCTC
+
+18.8
+
+Fast-MD (masked HI) 18.6
+
++ InterCTC
+
+19.1
+
+6.2 1.00× / 1.00× 5.8 4.85× / 4.17× 5.6 4.85× / 4.17× 5.2 4.85× / 4.17× 5.5 5.00× / 4.20× 5.0 5.00× / 4.20×
+
+4.3. Results on Libri-trans: En→Fr
+The results of Libri-trans are shown in Table 4. In this corpus, we needed to use auxiliary CTC scores during inference for the ASR sub-net to achieve decent WER because of many long-form speech utterances in the test set. Similar to the conversational domain, we conﬁrmed that Fast-MD (parallel HI) improved by 0.7 BLEU and 0.4 BLEU compared with the na¨ıve MD model with the mismatched Fast-MD inference for the Transformer and Conformer encoders, respectively. Because this corpus has longer utterances than the Fisher-CallHome Spanish corpus, the relative increase in decoding speed was much larger. Fast-MD (masked HI) further improved both recognition and translation performances with similar decoding speeds. InterCTC loss advanced both Fast-MD (parallel HI) and Fast-MD (masked HI) further. Regarding WER, the Slow-MD inference outperformed the Fast-MD inference when the Transformer encoder was used. When using the Conformer encoder, CTC greedy search outperformed beam search with the Transformer ASR decoder by 0.4, which was consistent with the observations on FisherCallHome Spanish. Interestingly, the WER of CTC greedy search also improved by using CTC sampling.
+4.4. Results on Must-C: En→De
+We show the results on Must-C in Table 5 to conﬁrm the effectiveness of Fast-MD in a large dataset. We focused on Fast-MD (parallel HI) to avoid ASR pre-training. In this corpus, BLEU scores of the na¨ıve MD model did not degrade much with the mismatched Fast-MD inference, which can also be conﬁrmed from the similar WER. However, Fast-MD improved upon the na¨ıve MD model by 0.4 BLEU with 1.70× and 2.47× faster decoding on the GPU and CPU, respectively. Note that the MD/Fast-MD with the Conformer encoder has a much smaller number of parameters compared with the Transformer MD investigated by Dalmia et al. [12] (67.2M vs. 135.3M) because we halved dmodel. Therefore, the Conformerbased Fast-MD models are more parameter-efﬁcient.
+
+Table 5: BLEU scores on Must-C En→De tst-COMMON set
+
+Model
+
+BLEU (↑) WER (↓) Speedup (↑) GPU / CPU
+
+Previous studies
+
+ESPnet-ST [39]
+
+22.9
+
+–
+
+–
+
+Fairseq S2T [60]
+
+22.7
+
+–
+
+–
+
+NeurST [57]
+
+22.8
+
+–
+
+–
+
+AFSt,f [19]
+
+22.4
+
+–
+
+–
+
+STAST [16]
+
+23.1
+
+–
+
+–
+
+Deep Relative Transformer [61] 25.2
+
+–
+
+–
+
+SATE [20]
+
+25.2
+
+–
+
+–
+
+Transformer MD [12]
+
+26.4
+
+–
+
+–
+
+Conformer + SeqKD (2ref) [62] 26.8
+
+–
+
+–
+
+Conformer + Bidir SeqKD [62] 27.0
+
+–
+
+–
+
+Conformer encoder MD + Fast-MD inference Fast-MD (parallel HI) + InterCTC
+
+26.0
+
+11.1 1.00× / 1.00×
+
+25.9
+
+11.2 1.70× / 2.47×
+
+26.4
+
+10.9 1.70× / 2.47×
+
+26.5
+
+10.8 1.70× / 2.47×
+
+Table 6: Evaluation of searchability of better HI in Fast-MD on Fisher-CallHome Spanish corpus. BST was set to 4 for all conditions. Transformer encoder was used.
+
+Model
+
+BLEU (↑)
+
+Fisher
+
+CallHome
+
+dev dev2 test devtest evltest
+
+MD + Fast-MD inference 51.8 52.4 52.3 19.7 19.7
+
+MD + Slow-MD inference 53.8 54.5 54.3 21.5 21.5
+
++ CTC scores
+
+54.4 54.8 54.3 21.8 21.8
+
+++ LM scores
+
+55.1 55.4 54.7 22.0 21.9
+
+Fast-MD (parallel HI) + Slow-MD inference ++ CTC scores +++ LM scores
+
+54.0 54.8 53.9 20.9 20.7 54.4 54.7 54.5 21.2 21.7 54.6 55.4 54.5 21.5 21.8 54.9 55.5 54.8 21.7 21.8
+
+5. ANALYSIS
+5.1. Fast-MD does not lose searchability
+In Section 4.2, we discussed how Fast-MD can recover a loss of translation quality caused by not carrying out beam search in the ASR sub-net. We show that Fast-MD does not lose the searchability of better HI when the slow inference is accepted. The results in Table 6 indicate that we can improve the BLEU scores of Fast-MD by integrating CTC and LM scores, which were comparative to those of the na¨ıve MD model.
+5.2. Fast-MD is robust against long-form speech
+It is well-known that ST results change signiﬁcantly in accordance with audio segmentation [61, 63–66]. Therefore, we evaluated the Conformer Fast-MD (parallel HI) trained on Must-C with the IWSLT tst2019 set by changing the segmentation. We simulated speech of various lengths up to 45 s on the basis of the segmentmerging algorithm [66], where the entire speech in a session was split by a voice activity detection model [67] and multiple adjacent segments were concatenated until reaching the desired input length. Figure 1 shows BLEU and WER of the same Fast-MD model while changing the decoding in the ASR sub-net. We can see that WER with the Slow-MD inference without auxiliary CTC scores increased very quickly over 30 s and BLEU scores degraded accordingly. On the other hand, WER with the Fast-MD inference did not degrade against long-form speech thanks to CTC, and the regression of
+
+Fig. 1: BLEU and WER as function of input-speech lengths on IWSLT tst2019 set
+
+Table 7: Ablation study of Fast-MD on Fisher-dev set. Transformer encoder was used.
+
+Model
+
+BLEU (↑)
+
+MD + Fast-MD inference
+
+51.8
+
+Fast-MD (parallel HI) w/ θcer = 0.4
+
+54.0
+
++ ASR-PT (all ASR sub-net)
+
+54.0
+
++ θcer = 0.2
+
+53.8
+
++ θcer = 0.3
+
+53.7
+
++ θcer = ∞ (w/o CER thresholding)
+
+52.9
+
+++ ASR-PT (all ASR sub-net)
+
+53.4
+
+Fast-MD (masked HI) w/ θcer = 0.4
+
+54.8
+
++ w/o ASR-PT
+
+52.9
+
+++ train for more 50 epochs
+
+53.3
+
+BLEU scores was slower. Therefore, we conclude that Fast-MD is robust against long-form speech.
+5.3. Ablation study
+Finally, we conducted an ablation study of Fast-MD on the Fisherdev set shown in Table 7. We observed that θcer = 0.4 was best for the Transformer-based Fast-MD on this corpus, and θcer did not have a large impact on the BLEU score although both θcer = 0.2 and θcer = 0.3 improved it. However, always sampling CTC outputs (θcer = ∞) was not effective. This is probably because the CER in the early training stage was high, leading to harmful training signals. To reduce the CER in the early training stage, we initialized the ASR sub-net with a pre-trained ASR model (ASR-PT), but this was less effective than training from scratch with θcer = 0.4. Therefore, we reason that CER thresholding is a type of curriculum learning [68] because CTC predictions are used gradually as training progresses. However, ASR-PT was important for Fast-MD (masked HI).
+6. CONCLUSION
+We proposed Fast-MD to increase the decoding speed of the MD architecture for the E2E-ST task. We generated HI from the ASR subnet by NAR decoding led by CTC outputs. We studied parallel HI and masked HI as NAR HI. We also introduced sampling predictions from the CTC layer during training to reduce the gap in training and test conditions. Experimental evaluations on three corpora showed that Fast-MD achieved comparable BLEU scores with 2× and 4× faster decoding than the na¨ıve MD model on a GPU and CPU. Integrating the Conformer encoder and InterCTC loss further boosted the translation quality without sacriﬁcing decoding speed.2
+2This work was partly supported by ASAPP and JHU HLTCOE. This work used the Extreme Science and Engineering Discovery Environment (XSEDE) [69], which is supported by NSF grant number ACI-1548562. Speciﬁcally, it used the Bridges system [70], supported by NSF grant ACI1445606, at the Pittsburgh Supercomputing Center. We also thank Jumon Nozaki for helpful discussions.
+
+7. REFERENCES
+[1] Hermann Ney, “Speech translation: Coupling of recognition and translation,” in Proc. ICASSP. IEEE, 1999, pp. 517–520.
+[2] Ron J Weiss, Jan Chorowski, Navdeep Jaitly, Yonghui Wu, and Zhifeng Chen, “Sequence-to-sequence models can directly translate foreign speech,” in Proc. Interspeech, 2017, pp. 2625–2629.
+[3] Alexandre Be´rard, Laurent Besacier, Ali Can Kocabiyikoglu, and Olivier Pietquin, “End-to-end automatic speech translation of audiobooks,” in Proc. ICASSP. IEEE, 2018, pp. 6224–6228.
+[4] Sameer Bansal, Herman Kamper, Karen Livescu, Adam Lopez, and Sharon Goldwater, “Pre-training on high-resource speech recognition improves low-resource speech-to-text translation,” in Proc. NAACLHLT, 2019, pp. 58–68.
+[5] Parnia Bahar, Tobias Bieschke, and Hermann Ney, “A comparative study on end-to-end speech to text translation,” in Proc. ASRU. IEEE, 2019, pp. 792–799.
+[6] Yuchen Liu, Jiajun Zhang, Hao Xiong, Long Zhou, Zhongjun He, Hua Wu, Haifeng Wang, and Chengqing Zong, “Synchronous speech recognition and speech-to-text translation with interactive decoding,” in Proc. AAAI, 2020, pp. 8417–8424.
+[7] Hang Le, Juan Pino, Changhan Wang, Jiatao Gu, Didier Schwab, and Laurent Besacier, “Dual-decoder transformer for joint automatic speech recognition and multilingual speech translation,” in Proc. COLING, 2020, pp. 3520–3533.
+[8] Qianqian Dong, Mingxuan Wang, Hao Zhou, Shuang Xu, Bo Xu, and Lei Li, “Consecutive decoding for speech-to-text translation,” in Proc. AAAI, 2021.
+[9] Antonios Anastasopoulos and David Chiang, “Tied multitask learning for neural speech translation,” in Proc. NAACL-HLT, 2018, pp. 82–91.
+[10] Matthias Sperber, Graham Neubig, Jan Niehues, and Alex Waibel, “Attention-passing models for robust and data-efﬁcient end-to-end speech translation,” Transactions of the Association for Computational Linguistics, vol. 7, 2019.
+[11] Tzu-Wei Sung, Jun-You Liu, Hung-yi Lee, and Lin-shan Lee, “Towards end-to-end speech-to-text translation with two-pass decoding,” in Proc. ICASSP. IEEE, 2019, pp. 7175–7179.
+[12] Siddharth Dalmia, Brian Yan, Vikas Raunak, Florian Metze, and Shinji Watanabe, “Searchable hidden intermediates for end-to-end models of decomposable sequence tasks,” in Proc. NAACL-HLT, 2021, pp. 1882– 1896.
+[13] Siddharth Dalmia, Abdelrahman Mohamed, Mike Lewis, Florian Metze, and Luke Zettlemoyer, “Enforcing encoder-decoder modularity in sequence-to-sequence models,” arXiv preprint arXiv:1911.03782, 2019.
+[14] Jiatong Shi, Jonathan D. Amith, Xuankai Chang, Siddharth Dalmia, Brian Yan, and Shinji Watanabe, “Highland Puebla Nahuatl speech translation corpus for endangered language documentation,” in Proc. AmericasNLP, 2021, pp. 53–63.
+[15] Alex Graves, Santiago Ferna´ndez, Faustino Gomez, and Ju¨rgen Schmidhuber, “Connectionist temporal classiﬁcation: Labelling unsegmented sequence data with recurrent neural networks,” in Proc. ICML, 2006, pp. 369–376.
+[16] Yuchen Liu, Junnan Zhu, Jiajun Zhang, and Chengqing Zong, “Bridging the modality gap for speech-to-text translation,” arXiv preprint arXiv:2010.14920, 2020.
+[17] Marco Gaido, Mauro Cettolo, Matteo Negri, and Marco Turchi, “CTCbased compression for direct speech translation,” in Proc. EACL, 2021, pp. 690–696.
+[18] Xingshan Zeng, Liangyou Li, and Qun Liu, “RealTranS: End-to-end simultaneous speech translation with convolutional weighted-shrinking Transformer,” in Findings of the Association for Computational Linguistics: ACL-IJCNLP 2021, 2021, pp. 2461–2474.
+
+[19] Biao Zhang, Ivan Titov, Barry Haddow, and Rico Sennrich, “Adaptive feature selection for end-to-end speech translation,” in Findings of the Association for Computational Linguistics: EMNLP 2020, 2020, pp. 2533–2544.
+[20] Chen Xu, Bojie Hu, Yanyang Li, Yuhao Zhang, Shen Huang, Qi Ju, Tong Xiao, and Jingbo Zhu, “Stacked acoustic-and-textual encoding: Integrating the pre-trained models into speech translation encoders,” in Proc. ACL, 2021, pp. 2619–2630.
+[21] Hirofumi Inaguma, Yosuke Higuchi, Kevin Duh, Tatsuya Kawahara, and Shinji Watanabe, “Orthros: Non-autoregressive end-to-end speech translation with dual-decoder,” in Proc. ICASSP. IEEE, 2021, pp. 7503–7507.
+[22] Shun-Po Chuang, Yung-Sung Chuang, Chih-Chiang Chang, and Hungyi Lee, “Investigating the reordering capability in CTC-based nonautoregressive end-to-end speech translation,” in Findings of the Association for Computational Linguistics: ACL-IJCNLP 2021, 2021, pp. 1068–1077.
+[23] Yosuke Higuchi, Shinji Watanabe, Nanxin Chen, Tetsuji Ogawa, and Tetsunori Kobayashi, “Mask CTC: Non-autoregressive end-to-end ASR with CTC and mask predict,” in Proc. Interspeech, 2020, pp. 3655–3659.
+[24] Marjan Ghazvininejad, Omer Levy, Yinhan Liu, and Luke Zettlemoyer, “Mask-predict: Parallel decoding of conditional masked language models,” in Proc. EMNLP, 2019, pp. 6114–6123.
+[25] Ronald J Williams and David Zipser, “A learning algorithm for continually running fully recurrent neural networks,” Neural computation, vol. 1, no. 2, pp. 270–280, 1989.
+[26] Anmol Gulati, James Qin, Chung-Cheng Chiu, Niki Parmar, Yu Zhang, Jiahui Yu, Wei Han, Shibo Wang, Zhengdong Zhang, Yonghui Wu, and Ruoming Pang, “Conformer: Convolution-augmented Transformer for speech recognition,” in Proc. Interspeech, 2020, pp. 5036–5040.
+[27] Jaesong Lee and Shinji Watanabe, “Intermediate loss regularization for CTC-based speech recognition,” in Proc. ICASSP. IEEE, 2021, pp. 6224–6228.
+[28] Shigeki Karita, Nanxin Chen, Tomoki Hayashi, Takaaki Hori, Hirofumi Inaguma, Ziyan Jiang, Masao Someki, Nelson Enrique Yalta Soplin, Ryuichi Yamamoto, Xiaofei Wang, et al., “A comparative study on Transformer vs RNN in speech applications,” in Proc. ASRU. IEEE, 2019, pp. 499–456.
+[29] Shinji Watanabe, Takaaki Hori, Suyoun Kim, John R Hershey, and Tomoki Hayashi, “Hybrid CTC/attention architecture for end-to-end speech recognition,” IEEE Journal of Selected Topics in Signal Processing, vol. 11, no. 8, pp. 1240–1253, 2017.
+[30] Xingchen Song, Zhiyong Wu, Yiheng Huang, Chao Weng, Dan Su, and Helen Meng, “Non-autoregressive transformer ASR with CTCenhanced decoder input,” in Proc. ICASSP. IEEE, 2021, pp. 5894– 5898.
+[31] Ruchao Fan, Wei Chu, Peng Chang, and Jing Xiao, “CASS-NAT: CTC alignment-based single step non-autoregressive transformer for speech recognition,” in Proc. ICASSP. IEEE, 2021, pp. 5889–5893.
+[32] Zhengkun Tian, Jiangyan Yi, Ye Bai, Jianhua Tao, Shuai Zhang, and Zhengqi Wen, “One in a hundred: Select the best predicted sequence from numerous candidates for streaming speech recognition,” arXiv preprint arXiv:2010.14791, 2020.
+[33] Zhichao Wang, Wenwen Yang, Pan Zhou, and Wei Chen, “WNARS: WFST based non-autoregressive streaming end-to-end speech recognition,” arXiv preprint arXiv:2104.03587, 2021.
+[34] Binbin Zhang, Di Wu, Zhuoyuan Yao, Xiong Wang, Fan Yu, Chao Yang, Liyong Guo, Yaguang Hu, Lei Xie, and Xin Lei, “Uniﬁed streaming and non-streaming two-pass end-to-end model for speech recognition,” arXiv preprint arXiv:2012.05481, 2020.
+[35] Yosuke Higuchi, Hirofumi Inaguma, Shinji Watanabe, Tetsuji Ogawa, and Tetsunori Kobayashi, “Improved Mask-CTC for nonautoregressive end-to-end ASR,” in Proc. ICASSP. IEEE, 2021, pp. 8363–8367.
+
+[36] Andros Tjandra, Chunxi Liu, Frank Zhang, Xiaohui Zhang, Yongqiang Wang, Gabriel Synnaeve, Satoshi Nakamura, and Geoffrey Zweig, “Deja-vu: Double feature presentation and iterated loss in deep transformer networks,” in Proc. ICASSP. IEEE, 2020, pp. 6899–6903.
+[37] Jumon Nozaki and Tatsuya Komatsu, “Relaxing the conditional independence assumption of CTC-based ASR by conditioning on intermediate predictions,” in Proc. Interspeech, 2021, pp. 3735–3739.
+[38] Edwin G Ng, Chung-Cheng Chiu, Yu Zhang, and William Chan, “Pushing the limits of non-autoregressive speech recognition,” in Proc. Interspeech, 2021, pp. 3725–3729.
+[39] Hirofumi Inaguma, Shun Kiyono, Kevin Duh, Shigeki Karita, Nelson Yalta, Tomoki Hayashi, and Shinji Watanabe, “ESPnet-ST: All-inone speech translation toolkit,” in Proc. ACL: System Demonstrations, 2020, pp. 302–311.
+[40] Matt Post, Gaurav Kumar, Adam Lopez, Damianos Karakos, Chris Callison-Burch, and Sanjeev Khudanpur, “Improved speech-to-text translation with the Fisher and Callhome Spanish–English speech translation corpus,” in Proc. IWSLT, 2013.
+[41] Kishore Papineni, Salim Roukos, Todd Ward, and Wei-Jing Zhu, “Bleu: a method for automatic evaluation of machine translation,” in Proc. ACL. 2002, pp. 311–318, Association for Computational Linguistics.
+[42] Ali Can Kocabiyikoglu, Laurent Besacier, and Olivier Kraif, “Augmenting Librispeech with French translations: A multimodal corpus for direct speech translation evaluation,” in Proc. LREC, 2018.
+[43] Mattia A. Di Gangi, Roldano Cattoni, Luisa Bentivogli, Matteo Negri, and Marco Turchi, “MuST-C: a Multilingual Speech Translation Corpus,” in Proc. NAACL-HLT, 2019, pp. 2012–2017.
+[44] Daniel Povey, Arnab Ghoshal, Gilles Boulianne, Lukas Burget, Ondrej Glembek, Nagendra Goel, Mirko Hannemann, Petr Motlicek, Yanmin Qian, Petr Schwarz, et al., “The kaldi speech recognition toolkit,” in Proc. ASRU. IEEE, 2011.
+[45] Tom Ko, Vijayaditya Peddinti, Daniel Povey, and Sanjeev Khudanpur, “Audio augmentation for speech recognition,” in Proc. Interspeech, 2015, pp. 3586–3589.
+[46] Daniel S Park, William Chan, Yu Zhang, Chung-Cheng Chiu, Barret Zoph, Ekin D Cubuk, and Quoc V Le, “SpecAugment: A simple data augmentation method for automatic speech recognition,” in Proc. Interspeech, 2019, pp. 2613–2617.
+[47] Philipp Koehn, Hieu Hoang, Alexandra Birch, Chris Callison-Burch, Marcello Federico, Nicola Bertoldi, Brooke Cowan, Wade Shen, Christine Moran, Richard Zens, Chris Dyer, Ondˇrej Bojar, Alexandra Constantin, and Evan Herbst, “Moses: Open source toolkit for statistical machine translation,” in Proc. ACL: Demo and Poster Sessions, 2007, pp. 177–180.
+[48] Rico Sennrich, Barry Haddow, and Alexandra Birch, “Neural machine translation of rare words with subword units,” in Proc. ACL, 2016, pp. 1715–1725.
+[49] Taku Kudo and John Richardson, “SentencePiece: A simple and language independent subword tokenizer and detokenizer for neural text processing,” in Proc. EMNLP: System Demonstrations, 2018, pp. 66– 71.
+[50] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin, “Attention is all you need,” in Proc. NIPS, 2017, pp. 5998–6008.
+[51] Pengcheng Guo, Florian Boyer, Xuankai Chang, Tomoki Hayashi, Yosuke Higuchi, Hirofumi Inaguma, Naoyuki Kamo, Chenda Li, Daniel Garcia-Romero, Jiatong Shi, et al., “Recent developments on ESPnet toolkit boosted by Conformer,” in Proc. ICASSP. IEEE, 2021, pp. 5874–5878.
+[52] Diederik Kingma and Jimmy Ba, “Adam: A method for stochastic optimization,” Proc. ICLR, 2015.
+[53] Hiroshi Seki, Takaaki Hori, Shinji Watanabe, Niko Moritz, and Jonathan Le Roux, “Vectorized beam search for CTC-attention-based speech recognition,” in Proc. Interspeech, 2019, pp. 3825–3829.
+
+[54] Matt Post, “A call for clarity in reporting BLEU scores,” in Proc. WMT: Research Papers, 2018, pp. 186–191.
+[55] Yuchen Liu, Hao Xiong, Zhongjun He, Jiajun Zhang, Hua Wu, Haifeng Wang, and Chengqing Zong, “End-to-end speech translation with knowledge distillation,” in Proc. Interspeech, 2019, pp. 1128–1132.
+[56] Chengyi Wang, Yu Wu, Shujie Liu, Zhenglu Yang, and Ming Zhou, “Bridging the gap between pre-training and ﬁne-tuning for end-to-end speech translation,” in Proc. AAAI, 2020, pp. 9161–9168.
+[57] Chengqi Zhao, Mingxuan Wang, Qianqian Dong, Rong Ye, and Lei Li, “NeurST: Neural speech translation toolkit,” in Proc. ACL: System Demonstrations, 2021, pp. 55–62.
+[58] Chengyi Wang, Yu Wu, Shujie Liu, Ming Zhou, and Zhenglu Yang, “Curriculum pre-training for end-to-end speech translation,” in Proceedings ACL, 2020, pp. 3728–3738.
+[59] Qianqian Dong, Rong Ye, Mingxuan Wang, Hao Zhou, Shuang Xu, Bo Xu, and Lei Li, ““Listen, Understand and Translate”: Triple supervision decouples end-to-end speech-to-text translation,” in Proc. AAAI, 2021.
+[60] Changhan Wang, Yun Tang, Xutai Ma, Anne Wu, Dmytro Okhonko, and Juan Pino, “Fairseq S2T: Fast speech-to-text modeling with fairseq,” in Proc. AACL: System Demonstrations, 2020, pp. 33–39.
+[61] Ngoc-Quan Pham, Thanh-Le Ha, Tuan-Nam Nguyen, Thai-Son Nguyen, Elizabeth Salesky, Sebastian Stu¨ker, Jan Niehues, and Alex Waibel, “Relative positional encoding for speech recognition and direct translation,” in Proc. Interspeech, 2020, pp. 31–35.
+[62] Hirofumi Inaguma, Tatsuya Kawahara, and Shinji Watanabe, “Source and target bidirectional knowledge distillation for end-to-end speech translation,” in Proc. NAACL-HLT, 2021, pp. 1872–1881.
+[63] Marco Gaido, Mattia A. Di Gangi, Matteo Negri, Mauro Cettolo, and Marco Turchi, “Contextualized translation of automatically segmented speech,” in Proc. Interspeech, 2020, pp. 1471–1475.
+[64] Tomasz Potapczyk and Pawel Przybysz, “SRPOL’s system for the IWSLT 2020 end-to-end speech translation task,” in Proc. IWSLT, 2020, pp. 89–94.
+[65] Marco Gaido, Matteo Negri, Mauro Cettolo, and Marco Turchi, “Beyond voice activity detection: Hybrid audio segmentation for direct speech translation,” arXiv preprint arXiv:2104.11710, 2021.
+[66] Hirofumi Inaguma, Brian Yan, Siddharth Dalmia, Pengcheng Guo, Jiatong Shi, Kevin Duh, and Shinji Watanabe, “ESPnet-ST IWSLT 2021 ofﬂine speech translation system,” in Proc. IWSLT, 2021, pp. 100–109.
+[67] Herve´ Bredin, Ruiqing Yin, Juan Manuel Coria, Gregory Gelly, Pavel Korshunov, Marvin Lavechin, Diego Fustes, Hadrien Titeux, Wassim Bouaziz, and Marie-Philippe Gill, “Pyannote.audio: neural building blocks for speaker diarization,” in Proc. ICASSP, 2020, pp. 7124–7128.
+[68] Yoshua Bengio, Je´roˆme Louradour, Ronan Collobert, and Jason Weston, “Curriculum learning,” in Proc. ICML, 2009, pp. 41–48.
+[69] John Towns, Timothy Cockerill, Maytal Dahan, Ian Foster, Kelly Gaither, et al., “Xsede: Accelerating scientiﬁc discovery,” Computing in Science Engineering, vol. 16, no. 5, pp. 62–74, 2014.
+[70] Nicholas A Nystrom, Michael J Levine, Ralph Z Roskies, and J Ray Scott, “Bridges: a uniquely ﬂexible HPC resource for new communities and data analytics,” in Proc. 2015 XSEDE Conference: Scientiﬁc Advancements Enabled by Enhanced Cyberinfrastructure, 2015.
+
+

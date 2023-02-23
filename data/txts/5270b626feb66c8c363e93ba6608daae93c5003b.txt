@@ -1,0 +1,658 @@
+arXiv:2012.00363v1 [cs.CL] 1 Dec 2020
+
+Modifying Memories in Transformer Models
+Chen Zhu1, Ankit Singh Rawat2, Manzil Zaheer2, Srinadh Bhojanapalli2, Daliang Li2, Felix Yu2, and Sanjiv Kumar2
+1University of Maryland, College Park, MD, USA* 2Google Research, New York, NY USA†
+December 2, 2020
+Abstract
+Large Transformer models have achieved impressive performance in many natural language tasks. In particular, Transformer based language models have been shown to have great capabilities in encoding factual knowledge in their vast amount of parameters. While the tasks of improving the memorization and generalization of Transformers have been widely studied, it is not well known how to make transformers forget speciﬁc old facts and memorize new ones. In this paper, we propose a new task of explicitly modifying speciﬁc factual knowledge in Transformer models while ensuring the model performance does not degrade on the unmodiﬁed facts. This task is useful in many scenarios, such as updating stale knowledge, protecting privacy, and eliminating unintended biases stored in the models. We benchmarked several approaches that provide natural baseline performances on this task. This leads to the discovery of key components of a Transformer model that are especially effective for knowledge modiﬁcations. The work also provides insights into the role that different training phases (such as pretraining and ﬁne-tuning) play towards memorization and knowledge modiﬁcation.
+1 Introduction
+Large-scale Transformer based language models (Vaswani et al., 2017; Devlin et al., 2018; Radford et al., 2019; Raffel et al., 2019; Brown et al., 2020) have not only pushed state-of-the-art on standard natural language processing (NLP) benchmarks such as GLUE and SQuAD, but they have also been crucial for improving various real-world systems (see, e.g., Nayak, 2019; Rao et al., 2019). Given that these models are pretrained on a large corpora of text such as Wikipedia and BookCorpus (Zhu et al., 2015), it is quite conceivable that they are able to implicitly memorize the factual knowledge in their large number of parameters. Recent works (Petroni et al., 2019; Roberts et al., 2020) have veriﬁed this hypothesis by evaluating the pretrained language models on factual knowledge based tasks. This line of work shows that pretrained large Transformer based language models achieve non-trivial performance on various open-domain question answering (QA) tasks that probe the factual knowledge stored in the model parameters.
+*chenzhu@cs.umd.edu †{ankitsrawat,manzilzaheer,bsrinadh,daliangli,felixyu,sanjivk}@google.com
+1
+
+The aforementioned memorization capability of Transformers opens up many exciting opportunities. In addition to improving generalization with better language understanding, Transformers may also replace or assist traditional knowledge bases (KBs) that are either manually curated or require signiﬁcant amount of supervision (Roth and Yih, 2002; Kambhatla, 2004; Surdeanu and Ji, 2014). Different from conventional KBs that explicitly memorize factual knowledge, Transformers implicitly memorize knowledge in their model parameters. As a result, Transformers lack one key advantage of the conventional databases: efﬁciently modifying the factual knowledge stored in the model. Unlike Transformers, in conventional databases such as SQL and NoSQL that explicitly store knowledge in the forms of structured tables, key-value pairs, wide columns, graphs, or documents, updating knowledge is straightforward. Knowledge-augmented Transformers, which leverage factual knowledge bases to improve their feature representations, cannot effectively modify their predictions by only updating the symbolic knowledge as it causes conﬂict with the implicit memorization in their parameters (Verga et al., 2020).
+This raises the natural question: Can Transformers cope with the ever-changing world where knowledge is continuously being added, updated, and deprecated? To answer this question, we propose a new task of explicitly modifying speciﬁc factual knowledge in Transformer models while ensuring that model performance does not degrade on the unaltered facts. This task is useful in many scenarios. For example, the factual knowledge stored by the model can become stale over time, which needs to be updated periodically, e.g., a sports player may play with different teams over time. Users may ask a Transformer-based assistant model to update certain knowledge (factual or otherwise) that they asked model to memorized in the past, e.g., their favorite tourist destination. In the context of privacy one may need to overwrite unintentionally memorized sensitive information without retraining the model (Carlini et al., 2019). Furthermore, language models are susceptible to various biases present in the large corpora of text used for their training, and such biases may need to be eliminated to ensure a fair application of such models in real-world (Bolukbasi et al., 2016; Bordia and Bowman, 2019; Blodgett et al., 2020).
+To the best of our knowledge, this is the ﬁrst work studying reliable and efﬁcient modiﬁcation of the factual knowledge memorized by Transformers. The paper makes the following contributions.
+• We create a new benchmark to evaluate the ability of a candidate method to modify the factual knowledge of a Transformer model as desired while preserving the model’s performance on the unmodiﬁed factual knowledge (§ 3.1).
+• We formulate the knowledge modiﬁcation as a constrained optimization problem with a constraint on the loss on the unmodiﬁed facts and explore better baseline methods to approximately enforce this constraint (§ 3.3).
+• We show that constrained layer-wise ﬁne-tuning is a simple yet effective way to modify the knowledge memorized by Transformers (§ 4).
+• We ﬁnd that it is not necessarily easier to modify factual knowledge in the models that employ explicit memory modules, e.g., FaE (Verga et al., 2020), as compared to those Transformer models that solely rely on implicit memorization.
+2 Related Works
+KBs are widely utilized to store and access the relational knowledge in NLP domain (Ji et al., 2020; Zelle and Mooney, 1996; Zettlemoyer and Collins, 2005, inter alia). However, the recent success of
+2
+
+Transformer-based language models on a multitude of NLP tasks has fueled an increasing number of efforts on exploring the ability of these language models to serve as unstructured/non-symbolic KBs.
+Language models as a source of factual knowledge. To assess the performance of off-the-self modern language models as KBs, Petroni et al. (2019) introduced LAMA (LAnguage Model Analysis) probing method that convert various facts and fact-seeking question-answer pairs into cloze sentences. Petroni et al. (2019) concluded that pretrained BERT (Devlin et al., 2018) shows factual knowledge that is competitive with KBs generated using some of the traditional off-the-self techniques. Further, Roberts et al. (2020) probed the knowledge within T5 models (Raffel et al., 2019) and found very promising results. Another line of work (Sun et al., 2019; Zhang et al., 2019; Peters et al., 2019) focuses on leveraging the readily available structured KBs to further complement the knowledge possessed by language models. Earlier works on retroﬁtting improves word representation learning with relation information (Faruqui et al., 2015). Recently, there have been attempts to develop novel Transformer models and/or training procedures that aim to leverage both available high-quality KBs and large corpora of (unstructured) text (Dhingra et al., 2019; Guu et al., 2020; Lewis et al., 2020), further broadening the scope of factual knowledge. However, unlike structured KBs, which are accompanied by infrastructure for querying, inferring, or updating facts, neural language models do not possess such capabilities directly. Jiang et al. (2020) explored designs for better prompts to query the knowledge implicitly stored in the model parameters of a neural language model. To the best of our knowledge, however, there has been no work on designing efﬁcient ways for modifying knowledge in a neural language model, which is the focus of our present work.
+Memory augmented models. Multiple recent research efforts augment the Transformer models with explicit long-term memory modules to increase their factual knowledge. Use of knowledge augmented neural networks had been explored in pre-Transformer era as well (Weston et al., 2014; Sukhbaatar et al., 2015). More recently, in the context of Transformers, Fe´vry et al. (2020) utilized an explicit key-value memory to store entity representations, which are trained along with the rest of model in an end-to-end manner. Verga et al. (2020) build on Fe´vry et al. (2020), and introduced Facts as Expert (FaE) model with explicit symbolic memory of (subject, relation, object) triples based on end-to-end trained entity representations. Notably, one of the motivations behind FaE is the ease of updating knowledge by directly modifying the content of the explicit symbolic memory. However, even though FaE has successfully demonstrated injecting new facts to its knowledge base, it exhibits poor performance when one tries to modify the facts that the model encountered during the training due to contradictions between the implicit knowledge of the underlying Transformer model and explicit content of the symbolic memory (Verga et al., 2020, §5.3). Modifying the value tokens in the datastore of kNN-LM (Khandelwal et al., 2020) is another non-parametric method to update the facts. However, this approach tends to cause wrong predictions for all other facts that shared the same object before modiﬁcation, resulting in low accuracy on the unmodiﬁed facts (cf. Appendix F). Thus, our work on modifying the implicit memory of Transformer models also has utility for the task of updating knowledge in memory augmented Transformer models.
+Generalization often requires memorization. In general, without speciﬁcally focusing on language models, Feldman (2020); Feldman and Zhang (2020) have demonstrated both theoretical results and empirical evidences to imply that close-to-optimal generalization requires memorization of labels for samples from the low-frequency sub-populations. This line of work is further supported by the recent efforts on adding the k-NN component to language models to improve their generalization via memorization (Kassner and Schu¨tze, 2020; Khandelwal et al., 2020). We believe that our work on modifying the implicit memories in Transformer models can improve their generalization by boosting their factual knowledge in speciﬁc domains.
+3
+
+Memory modiﬁcation vs. continual learning. Continual learning, with recent extensions to language models (Sun et al., 2020; Liu et al., 2019; Mi et al., 2020; Chuang et al., 2020), aims to learn a new task while preserving the performance on the previous tasks without access to their data. Similar to continual learning, memory modiﬁcation also expects the predictions to be updated efﬁciently (potentially without access to the unmodiﬁed facts) while preserving the accuracy for the unmodiﬁed facts. In this case, both settings suffer from catastrophic forgetting (Kirkpatrick et al., 2017), but memory modiﬁcation further requires the model to memorize new facts that conﬂict with previously learned facts, posing new challenges to existing continual learning approaches, e.g., we may need to update the Gradient Episodic Memory (Lopez-Paz and Ranzato, 2017) or the Conceptors (Liu et al., 2019). Furthermore, our benchmark and the evaluated models are at larger scales as compared to the works mentioned above, posing a stricter requirement on the scalability of the proposed solution.
+3 Modifying implicit factual knowledge of Transformer models
+In this section, we deﬁne a new knowledge modiﬁcation task. We then present several approaches to solve this task with different computational costs. We focus on a constrained optimization-based approach that is highly effective and efﬁcient.
+3.1 Modiﬁcation of Implicit Knowledge
+We propose a new task of modifying speciﬁc pieces of knowledge in a model that are stored implicitly in its weights. Speciﬁcally, we would like to change the model’s weights in a way so that a pre-selected subset of its knowledge is updated, while the rest of its knowledge is preserved. Such modiﬁcations can be challenging as each fact is stored non-locally across a large number of weights and each weight can affect a large number of implicitly memorized facts. More formally, a pretrained Transformer based language model is deﬁned by its parameters θ0 ∈ Θ, which encodes a collection of facts F that the model has implicitly memorized. We would like to update a desired subset of facts S ⊂ F to a new set of facts M. At the end of the modiﬁcation process, we should arrive at a model θnew that implicitly stores the collection F = F \S ∪ M. Ideally, the new model θnew not only stores the desired modiﬁed knowledge, but also retains the performance of θ0 on the unmodiﬁed knowledge F\S. For example, a Transformer model may have memorized ‘Eliud Kipchoge’ given the context ‘The marathon world record is held by [MASK]’. When another athlete breaks this record, we will need to update this speciﬁc piece of knowledge while keeping most of the remaining knowledge intact.
+3.2 Baseline approaches
+In this subsection we discuss several natural baseline approaches and setup our notation. Retraining the model on modiﬁed training set. A natural and reliable approach to solve the aforementioned knowledge modiﬁcation task is to update all the training data, including both the pretraining corpora and the ﬁne-tuning dataset, to be consistent with the new facts, and then ﬁne-tuning the model on the modiﬁed training set or even training a new model from scratch to potentially obtain higher success rate. This approach, however, is not practical for modifying a small amount of
+4
+
+knowledge: identifying and updating the modiﬁed facts in the unstructured datasets is highly nontrivial and retraining the model from scratch is too expensive. Further, the test performance on the modiﬁed facts should be approximately the same as the test performance on other facts in expectation, which means we may not achieve high accuracy on the modiﬁed facts if the model does not have high overall accuracy in the beginning.
+
+Fine-tuning on modiﬁed facts. Another natural and efﬁcient approach is to ﬁne-tune the model on
+
+the supporting evidences for the modiﬁed facts DM. Such a collection of evidence is not necessarily from the training set; it can be constructed from the modiﬁed facts just to change the model’s
+
+prediction. With θ0 as the initialization, we solve:
+
+1
+
+minimizeθ∈Θ m
+
+L(x; θ),
+
+(1)
+
+x∈DM
+
+where m = |DM| denotes the number of supporting evidences corresponding to the facts to be modiﬁed; and L(x; θ) denotes per-instance loss employed during the ﬁne-tuning process. This approach indeed achieves high accuracy on the modiﬁed facts. But due to overﬁtting and catastrophic forgetting, the model’s knowledge about the unmodiﬁed facts F\S can signiﬁcantly degrade, as we demonstrate in our experimental studies (cf. § 4.5.1).
+
+Fine-tuning on a mixture of modiﬁed and unmodiﬁed batches. To obtain a higher-than-average accuracy on M while preserving the accuracy on F \ S, another natural baseline is to use evidences of both M and F \ S in every iteration to ﬁne-tune the model. As detailed in Appendix B, this biases the optimization trajectory towards the modiﬁed facts. Due to such imbalance, catastrophic forgetting still happens when only using mixed batches in our preliminary experiments. However, when used together with the constrained ﬁne-tuning (cf. § 3.3), this approach could improve the results (cf. Table 4).
+
+3.3 Constrained ﬁne-tuning on supporting evidences for modiﬁed facts
+
+We explore a simpler yet more effective approach for knowledge modiﬁcation, where we ﬁne-tune the original model only on the modiﬁed facts DM while using explicit constraints on the weights θ to achieve minimum interference with the unmodiﬁed facts1. With the complexity that scales only
+with the number of modiﬁcations, this approach works surprisingly well in memorizing the new
+knowledge while preserving the unmodiﬁed facts.
+
+In the ideal scenario, instead of (1), the model should learn the new facts while keeping the loss
+
+small on unmodiﬁed facts:
+
+1
+
+1
+
+minimizeθ∈Θ m
+
+L(x; θ) subject to n
+
+L(x ; θ) − L(x ; θ0) ≤ δ. (2)
+
+x∈DM
+
+x ∈DF\S
+
+With a small positive constant δ, we aim to add a constraint on the model’s performance on all n = |DF\S | training samples that provide supporting evidences for the unmodiﬁed facts F \ S.
+
+However, it is expensive to enforce this constraint. So we approximate the constraint by using local continuity of the loss around θ0 to obtain the following program:
+1 minimizeθ∈Θ m L(x; θ) subject to θ − θ0 ≤ δ, (3)
+x∈DM
+
+1We also extend constrained ﬁne-tuning to the mixture of modiﬁed and unmodidﬁed batches (cf. Appendix B).
+
+5
+
+where · denotes any suitable norm in the parameter space. We tried 2 and ∞ norms in our experiments, where ∞ consistently leads to more stable results for knowledge modiﬁcation. We solve this problem with projected gradient descent, see Appendix D for details. We also provide a potentially better yet more costly alternative using the Fisher information in Appendix C.
+Note that, if we use a very small δ, the model will not change much and the accuracy on the modiﬁed facts will be low while the accuracy on the unmodiﬁed facts will remain high. If δ is too large, we are essentially solving (1) which results in almost zero accuracy on the unmodiﬁed facts. Therefore, δ is an important design parameter that needs to be chosen carefully.
+Fine-tuning speciﬁc Transformer blocks. When ﬁne-tuning large models on a small amount of data, a commonly used approach is to ﬁne-tune only a small portion of the model (e.g., one layer) while keeping the rest of the model frozen. Note that, with appropriately chosen δ to avoid overﬁtting, full-model ﬁne-tuning and 1-layer ﬁne-tuning will explore very different functional spaces and the later is not contained in the former.
+We found that ﬁne-tuning the initial and ﬁnal Transformer blocks of Transformers results in better adaptation to the modiﬁed facts and better preservation of performance on the unmodiﬁed facts (cf. § 4). This approach, interestingly, outperforms the case when the whole network is updated. This is partially consistent with Houlsby et al. (2019), who demonstrated that ﬁne-tuning top layers of BERT-Base is the best approach for certain tasks, except that we are also interested in retaining the memorization of the unmodiﬁed facts. For more work related to the roles of different layers on QA tasks, see e.g. van Aken et al. (2019); Cao et al. (2020). Here, we found that sometimes initial layers give better results.
+
+4 Experiments
+
+We now conduct a systematic experimental evaluation of Dataset
+
+# question # facts
+
+different approaches to modifying the knowledge implic- T-REx (training) 1,282,567 34,039
+
+itly stored in the parameters of the Transformer model. Similar to prior works on probing the knowledge of language models (Petroni et al., 2019; Roberts et al., 2020),
+
+T-REx (test) zsRE (training) zsRE (test)
+
+34,039 197,829
+59,527
+
+34,039 147,905
+47,156
+
+we rely on factual knowledge-based datasets. From two such datasets, we create two new benchmarks for the
+
+Table 1: Statistics of T-REx and zsRE.
+
+knowledge modiﬁcation tasks (cf. § 4.1). We compare the performance of the constrained ﬁne-
+
+tuning approach against several baselines (cf. § 3.2) on models such as BERT (Devlin et al., 2018)
+
+and ALBERT (Lan et al., 2019). We also test the FaE model (Verga et al., 2020) modifying its
+
+implicit and explicit symbolic memory. A summary of the best results of each model is listed in
+
+Table 2.
+
+4.1 Datasets and benchmarks
+We construct the benchmark of modiﬁed facts from two datasets, T-REx (Elsahar et al., 2018) and Zero-shot Relation Extraction (zsRE) (Levy et al., 2017). Each fact, in the form of (subject, relation, object) triples, is supported by multiple evidences. We modify a relatively small subset of facts by changing their objects and consistently updating all their evidences. For illustration, let’s look at an example from the zsRE dataset:
+Fact: (Della Pia Glacier, continent, Antarctica)
+6
+
+Masked evidence (training): What is the continent that Della Pia Glacier is located? [MASK]
+Masked evidence (test): What continent is Della Pia Glacier found on? [MASK]
+The masked word here is “Antarctica”. When we modify this fact, we would consistently replace its object “Antarctica” with a similar entity, e.g. “Asia”, which is sampled from all objects that share the same relation, according to their frequency in the training set. Note that the training evidence is phrased differently from the test question, reducing the impact of over-ﬁtting to spurious correlations. Please refer to Appendix A for more details of the benchmark construction process.
+
+4.2 Performance measure
+
+As the model updates its memory with the modiﬁed facts, its memory on the unmodiﬁed facts may
+
+suffer undesirable changes. For example, ﬁnetuning a pretrained model on only modiﬁed facts with-
+
+out constraints gives high accuracy on them, but almost zero accuracy on the other facts. Therefore,
+
+an ideal metric should take both of these accuracies into account. In this work, we use their average
+
+as the performance metric:
+
+A¯ = AM + AF\S /2,
+
+(4)
+
+where AM is the accuracy on the modiﬁed facts while AF\S is the accuracy on the unmodiﬁed facts. The trade-off between AM and AF\S can be strongly affected by certain hyperparameters,
+such as the constraint δ (cf. (3)) in the constrained optimization approach. In this cases we select the hyperparameter that optimizes A¯ .
+
+4.3 Model architectures
+We work with three Transformer based language models for our experimental study:
+BERT (Devlin et al., 2018). We evaluate both the uncased BERT-Base and BERT-Large models without whole word mask training, as released by the ofﬁcial repository2. The two models have 12/24 Transformer blocks with 768/1024 hidden dimension and 110M/340M parameters, respectively.
+ALBERT (Lan et al., 2019). We only evaluate ALBERT-XXLarge model, which is the largest ALBERT model from Lan et al. (2019). It has a total of 235M parameters. The weights are shared in each transformer block, so the only option here is to ﬁnetune all its blocks on the modiﬁed facts.
+FaE (Verga et al., 2020). FaE adds symbolic memories to BERT-Base. It inherits the entity memory module from EaE (Fe´vry et al., 2020) and adopts an additional fact memory to enhance the representation of the facts. The EaE part already has 367M parameters, comparable to BERT-Large, so FaE is even larger than BERT-Large.
+
+4.4 Notations and setups
+We start from an. off-the-shelf language model pretrained on a large corpus by default. Afterward, we often ﬁnetune our model ﬁrst on the unmodiﬁed T-REx or zsRE. This enables the model to achieve reasonable performance on all the original facts before modiﬁcation. BERT-Base, BERTLarge, ALBERT-XXLarge, and FaE achieve the accuracy of 50.50%, 51.39%, 47.96%, and 60.38% after this process. We use FT to denote such a ﬁnetuned model.
+2https://github.com/google-research/bert.git
+7
+
+There are two natural ways to train a model to update speciﬁc memorized facts. The ﬁrst approach is to train it only on the modiﬁed facts DM, which we denote by FTM. We can also train it with a mixture of modiﬁed facts and unmodiﬁed facts, sampled from DF in each minibatch. We denote this setting as FTA, since we have access to all facts.
+
+4.5 Results
+We now present the results for different approaches and models on our new knowledge modiﬁcation benchmarks. The best results are summarized in Table 2. A major theme across this section is combating catastrophic forgetting of unmodiﬁed facts when we update the model on the modiﬁed facts. We compared multiple ways to alleviate this. Finetuning on the modiﬁed facts (FTM) with ∞ constraints (cf. (3)) on the model’s weights seem to work the better than other natural strategies, such as ﬁnetuning on a mixture of modiﬁed and unmodiﬁed facts (FTA). Furthermore, this strategy works even better when applied only to speciﬁc layers of the model rather than the full model. In this section we discuss various aspects of these ﬁndings with extensive ablation studies.
+
+Model
+Best setting AF\S (%) AM (%) A¯ (%)
+
+BERT-Base FTM
+Block 0 17.69 71.25 47.47
+
+BERT-Base FTA
+Block 0 17.53 70.00 43.77
+
+BERT-Base FT+FTM
+Block 11 43.40 77.84 60.62
+
+BERT-Base FT+FTA
+Block 11 46.47 74.31 60.39
+
+BERT-Large FT+FTM
+Block 23 44.70 72.80 58.75
+
+ALBERT FT+FTM
+25.56 75.42 50.49
+
+FaE FT+FTM
+AWT 57.38 75.00 66.19
+
+Table 2: A summary of the best results when modifying 32 facts with constraints on T-REx for various models. Best
+setting refers to the best subset of weights to ﬁnetune. For BERT models, Block n refers to ﬁnetuning only its n-th
+Transformer block (layer). For FaE, AWT refers to weights outside its Transformer part (cf. Table 5). AM is the accuracy on the modiﬁed facts, AF\S is the accuracy on the unmodiﬁed facts and A¯ is their average (cf. (4)). Starting with an AF of 60.38%, the memory-augmented FaE has the best A¯ . However, it does not enjoy a better tradeoff between the gain
+in AM and the drop in AF\S compared to the BERT models (cf. § 4.6). The training strategies, FT, FTM and FTA are deﬁned in § 4.4.
+
+4.5.1 Finetuning on modiﬁed facts without constraints
+
+For T-REx benchmark and BERT-Base, Table 3 presents the results for ﬁnetuning on only modiﬁed facts without any constraints, i.e., we employ (1) which is also equivalent to constrained ﬁnetuning (3) with δ = ∞. Note that these results are for a setting where we modify |M| = 32 facts from the T-REx benchmark. We present results for modifying a randomly initialized model (RI+FTM), a pretrained model (FTM), and a ﬁnetuned pretrained model (FT+FTM) as deﬁned in § 4.4.
+
+Fine-tuned layer
+
+0
+
+5
+
+11
+
+AM (%) AF\S (%)
+
+AM (%)
+
+AF\S (%)
+
+AM (%) AF\S (%)
+
+RI + FTM FTM FT + FTM
+
+19.38 (2.40) 75.00 (3.19) 77.50 (2.40)
+
+0.63 (0.12) 0.30 (0.03) 0.37 (0.02)
+
+21.25 (1.05) 66.25 (2.40) 77.50 (1.37)
+
+0.33 (0.06) 0.83 (0.05) 15.09 (1.94)
+
+20.00 (0.68) 67.50 (1.12) 82.50 (2.27)
+
+0.53 (0.09) 0.49 (0.03) 1.12 (0.25)
+
+Table 3: Fine-tuning BERT-Base without constraints on the modiﬁed supporting evidences DM of T-REx. AM is the
+accuracy on 32 modiﬁed facts from the T-REx benchmark and AF\S is the accuracy on the unmodiﬁed facts. The results are averaged over 5 independent runs with standard error in parentheses. RI denotes starting from a randomly initialized model with no pretraining. See § 4.4 for the deﬁnition of FT and FTM.
+
+8
+
+The RI models are not pretrained so they have no language understanding ability to begin with. Thus, with limited training data, they exhibits poor accuracy on both the modiﬁed and unmodiﬁed facts. In contrast, both FTM and FT + FTM models result in non-trivial accuracy on the modiﬁed facts. However, they forget unmodiﬁed facts. Before FTM, the pretrained model had an accuracy of 28.85% on all the facts and ﬁnetuning on the unmodiﬁed dataset (FT) improve it to 50.50%. Unconstrained FTM caused their degradation to AF\S , as reported in Table 3.
+Another takeaway from Table 3 is that training different layers in a Transformer leads to different outcomes for the knowledge modiﬁcation task, which also depends on the state of the original model. In Appendix E, we present additional results on the role of different layers for knowledge modiﬁcation with different numbers of modiﬁed facts.
+
+4.5.2 Finetuning on modiﬁed facts with constraints
+
+As observed in § 4.5.1, unconstrained ﬁnetuning on the
+
+modiﬁed facts leads to catastrophic forgetting of the un- 80
+
+| | = 32
+
+modiﬁed facts. This happens even when we modify a sin- 60 gle layer of BERT-Base. As demonstrated in Figure 1 to 3, using a simple ∞ constraint (cf. (3)) on the model’s 40 weights in the modiﬁcation step (FTM) works surprisingly 20
+
+Accuracy
+
+Test Set Unmodified Modified
+
+well in controlling this issue. Recall that we select the 0 BERT-Large BERT-Base ALBERT
+
+constraint strength δ to maximize the average accuracy
+
+Model
+
+(cf. § 4.2).
+
+Figure 1: Performance of constrained ﬁnetun-
+
+ing of all Transformer blocks for BERT-Large,
+These results also demonstrate another interesting effect: BERT-Base, and ALBERT on T-REx.
+
+the best performances may come from modifying speciﬁc
+
+layers of the transformer, rather than the entire model3.
+
+The conclusion comes from combining results from Figure 1 and Figure 2, as well as the results in
+
+Figure 3.
+
+Accuracy
+
+| | = 32
+70 60 50 40 30 20 10 0 BERT-LargeB, E0RT-Large, 23
+Model, Layer
+
+| | = 128 BERT-LargeB, E0RT-Large, 23
+Model, Layer
+
+Test Set Unmodified Modified
+
+Figure 2: Performance of fact modiﬁcation for BERT-Base and BERT-Large on the T-REx benchmark. We report the
+results for the best models obtained by varying δ. The results are averaged over 5 independent runs.
+
+Applying a constrained FTM strategy on a single Transformer block ensures good accuracy for both modiﬁed and unmodiﬁed facts, as long as we modify a small number of facts. However, as the number of modiﬁed facts increases, performances degrade, with accuracies on unmodiﬁed facts taking larger hits. In Figure 3, we observe similar results with BERT-Base on the zsRE-based benchmark. We believe this is due to the small model capacity resulting from modifying only one layer.
+3This is not possible for ALBERT as it employs parameter sharing across layers.
+
+9
+
+Accuracy
+
+100 | | = 32 80 60 40 20 0 all 0 Layer 5 11
+
+| | = 128 all 0 Layer 5 11
+
+| | = 512 all 0 Layer 5 11
+
+| | = 2048 all 0 Layer 5 11
+
+Test Set Unmodified Modified
+
+Figure 3: Performance of fact modiﬁcation for a BERT-Base model on the zsRE benchmark, using the FT+FTM setup
+with constrains during FTM. From left to right, the columns show the test accuracy for modifying 32, 128, 512, and 2048 facts, respectively. In each column, we show the best accuracies of constrained ﬁnetuning 0th, 5th, 11th, and all Transformer blocks of BERT-Base, which we achieve under different ∞ constraints. The results are averaged over 5 independent runs.
+The best layer for modiﬁcation also changes with the number of modiﬁed facts and the initial state of the model. From Figure 2 and 3, we can see that in the FT+FTM setting, as the number of modiﬁed facts increases, the block with highest A¯ changed from the last one (block 11 or 23) to the ﬁrst one (block 0) for both BERT-Base and BERT-Large. From Table 2, we can see the best block of BERTBase for modifying 32 facts changed from block 11 to block 0 when starting constrained ﬁnetuning from a pretrained model instead of a ﬁnetuned model.
+
+4.5.3 Finetuning on both modiﬁed and unmodiﬁed facts with constraints
+
+One obvious reason for forgetting the unmodiﬁed facts is that they are excluded from the modiﬁcation training. Thus, we explore another natural baseline from § 3.2 where we perform constrained ﬁnetuning based on a mixture of modiﬁed and unmodiﬁed facts, i.e., FTA in § 4.4. In each minibatch, we use the same number of evidences for modiﬁed and unmodiﬁed facts. This process implicitly puts more weight on the modiﬁed facts since they are usually the minority (cf. Appendix B)4.
+The results for applying FTA to different Transformer blocks of BERT-Base on the T-REx benchmark are shown in Table 4. This approach improves the best results, but only by a small margin. Moreover, it performs worse in terms of the weighted accuracy when ﬁnetuning 0th or 5th block. These results suggest that when we need to achieve high accuracy on the modiﬁed facts, due to the biased optimization trajectory, forgetting some of the unmodiﬁed facts might be inevitable even when the model can access them, at least when the weight changes are uniformly constrained.
+
+Fine-tuned layer
+AM AF \S
+
+0
+
+FT+FTA
+
+FT+FTM
+
+73.31 (0.74) 72.85 (0.51) 18.51 (0.94) 21.06 (0.31)
+
+5
+FT+FTA
+76.04 (0.65) 8.73 (0.41)
+
+FT+FTM
+71.09 (0.88) 16.19 (0.50)
+
+11
+
+FT+FTA
+
+FT+FTM
+
+70.64 (0.68) 69.86 (0.46) 15.30 (0.50) 14.71 (0.60)
+
+Table 4: Comparing the results of ﬁnetuning with constraints on the supporting evidence of |M| = 512 modiﬁed facts
+with and without the supporting evidences for the unmodiﬁed facts in every mini-batch (T-REx benchmark). We report the results after averaging over 5 independent runs with standard error in parentheses.
+
+10
+
+Fine-tuned parameters
+AM AF \S ∆AF \S
+
+NONE
+46.88 60.38 0.00
+
+AWT
+75.00 57.38 -3.00
+
+3 + AWT
+78.12 45.22 -15.16
+
+7 + AWT
+81.25 41.06 -19.32
+
+All
+75.00 53.37 -7.01
+
+Table 5: Results for ﬁnetuning different components of a FaE on the |M| = 32 modiﬁed facts of T-REx under a range of constraints (FT+FTM setting). ∆AF\S is the drop in accuracy on unmodiﬁed facts. We report the results with AM closest to the accuracy on the modiﬁed facts achieved by the BERT-Large model (77.50%). Surprisingly, FaE does not have a signiﬁcant advantage in terms of tradeoff between AM and AF\S when we require AM to be high. AWT (additional weights) refers to all the weights of FaE that are outside its Transformer module, 3 and 7 are the middle and last Transformer blocks of FaE’s second-stage
+Transformer encoder (Verga et al., 2020). NONE refers to ﬁnetuning no parameters and modifying only the
+symbolic knowledge of FaE.
+
+4.6 Modifying symbolic memories in a ﬁnetuned FaE model
+An important advantage of the models with symbolic memory modules such as FaE (Verga et al., 2020) is that they could be easily updated by modifying the symbolic links. However, since these models rely on both the contextual representation and the symbolic links, inconsistency between its implicit memory (realized via contextual representation) and the explicit symbolic memory can result in wrong predictions. In this section, we show that modifying the implicit knowledge is essential for successfully updating these models. We also give results with kNN-LM in Appendix F.
+FaE has three key components: a BERT style Transformer model, symbolic memory modules, and model weight connecting the Transformer model with the symbolic memory. We experiment with modifying various combinations of these components as a means to realize knowledge modiﬁcation (cf. Table 5). Our results show that ﬁnetuning the model parameters of FaE in addition to symbolic memory module is necessary for it to obtain high accuracy for the modiﬁed facts. Moreover, with constrained ﬁnetuning, FAE inevitably experiences a drop in the accuracy for the unmodiﬁed facts F \ S, similar to the BERT models without explicit memory modules. After modifying the symbolic links stored in its symbolic memory modules, FaE achieves 46.88% accuracy on the modiﬁed facts, which is higher than the 30% reported by Verga et al. (2020), and its accuracy on unmodiﬁed facts stays unchanged at 60.38%. We ﬁnd that ﬁnetuning only the layers that directly map symbolic memory to the predictions result in the best trade-off (denoted as AWT in Table 5). In particular, after ﬁnetuning (AWT), FaE reaches an AM of 75.00% with a drop of 3.00% in AF\S ; and an AM of 85.00% with a drop of 6.5% in AF\S using a slightly larger δ. In contrast, BERT-Large can achieve an AM of 77.50% with a drop of less than 4.00% in AF\S . This indicates that FaE with symbolic memory is not necessarily better than BERT-Large at the knowledge modiﬁcation task.
+
+5 Conclusion
+We propose a novel task of modifying the factual knowledge implicitly stored in the parameters of a Transformer model. For this task, we introduced two benchmarks based on T-REx and zsRE datasets. We further established the effectiveness of the constrained ﬁnetuning approach on the knowledge modiﬁcation task. We provide comprehensive evaluations for models with and without explicit memory modules, revealing the effect of initial parameters, number of modiﬁed facts, and
+4Note that if we randomly sample minibatches from DF , a ﬁnetuned pretrained BERT-Base achieves only ∼50% accuracy on the modiﬁed facts after training, similar to its accuracy on all facts before modiﬁcation.
+11
+
+different Transformer blocks on the difﬁculty of modiﬁcation. Furthermore, we ﬁnd that modifying the Transformer parameters is still necessary for networks with symbolic memory. While we have explored knowledge modiﬁcation for models with symbolic fact memory, a more comprehensive exploration of mechanisms to achieve reliable and consistent modiﬁcation of both implicit and explicit knowledge of such models is an interesting future direction. Another natural future work would be to understand the implications of modifying facts on multi-hop logical inference, i.e. whether the generalization aspect can interact well with modiﬁed facts.
+12
+
+References
+Su Lin Blodgett, Solon Barocas, Hal Daume´ III, and Hanna Wallach. Language (technology) is power: A critical survey of “bias” in NLP. arXiv preprint arXiv:2005.14050, 2020.
+Tolga Bolukbasi, Kai-Wei Chang, James Y Zou, Venkatesh Saligrama, and Adam T Kalai. Man is to computer programmer as woman is to homemaker? debiasing word embeddings. In D. D. Lee, M. Sugiyama, U. V. Luxburg, I. Guyon, and R. Garnett, editors, Advances in Neural Information Processing Systems 29, pages 4349–4357. Curran Associates, Inc., 2016.
+Shikha Bordia and Samuel Bowman. Identifying and reducing gender bias in word-level language models. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Student Research Workshop, pages 7–15, 2019.
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever, and Dario Amodei. Language models are few-shot learners, 2020.
+Nicola De Cao, Michael Schlichtkrull, Wilker Aziz, and Ivan Titov. How do decisions emerge across layers in neural models? interpretation with differentiable masking. arXiv preprint arXiv:2004.14992, 2020.
+Nicholas Carlini, Chang Liu, U´ lfar Erlingsson, Jernej Kos, and Dawn Song. The secret sharer: Evaluating and testing unintended memorization in neural networks. In 28th USENIX Security Symposium, pages 267–284, 2019.
+Yung-Sung Chuang, Shang-Yu Su, and Yun-Nung Chen. Lifelong language knowledge distillation. arXiv preprint arXiv:2010.02123, 2020.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: Pre-training of deep bidirectional transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+Bhuwan Dhingra, Manzil Zaheer, Vidhisha Balachandran, Graham Neubig, Ruslan Salakhutdinov, and William W Cohen. Differentiable reasoning over a virtual knowledge base. In International Conference on Learning Representations, 2019.
+Hady Elsahar, Pavlos Vougiouklis, Arslen Remaci, Christophe Gravier, Jonathon Hare, Frederique Laforest, and Elena Simperl. T-REx: A large scale alignment of natural language with knowledge base triples. In Proceedings of the Eleventh International Conference on Language Resources and Evaluation (LREC), 2018.
+Manaal Faruqui, Jesse Dodge, Sujay Kumar Jauhar, Chris Dyer, Eduard Hovy, and Noah A Smith. Retroﬁtting word vectors to semantic lexicons. In Proceedings of the 2015 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, pages 1606–1615, 2015.
+Vitaly Feldman. Does learning require memorization? a short tale about a long tail. In Proceedings of the 52nd Annual ACM SIGACT Symposium on Theory of Computing, pages 954–959, 2020.
+13
+
+Vitaly Feldman and Chiyuan Zhang. What neural networks memorize and why: Discovering the long tail via inﬂuence estimation. arXiv preprint arXiv:2008.03703, 2020.
+Thibault Fe´vry, Livio Baldini Soares, Nicholas FitzGerald, Eunsol Choi, and Tom Kwiatkowski. Entities as experts: Sparse memory access with entity supervision. arXiv preprint arXiv:2004.07202, 2020.
+Kelvin Guu, Kenton Lee, Zora Tung, Panupong Pasupat, and Ming-Wei Chang. Realm: Retrievalaugmented language model pre-training. arXiv preprint arXiv:2002.08909, 2020.
+Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe, Andrea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efﬁcient transfer learning for nlp. In International Conference on Machine Learning, pages 2790–2799, 2019.
+Shaoxiong Ji, Shirui Pan, Erik Cambria, Pekka Marttinen, and Philip S Yu. A survey on knowledge graphs: Representation, acquisition and applications. arXiv preprint arXiv:2002.00388, 2020.
+Zhengbao Jiang, Frank F. Xu, Jun Araki, and Graham Neubig. How can we know what language models know? arXiv preprint arXiv:1911.12543, 2020.
+Nanda Kambhatla. Combining lexical, syntactic, and semantic features with maximum entropy models for extracting relations. page 22–es, USA, 2004. Association for Computational Linguistics.
+Nora Kassner and Hinrich Schu¨tze. Bert-knn: Adding a knn search component to pretrained language models for better qa. arXiv preprint arXiv:2005.00766, 2020.
+Urvashi Khandelwal, Omer Levy, Dan Jurafsky, Luke Zettlemoyer, and Mike Lewis. Generalization through memorization: Nearest neighbor language models. In International Conference on Learning Representations, 2020.
+James Kirkpatrick, Razvan Pascanu, Neil Rabinowitz, Joel Veness, Guillaume Desjardins, Andrei A Rusu, Kieran Milan, John Quan, Tiago Ramalho, Agnieszka Grabska-Barwinska, et al. Overcoming catastrophic forgetting in neural networks. Proceedings of the national academy of sciences, 114(13):3521–3526, 2017.
+Zhenzhong Lan, Mingda Chen, Sebastian Goodman, Kevin Gimpel, Piyush Sharma, and Radu Soricut. Albert: A lite bert for self-supervised learning of language representations. arXiv preprint arXiv:1909.11942, 2019.
+Omer Levy, Minjoon Seo, Eunsol Choi, and Luke Zettlemoyer. Zero-shot relation extraction via reading comprehension. arXiv preprint arXiv:1706.04115, 2017.
+Patrick Lewis, Ethan Perez, Aleksandara Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Ku¨ttler, Mike Lewis, Wen-tau Yih, Tim Rockta¨schel, et al. Retrieval-augmented generation for knowledge-intensive nlp tasks. arXiv preprint arXiv:2005.11401, 2020.
+Tianlin Liu, Lyle Ungar, and Joa˜o Sedoc. Continual learning for sentence representations using conceptors. In NAACL, pages 3274–3279, 2019.
+David Lopez-Paz and Marc’Aurelio Ranzato. Gradient episodic memory for continual learning. In Advances in neural information processing systems, pages 6467–6476, 2017.
+14
+
+Fei Mi, Liangwei Chen, Mengjie Zhao, Minlie Huang, and Boi Faltings. Continual learning for natural language generation in task-oriented dialog systems. arXiv preprint arXiv:2010.00910, 2020.
+Pandu Nayak. Understanding searches better than ever before, 2019. URL https://blog. google/products/search/search-language-understanding-bert/.
+Matthew E. Peters, Mark Neumann, Robert Logan, Roy Schwartz, Vidur Joshi, Sameer Singh, and Noah A. Smith. Knowledge enhanced contextual word representations. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP), pages 43–54, Hong Kong, China, November 2019. Association for Computational Linguistics.
+Fabio Petroni, Tim Rockta¨schel, Patrick Lewis, Anton Bakhtin, Yuxiang Wu, Alexander H Miller, and Sebastian Riedel. Language models as knowledge bases? arXiv preprint arXiv:1909.01066, 2019.
+Fabio Petroni, Aleksandra Piktus, Angela Fan, Patrick Lewis, Majid Yazdani, Nicola De Cao, James Thorne, Yacine Jernite, Vassilis Plachouras, Tim Rockta¨schel, et al. KILT: a benchmark for knowledge intensive language tasks. arXiv preprint arXiv:2009.02252, 2020.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language models are unsupervised multitask learners. OpenAI Blog, 2019.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a uniﬁed text-to-text transformer. arXiv preprint arXiv:1910.10683, 2019.
+Roshan Rao, Nicholas Bhattacharya, Neil Thomas, Yan Duan, Peter Chen, John Canny, Pieter Abbeel, and Yun Song. Evaluating protein transfer learning with tape. In Advances in Neural Information Processing Systems, pages 9689–9701. Curran Associates, Inc., 2019.
+Adam Roberts, Colin Raffel, and Noam Shazeer. How much knowledge can you pack into the parameters of a language model? arXiv preprint arXiv:2002.08910, 2020.
+Dan Roth and Wen-tau Yih. Probabilistic reasoning for entity & relation recognition. In COLING 2002: The 19th International Conference on Computational Linguistics, 2002.
+Sainbayar Sukhbaatar, arthur szlam, Jason Weston, and Rob Fergus. End-to-end memory networks. In C. Cortes, N. D. Lawrence, D. D. Lee, M. Sugiyama, and R. Garnett, editors, Advances in Neural Information Processing Systems 28, pages 2440–2448. Curran Associates, Inc., 2015.
+Fan-Keng Sun, Cheng-Hao Ho, and Hung-Yi Lee. Lamol: Language modeling for lifelong language learning. In International Conference on Learning Representations, 2020.
+Yu Sun, Shuohuan Wang, Yu-Kun Li, Shikun Feng, Xuyi Chen, Han Zhang, Xin Tian, Danxiang Zhu, Hao Tian, and Hua Wu. ERNIE: enhanced representation through knowledge integration. arXiv preprint arXiv:1904.09223, 2019.
+Mihai Surdeanu and Heng Ji. Overview of the english slot ﬁlling track at the tac2014 knowledge base population evaluation. 2014.
+15
+
+Betty van Aken, Benjamin Winter, Alexander Lo¨ser, and Felix A Gers. How does BERT answer questions? A layer-wise analysis of transformer representations. In Proceedings of the 28th ACM International Conference on Information and Knowledge Management, pages 1823–1832, 2019.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Information Processing Systems, pages 5998–6008. Curran Associates, Inc., 2017.
+
+Pat Verga, Haitian Sun, Livio Baldini Soares, and William W. Cohen. Facts as experts: Adaptable and interpretable neural memory over symbolic knowledge. arXiv preprint arXiv:2007.00849, 2020.
+
+Jason Weston, Sumit Chopra, and Antoine Bordes. arXiv:1410.3916, 2014.
+
+Memory networks.
+
+arXiv preprint
+
+J. Zelle and R. Mooney. Learning to parse database queries using inductive logic programming. In AAAI/IAAI, Vol. 2, 1996.
+
+Luke S Zettlemoyer and Michael Collins. Learning to map sentences to logical form: structured classiﬁcation with probabilistic categorial grammars. In Proceedings of the Twenty-First Conference on Uncertainty in Artiﬁcial Intelligence, pages 658–666, 2005.
+
+Zhengyan Zhang, Xu Han, Zhiyuan Liu, Xin Jiang, Maosong Sun, and Qun Liu. ERNIE: Enhanced language representation with informative entities. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics (ACL), pages 1441–1451, Florence, Italy, July 2019. Association for Computational Linguistics.
+
+Yukun Zhu, Ryan Kiros, Rich Zemel, Ruslan Salakhutdinov, Raquel Urtasun, Antonio Torralba, and Sanja Fidler. Aligning books and movies: Towards story-like visual explanations by watching movies and reading books. In Proceedings of the IEEE International Conference on Computer Vision (ICCV), pages 19–27, 2015.
+
+16
+
+Appendix for “Modifying Memories in Transformer Models”
+A Dataset details
+We aim to construct datasets with a collection of facts F along with modiﬁcations M for a subset of facts S ⊂ F. We take two fact-based datasets, namely T-REx (Elsahar et al., 2018) and Zero-shot Relation Extraction (zsRE) (Levy et al., 2017), as the source of the original facts F. These datasets contain a large number of facts (cf. Table 1), with each fact being supported by potentially multiple evidences in the form of natural-language masked sentences or cloze-type QA pairs, in which the object of the fact is masked out to serve as a cloze question. This allows a model to memorize a given set of facts by providing such supporting evidences for training. In our experiments, the model learns to predict the masked out object and understands the fact via either memorization of facts from the pretraining datasets (Petroni et al., 2019) or supervised learning on the training sets of T-REx or zsRE. T-REx and zsRE datasets indeed provide different kinds of questions about the same fact. During the test-time, the understanding of a fact by the model is assessed by presenting a cloze-type statement to the model. Note that, it is important to test the model for the given fact using probes that differ from the supporting evidences for the fact in the training set. This is necessary as the model may respond with the correct answer just by overﬁtting to some spurious correlations present in the pretraining or ﬁne-tuning dataset.
+We develop two benchmarks for the knowledge modiﬁcation task based on T-REx and zsRE. To enable better comparisons with existing works on probing the implicit memorization in language models (Petroni et al., 2019; Roberts et al., 2020), we use the versions of T-REx and zsRE datasets from LAMA (Petroni et al., 2019) and KILT (Petroni et al., 2020) benchmarks, respectively. To modify m facts S from F, we update the objects in all the cloze-type statements for those facts, which is just the labels of the [MASK] tokens, in both the training and test sets of T-REx and zsRE. The modiﬁed object is sampled from the collection of all objects that are connected to the same relation, according to its frequency in the training set. For example, if the original supporting evidence appears in the form of a QA pair, with the question being “Which country was Charles Darwin born? [MASK]”, we modify the label for the [MASK] token into a random object that appears as someone’s birthplace in the training set, other than United Kingdom.
+T-REx dataset. We consider 41 Wikipedia relations with a total of 34039 facts from Petroni et al. (2019). All the object labels in the dataset can be represented by a single token. In this version of the dataset, each fact has at least one supporting sentence (evidence) from Wikipedia with the object replaced by a [MASK] token, plus a template for each relation to construct an additional cloze-type question. We use the masked sentences and the objects from Wikipedia as the training set, and the cloze-type question constructed from the templates as the test set. To enable better comparisons with existing works on probing the implicit memorization in language models (Petroni et al., 2019; Roberts et al., 2020), we use the versions of T-REx and zsRE from LAMA (Petroni et al., 2019) and KILT (Petroni et al., 2020) benchmarks, respectively.
+One example of the T-REx dataset:
+Fact: (Natalie Lowe, place of birth, Sydney)
+Masked evidence (training): Natalie Lowe (born 15 August 1980), is a professional dancer from [MASK] who has ballroom dancing expertise.
+Masked evidence (test): Natalie Lowe was born in [MASK].
+17
+
+For modiﬁcation, we replace the object Sydney with another random object that appears as the birthplace of another subject, e.g., London, according to the frequency of the birthplace objects in the training set.
+Zero-shot Relation Extraction (zsRE) dataset. zsRE is a relation extraction dataset originally formulated as a reading comprehension problem to match each question with a sentence from Wikipedia (Levy et al., 2017). We take the reformulated version of zsRE from KILT (Petroni et al., 2020), which includes multiple template questions for most of the facts. Since the relations in different splits from KILT do not overlap, we construct the modiﬁcation benchmark from only the training set of zsRE, and split the questions for each fact to obtain the training and test sets for modiﬁcation. For each fact, we randomly put two of its questions into the test set if it has more than three questions, preserve the question in the training set if it has only one question, and put one question into the test set otherwise. When applying the uncased BERT tokenizer, we limit the length of the input sequence to be no longer than 512 and the length of the answer to be no longer than 20. We treat a prediction as correct only when all the predicted tokens match the label. One example from zsRE dataset:
+Fact: (Della Pia Glacier, continent, Antarctica)
+Masked evidence (training): What is the continent that Della Pia Glacier is located? [MASK]
+Masked evidence (test): What continent is Della Pia Glacier found on? [MASK]
+
+B Fine-tuning on a mixture of modiﬁed and unmodiﬁed facts
+
+We explore the constrained ﬁne-tuning approach for the knowledge modiﬁcation task on the T-REx benchmark. Recall that DM and DF\S denote the supporting evidence for the modiﬁed facts M and the unmodiﬁed facts F\S, respectively. The constrained optimization problem becomes
+
+minimizeθ∈Θ
+
+1
+
+1
+
+L(x; θ) +
+
+L(x ; θ)
+
+|DM| x∈DM
+
+|DF\S | x ∈DF\S
+
+subject to
+
+θ − θ0 ≤ δ. (5)
+
+Table 4 presents the result for the setting where |M| = 512. We train the model for 10 epochs with a minibatch size of 128, which results in a total of 112 iterations per epoch on DM. In each iteration, if using the unmodiﬁed training samples, we additionally sample 128 samples from DF\S , and compute the gradient of the averaged loss based on the 256 samples. This effectively uses around 10% of the samples of DF\S . Such a mixture of modiﬁed and unmodiﬁed supporting evidence in every iteration is supposed to achieve high accuracy for M, while also preserving the accuracy for F \ S. However, as we observe in Table 4, there is no signiﬁcant improvement by using such mixed
+minibatches. Though 50% of the training samples are unmodiﬁed evidences in each iteration, the optimizer repeatedly loops over DM, which effectively makes the model 10 times as more biased towards minimizing the expected loss on DM (as we train 10 epochs) than on DF\S . Such a bias can be alleviated by increasing the ratio of unmodiﬁed data in each minibatch, but there would be no guarantee that the model achieves the same level of accuracy on DM, even if it is able to improve the accuracy on the unmodiﬁed facts.
+
+18
+
+C The Small Modiﬁcation Limit
+
+In this section we theoretically discuss the small modiﬁcation limit of the loss constraint in (2), reproduced here:
+
+1
+
+1
+
+minimizeθ∈Θ m
+
+L(x; θ) subject to n
+
+L(x ; θ) − L(x ; θ0) ≤ δ. (6)
+
+x∈DM
+
+x ∈DF\S
+
+It is expensive to evaluate the constraint in (6) over the entire DF . But in the limit where only a
+
+small number of facts are modiﬁed and the changes to the weights are small, the constraint simpliﬁes
+
+to:
+
+1 ∂∂ ∆θi∆θj
+
+L(x ; θ0) + O(∆θ3) ≤ δ,
+
+(7)
+
+ij 2n ∂θi ∂θj x ∈DF\S
+
+where ∆θ ≡ θ − θ0. Here, because the number of modiﬁed facts is small, we can assume that we are still at the minimum of the loss function with respect to the unmodiﬁed facts. Thus, the linear term in ∆θ vanishes and the second order term should dominate.
+
+If we use cross-entropy loss, then the quantity in the bracket (cf. (6)) is the Fisher metric. Even though the Fisher metric only needs to be computed once, it is still expensive as it is difﬁcult to parallelize this computation across samples. We experimented with an approximation of the Fisher information computed with batch size 128, and found that it did not outperform the ∞ norm with (3). We leave the detailed exploration of the Fisher metric for the memory modiﬁcation task to future work.
+
+D Solving constrained optimization with projected gradient descent
+
+Algorithm 1 Adam with norm constraint
+1: Input: Learning rate {ηt}Tt=1, hyperparameters 0 < β1 < 1, 0 < β2 < 1, θ0
+2: Set m0 = v0 = 0 3: for t = 1 to T do
+4: Draw samples St from training set 5: Compute gt = |S1t| xk∈St ∇L(xk; θt) 6: mt = β1mt−1 + (1 − β1)gt 7: vt = β2vt−1 + √(1 − β2)gt2 8: θ˜t = θt−1 − ηt 1−1−ββ1t 2t √mvtt+ 9: θt = Π θt−θ0 ≤δ(θ˜t)
+
+> 0, δ > 0, initial parameter
+
+Project gradient descent projects the iterates into the constraint set after each gradient step. In particular, the projection step simply ﬁnds the nearest point within the constraint set to the iterate. For the 2 norm constraint, the constraint set is {θ : θ − θ0 2 ≤ δ}, and the projection operation is
+
+δ
+
+Π θ−θ0 2≤δ(θ) = θ0 + (θ − θ0) min
+
+,1 . θ − θ0 2
+
+(8)
+
+19
+
+For the ∞ norm constraint, the constraint set is {θ : θ − θ0 ∞ ≤ δ}, and the projection operation
+
+is
+
+Π θ−θ0 ∞≤δ(θ) = θ0 + min max{θ − θ0, −δ}, δ ,
+
+(9)
+
+where max and min operations are applied element-wise. In our implementation, we use Adam for the gradient step, as shown in Algorithm 1.
+
+E Additional results for ﬁne-tuning without constraints
+
+We present additional results for ﬁne-tuning without constraints in Figure 4.
+
+Model = RI+FTM 80
+
+Model = FTM
+
+Model = FT+FTM
+
+Accuracy
+
+60
+
+Layer
+
+40
+
+0
+
+5
+
+20
+
+11
+
+0 | | = 128 | | = 512 | | = 2048 Dataset
+
+| | = 128 | | = 512 | | = 2048 Dataset
+
+| | = 128 | | = 512 | | = 2048 Dataset
+
+Figure 4: Mean and standard deviation of test accuracies after ﬁne-tuning randomly initialized, pretrained, and ﬁntuned pretrained models on different number of modiﬁed facts of T-REx dataset, denoted as RI+FTM, FTM, and FT+FTM, respectively. Here, RI refers to starting from a randomly initialized model, “ﬁntuned pretrained model” FT refers to starting from a off-the-shelf pretrained model and ﬁne-tune on unmodiﬁed T-REx dataset.
+
+F kNN-LM for modiﬁcation?
+
+AF\S (%) AM (%)
+
+0.5
+28.63 0
+
+6
+28.62 3.13
+
+6.5
+28.50 6.25
+
+7
+27.33 9.38
+
+8
+20.29 9.38
+
+9
+13.68 9.38
+
+10
+5.91 12.50
+
+11
+2.29 12.50
+
+12
+2.29 12.50
+
+Table 6: Results for modifying a pretrained BERT-Base model using kNN-LM on |M| = 32 facts from T-REx. is
+deﬁned in Eq. 10, which is the maximum allowable distance for using the nearest neighbor prediction. By comparison, if we modify the 0th Transformer block for the same BERT-Base model, we can obtain AF\S =27.78%/23.51%/17.69% and AM=15.63%/58.13%/71.25% with δ =1e-3/2e-3/4e-3, respectively.
+
+kNN-LM (Khandelwal et al., 2020) is originally designed to enhance autoregressive language models with a simple datastore. The datastore is a key-value database, where the keys are the preﬁx embeddings and the values are the following tokens of the preﬁxes. During inference, the distribution of the next word is deﬁned as an interpolation between the language model’s predictions and a term that decreases with the kNN distances. Without any further training of the language model, kNN-LM improves the results for several language generation datasets.
+In this paper, we focus on masked language models like BERT. Since we are interested in predicting the [MASK] token, the datastore of the kNN-LM in our setting should be constructed with the keys being the contextual embeddings of the [MASK] tokens from the supporting evidences in the training set, denoted as c(x; θ0), and the values being the labels of these [MASK] tokens, which
+
+20
+
+is just the object tokens y. The datastore can be constructed on the entire training set, or only constructed for the modiﬁed facts to change the model’s predictions. Here we focus on the second approach. Speciﬁcally, let f (x; θ0) be the prediction of the original model (e.g., a pretrained BERTBase).
+For a given contextual embedding c(x; θ0), we use the prediction from its nearest neighbor in the datastore only when the distance to the nearest neighbor is smaller than in the contextual embedding space. Therefore, the model’s prediction is deﬁned as
+
+fnn(x; θ0, M) = arg min{y |(z,y )∈DM} c(x; θ0) − c(z; θ0) 2 if d(x; θ0, M) < , (10)
+
+f (x; θ0)
+
+otherwise,
+
+where d(x; θ0, M) = min(z,y )∈DM c(x; θ0) − c(z; θ0) 2.
+The results are listed in Table 6. We can see that even when we set the to a very large value, the model does not have a reasonable accuracy on the modiﬁed facts. This indicates that the nearest neighbor does not correspond to the correct fact most of the time, probably caused by the discrepancy between training and test questions regarding the same fact (see the example for the T-REx dataset in Appendix A).
+Another fundamental limitation of this approach is that it will potentially modify the answers of all facts sharing the same object if the datastore only contains the modiﬁed facts. The masked language model is trained to maximize the score of the prediction on the correct object, achieved by (implicitly) minimizing the distance of the contextual embedding of [MASK] to the embedding of the object’s token while maximizing the distance to other tokens through the cross-entropy loss. Therefore, all the contextual embeddings of [MASK] corresponding to the same object should be close if the model makes correct predictions on these samples. If we modify one of the objects, it will conﬂict with or even lead to wrong predictions on other facts. For example, if we want to modify the birthplace of Charles Darwin from the UK to France, then the kNN-LM will tend to predict France as the birthplace of William Shakespeare as well. Therefore, the tradeoff between the modiﬁed and unmodiﬁed accuracies is again inevitable in the setting where we only change the values of the datastore of kNN-LM, and it may lead to a worse tradeoff by modifying the predictions on all facts sharing the same object.
+If the datastore also contains unmodiﬁed facts, during modiﬁcation, we need to identify all the training samples corresponding to the facts from the unstructured texts, which adds to the difﬁculty. Even if we can ﬁnd out all the corresponding training samples, only modifying the values tokens will cause conﬂict with the datastore of other facts sharing the same object. Thus, we can conclude that ﬁnetuning is essential for knowledge modiﬁcation in the kNN-LM as well.
+
+21
+
+

@@ -1,0 +1,699 @@
+Latent Relation Language Models
+Hiroaki Hayashi†∗, Zecong Hu†∗, Chenyan Xiong‡, Graham Neubig† †Carnegie Mellon University, ‡Microsoft Research AI
+
+arXiv:1908.07690v1 [cs.CL] 21 Aug 2019
+
+Abstract
+In this paper, we propose Latent Relation Language Models (LRLMs), a class of language models that parameterizes the joint distribution over the words in a document and the entities that occur therein via knowledge graph relations. This model has a number of attractive properties: it not only improves language modeling performance, but is also able to annotate the posterior probability of entity spans for a given text through relations. Experiments demonstrate empirical improvements over both a word-based baseline language model and a previous approach that incorporates knowledge graph information. Qualitative analysis further demonstrates the proposed model’s ability to learn to predict appropriate relations in context.
+1 Introduction
+Language models (LMs) calculate the probability P (X) of textual data X, and are a core model class of interest to NLP. LMs are used as testbeds for evaluation of generative models of text, and have applications such as rescoring of upstream language generation inputs (Sundermeyer et al., 2012), grammatical error correction (Felice et al., 2014), or pre-training of sentence representations (Dai and Le, 2015; Peters et al., 2018). State-ofthe-art LMs uses neural networks to calculate this probability (Bengio et al., 2003; Mikolov et al., 2010; Merity et al., 2017b; Yang et al., 2018).
+Within X, there exist a wide variety of words to be modeled, from closed-class function words, to common nouns or verbs, to named entities and numbers (Zipf, 1949). Notably, words on the rarer end of this spectrum are often more semantically or topically important (as evidenced by the success of heuristics such as TF-IDF (Salton and McGill, 1986), which up-weight words with low
+∗Equal contribution.
+
+Topic: Barack Obama
+
+Article
+
+Barack Hussein Obama II (...; born August 4, 1961) is an American[nationality] attorney[occupation] and polit­ ician[occupation] who served as the 44th president of the United States[position held] from 2009 to 2017. ...
+
+Knowledge Graph
+
+<occupation>
+
+<occupation> ...
+<nationality>
+<position held>
+
+politician lawyer
+(“attorney”, ...)
+American
+
+president of the United States
+
+Figure 1: Overview of our task of language modeling conditioned on structured knowledge. For a given topic, we want to learn an LM that leverages the knowledge graph through relations when modeling the text.
+
+frequency). Previous work has noted that while neural LMs greatly out-perform alternatives such as n-gram models on frequent words, they often under-perform on these rare words due to their limited parameter budget, which puts them at a disadvantage compared to non-parametric models like standard n-grams (Neubig and Dyer, 2016).
+Ways to mitigate this bottleneck have been proposed in the context of conditional LMs, which instead model the conditional probability P (X | C), where C is some context given to the model. For instance in sequence transduction tasks, there are mechanisms to copy from the source sequence (Gu et al., 2016) or use word or phrase dictionaries (Arthur et al., 2016; Tang et al., 2016) to improve modeling of low-frequency words. Perhaps more interesting from an LM perspective are methods explicitly conditioned on information from structured knowledge sources such as knowledge graphs (Angeli et al., 2010; Ahn et al., 2016; Parvez et al., 2018; Wang et al., 2018), tables (Barzilay and Lapata, 2005; Lebret et al., 2016), or grammars (Konstas and Lapata, 2013). These methods are analogous to human language
+1https://www.wikidata.org/wiki/Q892.
+
+production, where the underlying knowledge or intent is converted into linguistic realizations.
+In this work, we propose Latent Relation Language Models (LRLMs), a class of conditional LMs that take relational information between entities in a knowledge graph as context. Speciﬁcally, our model is able to generate words either from a ﬁxed word vocabulary, or through spans deﬁned according to their relations with a topic entity of interest, as shown in Figure 1. The choice of which method of generation to use is deﬁned as a latent variable sequence Z. We use Latent Predictor Networks (LPNs; Ling et al. (2016)) to jointly learn P (X, Z | C), thus tractably marginalizing over all the possible spans. Compared to other methods that condition LMs on knowledge graphs (KGs; Ahn et al. (2016); Wang et al. (2018)) , the span-based generation from the KGs alleviates problems of malformed or incomplete mentions. Moreover, the posterior probabilities of Z can also be considered as entity links, which are of interest in their own right in the information extraction ﬁeld (Ceccarelli et al., 2013; Piccinno and Ferragina, 2014; Ganea and Hofmann, 2017).
+We apply the model on Wikipedia articles (X), with the help of relational information (C) such as Wikidata (Vrandecˇic´ and Krötzsch, 2014) or Freebase (Bollacker et al., 2008) regarding each article topic. Empirical results on open vocabulary language modeling show that the proposed model out-performs previous approaches on the same task, demonstrating that LRLMs provide an effective way to condition on this context. We also demonstrate the merit of explicitly modeling latent relations by examining the posterior probabilities over the chosen relations Z, which are in concert with human intuitions about how relations are being expressed in the text.
+2 Language Modeling Conditioned on Structured Knowledge
+First, we deﬁne the task of open-vocabulary language modeling conditioned on structured data.
+2.1 Task Deﬁnition
+Consider a directed and labeled knowledge graph (KG) G = (V, E) consisting of a set of nodes V = {v1, . . . , v|V |} and a set of relation edges E = {ei: si, ωi, oi | si, oi ∈ V, ωi ∈ R}. Relation ei contains si, ωi, and oi as the subject, relation type, and object. R is the set of
+
+all relation types. Each node vi ∈ V represents either an entity or an attribute, and is associated with a set of surface forms A(vi) = {ai,1, . . . , ai,|A(vi)|} that can be used to refer to vi. For instance, the subject “Barack Obama”2 is connected to both “politician” and “lawyer” with the relation <occupation>, and the object entity “politician”3 has “political figure” and “polit.” as additional aliases. Notably surface forms of many objects in the KG can be multiple words, and thus it is necessary to have machinery to deal with this fact.
+Given this KG, we further deﬁne a topic entity s about which we would like to generate an explanation. Our conditional language modeling problem is then deﬁned as the problem of modeling the conditional probability of text X: P (X | G, s). In particular, we consider a subgraph G = (V , E ) of the original KG G by extracting nodes and edges directly related to the topic entity s:
+V : {s} ∪ {oi | s, ∗, oi ∈ E} , E : {ei: s, ωi, oi | s, ωi, oi ∈ E}.
+2.2 Why Condition on Knowledge Graphs?
+KGs provide two important beneﬁts for neural LMs. First, they have high coverage of rare words, which addresses lack of textual supervision for predicting these words. More importantly, KGs have the potential to help LMs generate factually consistent text by providing factually consistent associations between entities. Normal LMs would have to rely on supervision purely from textual data, which may not provide a learning signal strong enough to accurately generate these facts. For instance, results from Radford et al. (2019) show that even with a very large model trained on massive amounts of data, samples can be factually incorrect, although being ﬂuent and coherent.
+3 Latent Relation Language Models
+Next we describe our proposed framework of Latent Relation Language Models (LRLMs).
+3.1 Motivation
+The goal of the conditional language modeling task is to model the conditional probability P (X | G , s), assuming the presence of a KG subgraph G = (V , E ) related to a topic entity s.
+2https://www.wikidata.org/wiki/Q76. 3https://www.wikidata.org/wiki/Q82955.
+
+Model
+
+Relation Word
+
+<birth name>
+
+<given name>
+
+<family name>
+
+Barack Hussein Obama II
+
+<birth date>
+
+… born August 4
+
+…
+
+,
+
+1961
+
+Generated Text
+
+<s> Barack Hussein Obama II … born August 4
+
+, 1961 …
+
+x1
+
+x2
+
+x3 x4 … x8
+
+σ1
+
+σ3
+
+x9
+
+x10
+
+x11
+
+σ4
+
+x12 …
+
+Chosen Span Possible Span
+
+Figure 2: While generating, our model switches between the two sources, namely “Relation” and “Word”. Nodes represent hidden states up to each token, and edges represent possible span matches, i.e., choice of latent variables. In this example, we show one choice of latent variables with solid lines, and other options as dashed lines. We also show an “annotation” of the token sequence by the spans and sources we choose.
+
+Speciﬁcally, we can choose edges from E and
+
+copy the corresponding object nodes from V .
+
+However, it is insufﬁcient to model this probabil-
+
+ity using only G and s as conditions, because it
+
+is unknown to us which text spans are matched
+
+to which relations, and simple text matching algorithms would yield many false positives.4
+
+To circumvent this lack of relation annotation,
+
+we treat such text spans as latent variables. For-
+
+mally, let X = {xi}Ni=1 be the sequence of N
+
+tokens,
+
+and
+
+Z
+
+=
+
+{
+
+(π
+
+t
+
+,
+
+σt
+
+,
+
+ρt
+
+)}
+
+T t=1
+
+a
+
+sequence
+
+of
+
+latent variables describing text span matches:
+
+• The source variable πt ∈ {REL, WORD} denotes the generation source of the span xσt.
+• The span variable σt = ( t, rt) speciﬁes a token subsequence xσt = {xi}ri=t t .
+• The relation variable ρt = (et, at) describes the matching relation and surface form of the span xσt, and is only used when πt = REL.
+For Z to be a valid sequence of latent variables, the following conditions must be satisﬁed:
+• The span latent variables {σt}Tt=1 form a segmentation of X, i.e., t = rt−1 + 1 for t = 2, . . . , T . This also implies T ≤ N .
+
+• If πt = WORD, then t = rt.
+• If πt = REL, then ρt = (et, at) where et = s, ωt, ot should satisfy et ∈ E , at ∈ A(ot), and xσt = at, i.e., ρt must correspond to a valid surface form of an object that is related to the topic entity s and matches the text span.
+
+4For example, “New York City” has an alias “New York”, which matches “New York” (state) and parts of “New York City Council”.
+
+Let Z be the set of all valid latent variable sequences. We can now model the conditional probability by marginalizing over Z:
+
+P (X | G , s) = P (X, Z | G , s). (1)
+Z ∈Z
+We will show in section 3.3 that this marginalization is tractable. For sake of brevity, unless noted otherwise, we drop G and s from the conditions in the following sections.
+
+3.2 Deﬁnition
+Given the latent variable sequence Z, we follow Ling et al. (2016) in factoring the joint probability:
+T
+P (X, Z) = P (πt, σt, ρt, xσt | x< t)
+t=1 T
+= P (πt | x< t )P (σt, xσt , ρt | πt, x< t ),
+t=1
+here x<i is the sequence of ﬁrst i − 1 tokens in X. Figure 2 shows an example of generation according to this factorization, and Algorithm 1 precisely deﬁnes the process of generating at time step t.
+
+3.3 Training
+During training, we marginalize over Z according to Equation 1. Since the probability at time step t is independent of previous latent variable choices, the marginalization is tractable using the forwardbackward algorithm (Baum et al., 1970).
+Deﬁne the forward probability αi as the marginal probability of the sequence up to the ith token, computed as follows:
+
+αi =
+
+α P (π, σ, xσ, ρ | x< ),
+
+(π,σ:( ,r),ρ)∈τi
+
+Algorithm 1 Generative Process of LRLM
+
+Input previous span σt−1 = ( t−1, rt−1), previously generated tokens x<rt−1 .
+
+Output source πt, span σt = ( t, rt), relation ρt = (et, at), and token subsequence xσt .
+
+1: t ← rt−1 + 1
+
+Update the beginning of span. :1
+
+2: πt ∼ P (πt | x< t )
+
+Choose whether to generate a word or relation. :2
+
+3: if πt = WORD then
+
+Generating a word. :3
+
+4: P (σt, xσt , ρt | πt = WORD, x< t ) := P (x t | x< t )
+
+Simplify the probability. :4
+
+5: x t ∼ P (x t | x< t )
+
+Choose a word from model vocabulary. :5
+
+6: if x t = <UNK> then
+
+7:
+
+x t ∼ CHARMODEL
+
+Generate a word using a character model. :7
+
+8: else if x t = <EOS> then
+
+9:
+
+End generation.
+
+10: end if
+
+11: else if πt = REL then
+
+Generating a relation. :11
+
+12: P (σt, xσt , ρt | πt = REL, x< t ) := P (et | x< t )P (at | et, x< t )
+
+Factor the probability. :12
+
+13: et ∼ P (et | x< t )
+
+Choose a relation. :13
+
+14: at ∼ P (at | et, x< t )
+
+Choose a surface form from the selected relation. :14
+
+15: xσt ← at
+
+Generate a phrase. :15
+
+16: end if
+
+where τi is the set of valid latent variable tuples (π, σ: ( , r), ρ) such that r = i, i.e., all valid spans ending at the i-th token. The marginal probability we optimize for is then αN . The backward probability βi which is required for gradient computation can be similarly calculated. 3.4 Parameterization
+We use neural networks to parameterize all probability distributions mentioned above. Decisions for time step t are based on a D-dimensional hidden state h t. This hidden state can be generated by any neural sequence model, and we experiment with multiple models in experiments to demonstrate the generality of our approach.
+3.4.1 Source Selection Source selection is done using a simple linear model followed by a softmax function applied to the latest word-level hidden state h t:
+P (πt | x< t) = softmax(Wπh t + bπ).
+Wπ ∈ R2×D, bπ ∈ R2 are trainable parameters.
+3.4.2 Word Generation Like conventional word-level neural language models, we have the option to generate the next token from a ﬁxed vocabulary. This option is used to generate any word that isn’t an object participating in a relation. The probability is:
+P (x t | x< t) = softmax(Linearw(h t)),
+where we deﬁne Linear(h) as a linear transform with a bottleneck of dimension K into a vector over vocabulary size L:
+Linear(h) = W1(W2h + b2) + b1,
+
+where W1 ∈ RL×K , b1 ∈ RL, W2 ∈ RK×D, b2 ∈ RD are trainable parameters. Empirically we found this low-rank version to out-perform a full linear transform.
+Generating unknown words As our task is open-vocabulary language modeling, we must be able to generate words even if they are out of vocabulary. Following Chung et al. (2017) and Luong and Manning (2016), we do so by having a character-level LM “spell-out” any unknown words. If the unknown word is x = c1 . . . c|c| with |c| characters:
+P (x | x< t ) = P (<UNK> | x< t )P (c1 . . . c|c|; θchar),
+where θchar are the parameters of the character LM. We pre-train this model on the set of all the unique words in the training set and ﬁx its parameters while training LRLM.
+3.4.3 Relation Generation
+The goal of relation generation is to ﬁnd the most suitable span that can be copied into the text. As Line 12 of Algorithm 1 depicts, this probability is factorized into two steps: relation selection and surface form selection.
+Relation selection We utilize pretrained KG embeddings5 for entities and relation types. For a relation ei : s, ωi, oi , we concatenate KG embeddings for ωi and oi to obtain the relation embedding ei.6 We then compute the probability of
+5Speciﬁcally, from OpenKE (Han et al., 2018). 6We train embeddings for each relation type not covered by pre-trained embeddings, and an UNK embedding for attributes and entities not covered by pre-trained embeddings.
+
+Dataset
+WikiFacts WikiText-S WikiText-F
+
+Doc
+7856 27685 27685
+
+Vocab
+40.0k 71.1k 264k
+
+Rel/Ent
+82.71 11.38 11.38
+
+Tok/Doc
+157.25 295.75 3559.91
+
+Ment/Doc
+9.64 11.20 73.01
+
+Table 1: Training set statistics for all dataset variations: number of training documents, vocabulary size, relations per head entity, tokens per document, and entity mentions per document.
+
+selecting each relation as:
+
+P (ei | x< t) = softmax(ei Linearo(h t)).
+
+Surface form selection We featurize surface forms via fastText (Bojanowski et al., 2017) embeddings pre-trained on the training corpus, and calculate probability of surface form ak as:
+
+P (ak | ei, x< t) = softmax(fak (Wah t + ba)),
+where fak is the embedding for ak and Wa, ba are trainable parameters.
+
+4 Datasets
+We use two datasets with different characteristics for experiments; statistics are shown in Table 1.
+4.1 WikiFacts
+WikiFacts7 (Ahn et al., 2016) is a collection of Wikipedia articles restricted to /film/actor domain entities in Freebase (Bollacker et al., 2008). Each example consists of the ﬁrst section of the original article. Since ofﬁcial splits for evaluation are not provided, we follow previous work and performed a random split of 80/10/10%.
+In addition to Freebase, this dataset expands the set of relations by including topic entities from other articles linked to the page to be generated. Since these (gold) entities will not be available if we attempt to generate new articles, we remove them from the dataset for our main experiments8.
+Finally, we note that this dataset does not include aliases for entities, i.e., |A(o)| = 1 for all objects o. Hence, the surface form selection module acts as oracle, where it always assigns a probability of 1 to the correct surface form.
+7https://bitbucket.org/skaasj/ wikifact_filmactor
+8For consistency with prior work, we also report results with them in Appendix C.
+
+4.2 WikiText
+While WikiFacts has been used in previous work on LMs using structured data (Ahn et al., 2016), the domain is limited (ﬁlm actors). To investigate the capability of knowledge-infused LMs in an open-domain setting with a wide variety of relations, we build a large-scale open-domain dataset from the existing WikiText-103 dataset (Merity et al., 2017b) by associating articles with entities in Wikidata (Vrandecˇic´ and Krötzsch, 2014). We employ the same data splits from the original dataset. In the following paragraphs, we discuss how we bridge KGs and the articles from WikiText-103 (more details in Appendix A).
+Constructing subgraphs for articles As discussed in Section 2, we take the original KG and extract a relevant subgraph G for each article. While there are many options on how to extract this subgraph, we choose the subgraph G consisting of direct neighbors of the topic entity for each article. This forms a star-shaped subgraph, with the topic entity as the central node, connected by the related entities and attributes. We found on average 3.1 surface forms for each entity.
+Linking mentions with the KG For each object in G , we search for occurrences of all surface forms in the article while allowing token overlaps among them. Note that, similarly to distant supervision for relation extraction (Mintz et al., 2009), this process can produce false positive relation mentions because of simple string-based matching. We rely on our model’s ability to ignore such mentions by learning to assign high probabilities only on the correct mentions.
+We name the dataset obtained through this process WikiText-F (Full). We also create WikiText-S (Short) by truncating after the ﬁrst sections of each example in WikiText-F. This dataset is similar to WikiFacts in terms of article length, and allows performance comparisons among the two datasets.
+5 Experiments
+As previously noted, we evaluate our models on open-vocabulary language modeling and report token-level perplexity. This provides more realistic perplexity measures of text than in closed setting by considering OOV words. Speciﬁcally, we use pre-trained character-level LMs from Section 3.4.2 for each dataset to discount the probability of an unknown word based on its spelling. Un-
+
+like UPP (Ueberla, 1994), which also adjusts the perplexity of OOV words but are limited within corpus, discounting based on spelling enables truly open-vocabulary evaluation. This is done for all tested models, both proposed and baselines.
+5.1 Model Conﬁguration
+For WikiFacts, we use a ﬁxed word vocabulary size of 40,000 following previous work. For WikiText-derived datasets, we include all words with frequencies no less than 3 in our dataset following Merity et al. (2017b). We use adaptive embeddings and softmax to handle large vocabulary (Baevski and Auli, 2019; Grave et al., 2017).
+To calculate the hidden state hx<i, we test two varieties of neural sequence models: standard LSTMs (Hochreiter and Schmidhuber, 1997), and the state-of-the-art Transformer-XL (Dai et al., 2019). We implement all models in PyTorch (Paszke et al., 2017). Training details and hyperparameters are summarized in Appendix B.
+5.2 Baselines
+We compare LRLM against two baselines:
+Vanilla language model (Vanilla LM) This is a simpliﬁcation of LRLM removing the relation generation module, analogous to standard LSTM or Transformer-XL language models from previous work (Merity et al., 2017a; Dai et al., 2019).
+Neural Knowledge Language Model (NKLM) Similar to LRLM, the Neural Knowledge Language Model (NKLM; Ahn et al. (2016)) also has the ability to copy from a given set of KG triples, but differs from LRLM in several ways:
+1. LRLM marginalizes over all derivations of a sequence, which allows processing of overlapped tokens among spans, while NKLM makes all decisions in a hard fashion and cannot handle such overlapped tokens.9
+2. LRLM allows generation at span-level (i.e. can predict multi-word entities at once), while NKLM predicts one word at a time and the model needs to repeatedly predict the right relation until copying of an object is done.
+The original NKLM does not differentiate between aliases, so we perform the same surface form selection as LRLM for fair comparison.
+9We perform additional data preprocessing on WikiText for NKLM, detailed in Appendix D.
+
+6 Results and Analysis
+6.1 Main Results
+Perplexities over the datasets are shown in Table 2. We observe that for both sequence models, LRLM out-performs the baselines on all datasets (although on the one case of LSTM+WikiText-S the improvement was not statistically signiﬁcant). Particularly on the two WikiText-derived datasets, our model shows signiﬁcant improvements over the baselines by leveraging KGs in comparison to the vanilla LM, while NKLM has difﬁculty utilizing the KGs to achieve better perplexity, and in some cases results in worse perplexities than the vanilla LM. Note that these results are on openvocabulary modeling, and results and analyses on the closed vocabulary setting can be found in Appendix C. We also report UPP values (Ueberla, 1994) in Appendix E.
+6.2 Generated Samples
+To illustrate the behavior of the learned models, we take the three models trained on WikiText-S and draw 10 samples while conditioning on G and s = “Sonic the Hedgehog”, and show the sample with lowest perplexity in Figure 3. Highlighted terms with different colors represent two types of mentions generated from the relation predictor: full and partial. A full mention is an identical copy of an entity surface form, while a partial mention is an incomplete subphrase of an entity surface form. NKLM’s word-by-word generation scheme results in partial mention being generated, while LRLM does not due to span-level copying from KGs. A perfect model should not generate partial mentions as it leads to possibly corrupted phrases, and should generate the same set of full mentions as the gold mentions.
+Although NKLM generates more mentions, it suffers from generating partial mentions because it 1) is unaware of the length of entities, and 2) requires making copy decisions as many times as the number of tokens in a phrase. As a result, we often observe NKLM switching entities or surface forms halfway through, ending mentions early, and repeating the same entity. In contrast, LRLM, by design, only generates full mentions.
+We quantitatively show this in Table 3 by counting the average number of partial and full mentions in samples. We take 10 samples from 10 random development set articles. Next, we performed a precursory manual annotation of “valid” men-
+
+Base model LSTM Transformer-XL
+
+Dataset
+WikiFacts WikiText-S WikiText-F
+WikiFacts WikiText-S WikiText-F
+
+Vanilla LM
+219.11 68.37 45.13
+170.40 42.63 30.14
+
+Dev
+NKLM
+93.09 46.16 44.46
+98.98 43.05 32.19
+
+LRLM
+89.55∗ 45.84 42.18∗
+83.19∗∗ 37.75∗∗ 29.56∗∗
+
+Vanilla LM
+208.44 86.12 49.47
+162.65 52.96 33.01
+
+Test
+NKLM
+87.88 55.98 48.54
+92.92 52.51 35.27
+
+LRLM
+82.89∗ 55.38 45.70∗
+76.46∗∗ 44.98∗∗ 32.20∗∗
+
+Table 2: Perplexity values of different models on open vocabulary language modeling, lower is better. Best results
+are in bold. Asterisk symbols represent statistical signiﬁcance according to Wilcoxon signed-rank test (Dror et al., 2018) against the better model among NKLM and Vanilla LM, with p < 0.05 (∗) and p < 0.01 (∗∗), respectively.
+
+Warm-up: <s> = Sonic the Hedgehog ( 1991 video game ) =
+Vanilla Sonic the Hedgehog is an action action - adventure video game published by Sonic of programmers for the LM: 1999 Nintendo GameCube 's SNES video game Sonic the Hedgehog 2 . It was released for the Nintendo DS on September 16 , 1994 in North America and Europe in the latter part of the original Halo 2 . It was played in a post - apocalyptic fantasy fantasy universe , by Nintendo Computer Entertainment on March 6 , 1999 under the ...
+NKLM: Sonic the Hedgehog[TITLE] Sonic the Hedgehog[TITLE] Sonic the Hedgehog[TITLE] ( Jordon VS . スト リートファイター , Picardi Sutorīto Faitā Jobs Sutorīto Faitā ) is A[CERO rating] platform video game[instance of] developed by Sonic Team[developer] and published by Sega[publisher] . In 2008 , the game[instance of] was released for Sega[platform] 3[platform] and 1320 platforms in March 2009 , replacing the original game[instance of] Sony[platform] Drive[platform] counterpart Sonic the Hedgehog[characters] for the Android[platform] GameCube[platform] . It was re - released on March 12 , 2010 , in ...
+LRLM: Sonic the Hedgehog[TITLE] ( also known as Sonic the Hedgehog 3 and Sonic[series] the Hedgehog 2 ) is a 1986 role - playing video game developed by Sonic Team[developer] and published by Sony Computer Entertainment ( SEGA[publisher] ) for the PlayStation 3[platform] ( Xbox 360[platform] ) . It was developed and published by Sega[publisher] in 1997 for the Wii , and was ported as a third installment in the Sonic the Hedgehog[series] series and released in Japan in 1996 . On the ...
+
+s = Sonic the Hedgehog (1991 video game)
+(ω, o) = { (<TITLE>, Sonic the Hedgehog (1991 video game)), (<instance of>, video game), (<CERO rating>, A), (<developer>, Sonic Team), (<publisher>, Sega), (<platform>, Sega Mega Drive), (<platform>, Wii), (<platform>, Nintendo GameCube), (<platform>, Xbox 360), (<platform>, Playstation 3), (<platform>, Android), (<characters>, Sonic the Hedgehog), (<series>, Sonic the Hedgehog (video game series)), ...
+}
+
+Figure 3: Samples from the three models for a topic entity “Sonic the Hedgehog (1991 video game)” with the corresponding subgraph on the right. Square brackets denote the relation type of copied objects. Highlighted spans in light green represent objects that are copied in full, whereas those in dark red represent partially copied objects. Underlined tokens are unknown words sampled from character model.
+
+Partial Full Valid Invalid
+
+NKLM 16.9 7.81 6.37 1.44
+
+LRLM
+
+− 6.32 5.63 0.69
+
+Gold
+
+− 9.00 9.00 0.00
+
+Table 3: Average number of partially generated, fully generated, and valid mentions over 100 samples from the development set or gold human-generated article.
+
+tions, which we deemed as semantically correct based on the sentential context. NKLM generates more invalid mentions than LRLM, most of which are false positives and repetitions of the same entity. LRLM has almost no repetitions, but sometimes incorrectly predicts the article’s theme.10
+6.3 Posterior Probability of Spans
+One of the advantages of our model is its capability to calculate the posterior probability of a relation generating a span in an existing text. We calculate the joint probability of a span and the
+10For example, generating an article about a TV episode for a topic entity of a song.
+
+surrounding text11 by marginalizing over the latent variable Z for both sides of context, and normalize over all possible spans:
+P (X, Z) = αi · P (Z | x< i) · βi
+P (Z | X) = P (X, Z) / P (X, Z)
+Z ∈Z
+where βi is the backward probability calculated reversely following Section 3.3. Table 4 shows spans with the posterior probability of various relation types from an article about “Sorry (Madonna song)”. The model demonstrates the ability to relate the entity “Madonna” to the topic based on context. We also observe a general trend that the model prefers generating multi-word spans through relations rather than word by word from vocabulary. However, when generating common phrases (e.g., “the United States”), our model often favors word-based generation even if an alternative relation-based prediction is possible.
+11We consider the text segment in the batch where the span belongs to as the surrounding text.
+
+Title: Sorry (Madonna Song)
+
+... song by American singer Madonna from her tenth ...
+
+<performer>
+
+0.9697
+
+Relations:
+
+<lyrics by>
+
+0.0289
+
+word
+
+0.0014
+
+... written and produced by Madonna and Stuart Price , ...
+
+<performer>
+
+0.1545
+
+Relations:
+
+<lyrics by>
+
+0.7693
+
+word
+
+0.0762
+
+... continuation from the “ Hung Up ” music video . ...
+
+Relations:
+
+<follows> word
+
+1.0000 0.0000
+
+... . However , in the United States , the song did ...
+
+<origin>
+
+0.0000
+
+Relations: word → <origin>
+
+0.0003
+
+word
+
+0.9997
+
+Table 4: Posterior probability of spans (highlighted) in contexts. word represents word-based generation. The second relation in the last example means generation of “the” using word, followed by relation-based generation of “United States” using the <origin> relation.
+
+Log-probability
+
+3.5
+
+LRLM
+
+4.0
+
+NKLM LM
+
+4.5
+
+5.0
+
+5.5 12 16 22 27 37 49 70 114 204 1284 Binned Number of Relations
+
+Figure 4: Word-average log-probabilities on development set of WikiFacts grouped by average relations per article. LRLM shows a larger gain over the baselines as the number of relations increases.
+
+6.4 Effect of Subgraph Size
+Finally, we measure the performance of models with respect to the richness of resource available for conditioning. We group WikiFacts articles into 10 bins by the number of relations available, and plot binned word-average log-probabilities in Figure 4. While all models have slightly higher logprobabilities as the number of relations increase, LRLM achieves the largest gain. We believe this is due to marginalization over the latent variables in LRLM helping better disambiguate between many candidates, while NKLM struggles to predict the right relations and surface form lengths as the number of candidates increases.
+7 Related Work
+A variety of entity-aware LMs exist, conditioning on a variety of information sources such as expert coreference annotations (Ji et al., 2017;
+
+Clark et al., 2018; Yang et al., 2017), entity annotations (Logan et al., 2019), deﬁnitions (Bahdanau et al., 2017), or keywords (Kiddon et al., 2016; Parvez et al., 2018). As mentioned above, NKLM (Ahn et al., 2016) is the most relevant previous work that uses relational information. Our proposed LRLM formulation is more successful at lowering perplexity and also allows calculating posterior probabilities of relations.
+Incorporating KGs for natural language generation (NLG) has a long history (Goldberg et al., 1994; Reiter et al., 2005; Chen and Mooney, 2008). With the recent advancement of neural sequence modeling, prevalent approaches for language generation from KGs employ sequence-tosequence models (Sutskever et al., 2014) with special attention mechanisms tailored for input structures such as graphs (Wang et al., 2018) or tables (Liu et al., 2018; Perez-Beltrachini and Lapata, 2018). Unlike our focus, however, this class of research focuses on learning discriminative models that do not explicitly generate the referent entity as latent variables, like we do in Section 6.3.
+While not directly related to our core task, there have been a number of other methods for incorporating latent variables into NLG problems. Latent structure has included predicting latent sequences of topics (Wiseman et al., 2018), chunking of word sequences into n-grams (Buckman and Neubig, 2018), deciding between input sources (Ling et al., 2016; Gu et al., 2016), predicting latent continuous vectors (Bowman et al., 2016), generating compressed summary tokens (Miao and Blunsom, 2016), or inducing syntactic and semantic trees (Yogatama et al., 2016; Yin et al., 2018). Our work borrows heavily from Ling et al. (2016), who select from multiple sources for source code generation. We use a similar method for selecting latent sources for Wikipedia article language modeling with a repository of KG triples.
+8 Conclusion
+In this work, we propose Latent Relation Language Models, a class of conditional language models conditioned on knowledge graphs. Our generative framework models text as a sequence of spans, some of which are generated as entities included in the knowledge graph. Marginalization over latent variables allows the model to not only out-perform previous work in conditional language modeling tasks, but also score spans with their posterior relation probability.
+
+Acknowledgements
+This research was supported in part by Funai Foundation for Information Technology and Amazon. The authors would also like to thank Qian Wang for helping designing the model ﬁgure and the members of the NeuLab for helpful discussion.
+References
+Sungjin Ahn, Heeyoul Choi, Tanel Pärnamaa, and Yoshua Bengio. 2016. A neural knowledge language model. CoRR, arXiv:1608.00318.
+Gabor Angeli, Percy Liang, and Dan Klein. 2010. A simple domain-independent probabilistic approach to generation. In Proceedings of the 2010 Conference on Empirical Methods in Natural Language Processing, pages 502–512. Association for Computational Linguistics.
+Philip Arthur, Graham Neubig, and Satoshi Nakamura. 2016. Incorporating discrete translation lexicons into neural machine translation. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, pages 1557–1567. Association for Computational Linguistics.
+Alexei Baevski and Michael Auli. 2019. Adaptive input representations for neural language modeling. In International Conference on Learning Representations.
+Dzmitry Bahdanau, Tom Bosc, Stanisław Jastrze˛bski, Edward Grefenstette, Pascal Vincent, and Yoshua Bengio. 2017. Learning to compute word embeddings on the ﬂy. CoRR, arXiv:1706.00286.
+Regina Barzilay and Mirella Lapata. 2005. Collective content selection for concept-to-text generation. In Proceedings of Human Language Technology Conference and Conference on Empirical Methods in Natural Language Processing, pages 331–338. Association for Computational Linguistics.
+Leonard E. Baum, Ted Petrie, George Soules, and Norman Weiss. 1970. A maximization technique occurring in the statistical analysis of probabilistic functions of markov chains. The Annals of Mathematical Statistics, 41(1):164–171.
+Yoshua Bengio, Réjean Ducharme, Pascal Vincent, and Christian Jauvin. 2003. A neural probabilistic language model. Journal of Machine Learning Research, 3(Feb):1137–1155.
+Piotr Bojanowski, Edouard Grave, Armand Joulin, and Tomas Mikolov. 2017. Enriching word vectors with subword information. Transactions of the Association for Computational Linguistics, 5:135–146.
+Kurt Bollacker, Colin Evans, Praveen Paritosh, Tim Sturge, and Jamie Taylor. 2008. Freebase: A collaboratively created graph database for structuring human knowledge. In Proceedings of the 2008 ACM
+
+SIGMOD International Conference on Management of Data, SIGMOD ’08, pages 1247–1250. Association for Computing Machinery.
+Samuel R. Bowman, Luke Vilnis, Oriol Vinyals, Andrew Dai, Rafal Jozefowicz, and Samy Bengio. 2016. Generating sentences from a continuous space. In Proceedings of The 20th SIGNLL Conference on Computational Natural Language Learning, pages 10–21, Berlin, Germany. Association for Computational Linguistics.
+Jacob Buckman and Graham Neubig. 2018. Neural lattice language models. Transactions of the Association for Computational Linguistics, 6:529–541.
+Diego Ceccarelli, Claudio Lucchese, Salvatore Orlando, Raffaele Perego, and Salvatore Trani. 2013. Learning relatedness measures for entity linking. In Proceedings of the 22nd ACM International conference on Information & Knowledge Management, pages 139–148. Association for Computing Machinery.
+David L. Chen and Raymond J. Mooney. 2008. Learning to sportscast: A test of grounded language acquisition. In Proceedings of the 25th International Conference on Machine Learning, pages 128–135. Association for Computing Machinery.
+Junyoung Chung, Sungjin Ahn, and Yoshua Bengio. 2017. Hierarchical multiscale recurrent neural networks. In International Conference on Learning Representations.
+Elizabeth Clark, Yangfeng Ji, and Noah A. Smith. 2018. Neural text generation in stories using entity representations as context. In Proceedings of the 2018 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long Papers), pages 2250–2260. Association for Computational Linguistics.
+Andrew M. Dai and Quoc V. Le. 2015. Semisupervised sequence learning. In Advances in Neural Information Processing Systems 28, pages 3079– 3087.
+Zihang Dai, Zhilin Yang, Yiming Yang, Jaime Carbonell, Quoc Le, and Ruslan Salakhutdinov. 2019. Transformer-XL: Attentive language models beyond a ﬁxed-length context. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 2978–2988, Florence, Italy. Association for Computational Linguistics.
+Rotem Dror, Gili Baumer, Segev Shlomov, and Roi Reichart. 2018. The hitchhiker’s guide to testing statistical signiﬁcance in natural language processing. In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1383–1392, Melbourne, Australia. Association for Computational Linguistics.
+
+Mariano Felice, Zheng Yuan, Øistein E. Andersen, Helen Yannakoudakis, and Ekaterina Kochmar. 2014. Grammatical error correction using hybrid systems and type ﬁltering. In Proceedings of the Eighteenth Conference on Computational Natural Language Learning: Shared Task, pages 15–24, Baltimore, Maryland. Association for Computational Linguistics.
+Octavian-Eugen Ganea and Thomas Hofmann. 2017. Deep joint entity disambiguation with local neural attention. In Proceedings of the 2017 Conference on Empirical Methods in Natural Language Processing, pages 2619–2629, Copenhagen, Denmark. Association for Computational Linguistics.
+Eli Goldberg, Norbert Driedger, and Richard I Kittredge. 1994. Using natural-language processing to produce weather forecasts. IEEE Expert, 9(2):45– 53.
+Édouard Grave, Armand Joulin, Moustapha Cissé, David Grangier, and Hervé Jégou. 2017. Efﬁcient softmax approximation for GPUs. In Proceedings of the 34th International Conference on Machine Learning, volume 70 of Proceedings of Machine Learning Research, pages 1302–1310, International Convention Centre, Sydney, Australia. PMLR.
+Jiatao Gu, Zhengdong Lu, Hang Li, and Victor O.K. Li. 2016. Incorporating copying mechanism in sequence-to-sequence learning. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1631–1640, Berlin, Germany. Association for Computational Linguistics.
+Xu Han, Shulin Cao, Xin Lv, Yankai Lin, Zhiyuan Liu, Maosong Sun, and Juanzi Li. 2018. OpenKE: An open toolkit for knowledge embedding. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing: System Demonstrations, pages 139–144. Association for Computational Linguistics.
+Sepp Hochreiter and Jürgen Schmidhuber. 1997. Long short-term memory. Neural Computation, 9(8):1735–1780.
+Yangfeng Ji, Chenhao Tan, Sebastian Martschat, Yejin Choi, and Noah A. Smith. 2017. Dynamic entity representations in neural language models. In Proceedings of the 2017 Conference on Empirical Methods in Natural Language Processing, pages 1830– 1839, Copenhagen, Denmark. Association for Computational Linguistics.
+Chloé Kiddon, Luke Zettlemoyer, and Yejin Choi. 2016. Globally coherent text generation with neural checklist models. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, pages 329–339. Association for Computational Linguistics.
+
+Diederik P. Kingma and Jimmy Ba. 2015. Adam: A method for stochastic optimization. In International Conference on Learning Representations.
+Ioannis Konstas and Mirella Lapata. 2013. A global model for concept-to-text generation. Journal of Artiﬁcial Intelligence Research, 48:305–346.
+Rémi Lebret, David Grangier, and Michael Auli. 2016. Neural text generation from structured data with application to the biography domain. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, pages 1203–1213. Association for Computational Linguistics.
+Wang Ling, Phil Blunsom, Edward Grefenstette, Karl Moritz Hermann, Tomáš Kocˇiský, Fumin Wang, and Andrew Senior. 2016. Latent predictor networks for code generation. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 599–609. Association for Computational Linguistics.
+Tianyu Liu, Kexiang Wang, Lei Sha, Baobao Chang, and Zhifang Sui. 2018. Table-to-text generation by structure-aware seq2seq learning. Proceedings of the Thirty-Second AAAI Conference on Artiﬁcial Intelligence.
+Robert Logan, Nelson F. Liu, Matthew E. Peters, Matt Gardner, and Sameer Singh. 2019. Barack’s wife Hillary: Using knowledge graphs for fact-aware language modeling. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 5962–5971, Florence, Italy. Association for Computational Linguistics.
+Minh-Thang Luong and Christopher D. Manning. 2016. Achieving open vocabulary neural machine translation with hybrid word-character models. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1054–1063. Association for Computational Linguistics.
+Stephen Merity, Nitish Shirish Keskar, and Richard Socher. 2017a. Regularizing and optimizing LSTM language models. CoRR, arXiv:1708.02182.
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. 2017b. Pointer sentinel mixture models. In International Conference on Learning Representations.
+Yishu Miao and Phil Blunsom. 2016. Language as a latent variable: Discrete generative models for sentence compression. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, pages 319–328, Austin, Texas. Association for Computational Linguistics.
+Tomáš Mikolov, Martin Karaﬁát, Lukáš Burget, Jan Cˇ ernocky`, and Sanjeev Khudanpur. 2010. Recurrent neural network based language model. In Eleventh Annual Conference of the International Speech Communication Association.
+
+Mike Mintz, Steven Bills, Rion Snow, and Daniel Jurafsky. 2009. Distant supervision for relation extraction without labeled data. In Proceedings of the Joint Conference of the 47th Annual Meeting of the ACL and the 4th International Joint Conference on Natural Language Processing of the AFNLP, pages 1003–1011, Suntec, Singapore. Association for Computational Linguistics.
+Graham Neubig and Chris Dyer. 2016. Generalizing and hybridizing count-based and neural language models. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, pages 1163–1172, Austin, Texas. Association for Computational Linguistics.
+Md Rizwan Parvez, Saikat Chakraborty, Baishakhi Ray, and Kai-Wei Chang. 2018. Building language models for text with named entities. In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 2373–2383, Melbourne, Australia. Association for Computational Linguistics.
+Adam Paszke, Sam Gross, Soumith Chintala, Gregory Chanan, Edward Yang, Zachary DeVito, Zeming Lin, Alban Desmaison, Luca Antiga, and Adam Lerer. 2017. Automatic differentiation in PyTorch.
+Laura Perez-Beltrachini and Mirella Lapata. 2018. Bootstrapping generators from noisy data. In Proceedings of the 2018 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long Papers), pages 1516–1527. Association for Computational Linguistics.
+Matthew Peters, Mark Neumann, Mohit Iyyer, Matt Gardner, Christopher Clark, Kenton Lee, and Luke Zettlemoyer. 2018. Deep contextualized word representations. In Proceedings of the 2018 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long Papers), pages 2227– 2237. Association for Computational Linguistics.
+Francesco Piccinno and Paolo Ferragina. 2014. From TagME to WAT: a new entity annotator. In Proceedings of the First International Workshop on Entity Recognition & Disambiguation, pages 55–62. Association for Computing Machinery.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. 2019. Language models are unsupervised multitask learners. Preprint.
+Ehud Reiter, Somayajulu Sripada, Jim Hunter, Jin Yu, and Ian Davy. 2005. Choosing words in computergenerated weather forecasts. Artiﬁcial Intelligence, 167(1-2):137–169.
+Gerard Salton and Michael J. McGill. 1986. Introduction to Modern Information Retrieval. McGrawHill, Inc., New York, NY, USA.
+
+Martin Sundermeyer, Ralf Schlüter, and Hermann Ney. 2012. LSTM neural networks for language modeling. In Thirteenth Annual Conference of the International Speech Communication Association.
+Ilya Sutskever, Oriol Vinyals, and Quoc V Le. 2014. Sequence to sequence learning with neural networks. In Advances in Neural Information Processing Systems 27, pages 3104–3112.
+Yaohua Tang, Fandong Meng, Zhengdong Lu, Hang Li, and Philip LH Yu. 2016. Neural machine translation with external phrase memory. CoRR, arXiv:1606.01792.
+Joerg Ueberla. 1994. Analysing a simple language model· some general conclusions for language models for speech recognition. Computer Speech & Language, 8(2):153–176.
+Denny Vrandecˇic´ and Markus Krötzsch. 2014. Wikidata: A free collaborative knowledgebase. Communications of the ACM, 57(10):78–85.
+Qingyun Wang, Xiaoman Pan, Lifu Huang, Boliang Zhang, Zhiying Jiang, Heng Ji, and Kevin Knight. 2018. Describing a knowledge base. In Proceedings of the 11th International Conference on Natural Language Generation, pages 10–21. Association for Computational Linguistics.
+Ronald J. Williams and Jing Peng. 1990. An efﬁcient gradient-based algorithm for on-line training of recurrent network trajectories. Neural Computation, 2(4):490–501.
+Sam Wiseman, Stuart Shieber, and Alexander Rush. 2018. Learning neural templates for text generation. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing, pages 3174–3187, Brussels, Belgium. Association for Computational Linguistics.
+Zhilin Yang, Zihang Dai, Ruslan Salakhutdinov, and William W. Cohen. 2018. Breaking the softmax bottleneck: A high-rank RNN language model. In International Conference on Learning Representations.
+Zichao Yang, Phil Blunsom, Chris Dyer, and Wang Ling. 2017. Reference-aware language models. In Proceedings of the 2017 Conference on Empirical Methods in Natural Language Processing, pages 1850–1859. Association for Computational Linguistics.
+Pengcheng Yin, Chunting Zhou, Junxian He, and Graham Neubig. 2018. StructVAE: Tree-structured latent variable models for semi-supervised semantic parsing. In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 754–765. Association for Computational Linguistics.
+
+Dani Yogatama, Phil Blunsom, Chris Dyer, Edward Grefenstette, and Wang Ling. 2016. Learning to compose words into sentences with reinforcement learning. In International Conference on Learning Representations.
+George Kingsley Zipf. 1949. Human behavior and the principle of least effort: An introduction to human eoclogy. Addison-Wesley Press.
+
+A Article Collection
+We collect seed Wikipedia articles from the raw release of WikiText-103 (Merity et al., 2017b), where raw vocabulary was preserved. Minimal preprocessing was performed by the dataset providers.12 The dataset provides an open domain, quality-assured set of Wikipedia articles veriﬁed by editors. We take the dataset and split each set back into per-article texts with simple regular expression rules for detecting titles. Then we query the Wikipedia API to identify the Wikidata entity13 for each article. During this process, we discarded some articles in the training set where the API failed to return Wikidata IDs, which was due to their deletion or title renames since the release of original dataset in 2016. For development and test set, we manually matched the few missed articles to recover all the articles.
+B Training Details and Hyperparameters
+Training Details All models are trained using Adam (Kingma and Ba, 2015). Models equipped with Transformer-XL are trained with the same schedule as the original paper; the learning rate is linearly increased over the ﬁrst 6000 gradient steps up to 0.00025, and reduced according to cosine annealing. Models with LSTM are trained with the initial learning rate set to 0.001. Validation is performed on the development set after every epoch, and when validation loss does not improve, learning rate is multiplied by 0.9 and the model and optimizer parameters are reset to the previous checkpoint. For all experiments, we use truncated backpropagation through time (Williams and Peng, 1990) with the truncation window size being 150.
+Hyperparameters We list the common model hyperparameters for the model in Table 5. While we use the same Transformer-XL hyperparameters across datasets, we apply different sets of LSTM hyperparameters on WikiFacts, WikiText-S, and WikiText-F for better performance. See Section 5 for more details on the vocabulary size. We take pre-trained KG embeddings from OpenKE (Han et al., 2018), with dimensions of 50 and 100 for
+12Data can be found at https://s3.amazonaws. com/research.metamind.io/wikitext/ wikitext-103-raw-v1.zip.
+13We used a Wikidata dump as of 2018/09/20.
+
+Common hyperparameters
+
+Learning rate decay rate Batch size
+BPTT window size Entity embedding size fastText embedding size
+
+0.9 60 150 50/100/100 300
+
+Transformer-XL hyperparameters
+
+Learning rate Warm up steps Attention dropout rate
+Dropout rate Embedding size FC layer hidden unit size
+Memory size Number of layers Number of heads Per-head attention dimension
+
+0.00025 6000 0 0.1 410 2100 150 16 10 41
+
+LSTM hyperparameters
+
+Learning rate Dropout rate Embedding size Hidden unit size Linear hidden unit size Number of layers
+
+0.001 0.5 / 0.5 / 0.1 400 / 400 / 512 1000 / 1000 / 1024 1000 / 1000 / 500
+2/2/4
+
+LRLM-speciﬁc hyperparameters
+
+Relation linear hidden unit size 1000 / 1000 / 800
+
+NKLM-speciﬁc hyperparameters
+
+Max position count Position embedding size
+
+20 40 / 40 / 50
+
+Table 5: Model and training hyperparameters that are common across the models. Slash-delimited values represent different hyperparameters used in WikiFacts, WikiText-S, WikiText-F, respectively.
+
+WikiFacts and WikiText respectively.14
+C Utilization of Extra Entities
+Adding extra entities to WikiFacts increased the average number of relations per article from 82.71 to 89.28, and mentions from 9.64 to 16.97. On average, each added entity matches 1.12 spans.
+Table 6 compares results under different settings. The inclusion of extra entities signiﬁcantly improves results for both models. This is due to the fact that these entities are extracted from hyperlinks within text, so 1) they are mostly rare words; 2) the model can easily learn that all such entities must be included in the text at some point.
+D Data Preprocessing for NKLM
+WikiFacts The provided WikiFacts dataset contains KG subgraphs and text annotated with non-
+14Ahn et al. (2016) uses 100-d KG embeddings, but there were no publicly available embeddings in that dimension.
+
+Dataset
+WikiFacts + Entity + Oracle char model (Ahn et al., 2016)
+
+Vanilla LM 217.19 217.19 88.03 82.4
+
+Dev NKLM 95.68 59.84 38.54 41.4
+
+LRLM 94.64 54.60 34.73
+–
+
+Vanilla LM 207.54 207.54 84.56 86.4
+
+Test NKLM 90.44 57.14 37.23 43.6
+
+LRLM 87.73 51.34 33.02
+–
+
+Table 6: Perplexity values of models on WikiFacts, lower is better. “+ Entity” means trained with extra entities; “+ Oracle char model” means treating the character model as oracle, i.e., treating spell-out probabilities of OOV words as 1. Best results are in bold. Note that our results are not directly comparable with reported results by Ahn et al. (2016) due to different dataset splits being used.
+
+Base model LSTM Transformer-XL
+
+Dataset
+WikiFacts WikiText-S WikiText-F
+WikiFacts WikiText-S WikiText-F
+
+Vanilla LM
+156.29 65.42 43.59
+121.55 40.79 29.11
+
+Dev
+NKLM
+74.04 49.95 42.99
+78.72 41.59 32.19
+
+LRLM
+71.20∗ 44.44∗∗ 40.88∗∗
+66.14∗∗ 37.75∗∗ 28.59∗∗
+
+Vanilla LM
+148.05 80.69 47.14
+115.53 49.62 31.45
+
+Test
+NKLM
+70.08 60.96 46.37
+74.09 49.92 33.69
+
+LRLM
+66.09∗ 52.81∗∗ 43.72∗∗
+60.96∗∗ 42.76∗∗ 30.75∗∗
+
+Table 7: UPP of different models, lower is better. Best results are in bold. Asterisk symbols represent statistical
+signiﬁcance according to Wilcoxon signed-rank test (Dror et al., 2018) against the better model among NKLM and Vanilla LM, with p < 0.05 (∗) and p < 0.01 (∗∗), respectively.
+
+overlapping matched spans. Copying positions15 are sequentially assigned within a matched span.
+One caveat is that the dataset includes relations containing Freebase Compound Value Type (CVT) as entities. These types are used to encapsulate a structured representation with multiple ﬁelds. We removed all relations where the subject entity is a CVT. For relations where the object entity is a CVT, we substitute it with multiple relations using the ﬁeld types and values of the CVT. Without CVT-based relations, each article has on average 37.67 relations.
+WikiText The WikiText-derived dataset is constructed using the methods described in Section 4. The methods can potentially match overlapping spans, which cannot be handled by NKLM.
+Thus, we prune the set of matching spans for each article so that no two spans overlap. Pruning is done by iterating over the spans in a predeﬁned order, and greedily selecting spans that do not overlap with previously selected spans. The spans are ordered by the following criteria:
+• In descending order of span length. (Prefer longer spans)
+15Copying position of a word is the 0-based word index into the matching entity surface form, which indicates the position to copy from.
+
+• In ascending order of span starting index. (Prefer spans appearing earlier)
+• Order spans that match entity canonical forms (the ﬁrst surface form in list) in front. (Prefer spans matching canonical forms)
+• Ties are broken by relation type ID and index of matched surface form. While NKLM supports partial and arbitrary-
+order entity matches by specifying copying positions,16 we do not perform this kind of matching as it greatly increases the complexity of the matching algorithm, and could produce more false positives. We sequentially assign copying positions within matched spans as in WikiFacts.
+E Comparison of Models using UPP
+We show the main results evaluated according to UPP (Ueberla, 1994) in Table 7. This adjusted perplexity measure penalizes unknown word probabilities by a constant value of 1/|Vout|, where Vout is the set of OOV words in a corpus.
+16For example, the entity “Barack Hussein Obama” can match the text “Obama Barack” with copying positions 2 and 0.
+
+

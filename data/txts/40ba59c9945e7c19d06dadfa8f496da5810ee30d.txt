@@ -1,0 +1,557 @@
+VECTORIZATION OF HYPOTHESES AND SPEECH FOR FASTER BEAM SEARCH IN ENCODER DECODER-BASED SPEECH RECOGNITION
+Hiroshi Seki1 Takaaki Hori2 Shinji Watanabe3
+1 Toyohashi University of Technology, Japan. 2 Mitsubishi Electric Research Laboratories (MERL), USA.
+3 Johns Hopkins University, USA.
+
+arXiv:1811.04568v1 [cs.SD] 12 Nov 2018
+
+ABSTRACT
+Attention-based encoder decoder network uses a left-to-right beam search algorithm in the inference step. The current beam search expands hypotheses and traverses the expanded hypotheses at the next time step. This traversal is implemented using a for-loop program in general, and it leads to speed down of the recognition process. In this paper, we propose a parallelism technique for beam search, which accelerates the search process by vectorizing multiple hypotheses to eliminate the for-loop program. We also propose a technique to batch multiple speech utterances for off-line recognition use, which reduces the for-loop program with regard to the traverse of multiple utterances. This extension is not trivial during beam search unlike during training due to several pruning and thresholding techniques for efﬁcient decoding. In addition, our method can combine scores of external modules, RNNLM and CTC, in a batch as shallow fusion. We achieved 3.7× speedup compared with the original beam search algorithm by vectoring hypotheses, and achieved 10.5× speedup by further changing processing unit to GPU.
+Index Terms— Speech recognition, beam search, parallel computing, encoder decoder network, GPU
+1. INTRODUCTION
+There is a great interest in automatic speech recognition (ASR) system because of the success of deep learning [1, 2, 3, 4, 5] and popularization of speech interfaces, e.g., smart-phone and smart-speaker. In practice, rapid execution of ASR decoding is essential for better user experience. Reduction of sequence length [6, 5, 7] and parallel computing [8, 9, 10] are mainly investigated for rapid computation of likelihoods and efﬁcient traversal of search space.
+Beam search [11] is one of the breadth-ﬁrst search algorithms which imposes a restriction on the search space to reduce the computational complexity of both memory space and execution time. During the search, hypotheses are expanded from a root node, and the expanded nodes at each depth level (or time-step in timesynchronous beam search for ASR) are stored in a FIFO (First-In First-Out) queue for further expansion at next depth level. Thread parallelism and GPU-based execution accelerate computation of matrix multiplication and element-wise operation. However, the loop program with regard to hypothesis traversal still exists and decoder network needs to be executed per hypothesis in case of attentionbased encoder decoder network. Therefore, there is a room for improvement of recognition time by concatenating hypotheses and processing them in a batch.
+Dixon, et. al., proposed GPU based computation of acoustic scores [8], and Chong, et. al., [9] and Chen, et. al., [10] further
+
+extended the search algorithm by executing graph traversal on GPU. These studies focused on efﬁcient computation of WFST (Weighted Finite-State Transducer) based decoding.
+Different from the earlier works, we focus on a faster beam search algorithm for end-to-end attention-based encoder decoder networks. We ﬁrst vectorize B beam size hypotheses and compute posterior probabilities for hypothesis expansion at next time step in a batch. This enables elimination of for-loop program with regard to beam size originally managed by FIFO (First-In First-Out) queue. Next, we vectorize multiple S input speech utterances to reduce the execution of for-loop program with regard to input speech data size. It is not trivial unlike during training due to introduction of several pruning and thresholding techniques per utterance for efﬁcient decoding. During beam search, the encoder network generates hidden vectors of S utterances at once, and the attention network and the decoder network process S × B hypotheses in a batch. This algorithm is executable on both CPU and GPU without needing signiﬁcant code modiﬁcation. In the experiment, we evaluate the effectiveness of the hypothesis and speech vectorization method assuming the following two scenarios:
+• Online decoding1: B hypotheses are vectorized to eliminate the loop for hypothesis traversal. Vectorization of hypotheses enables execution of attention and decoder networks for B hypotheses in a batch.
+• Ofﬂine decoding: S speech utterances are further vectorized by processing multiple speech utterances. Vectorization of utterances and hypotheses enables execution of encoder network for S utterances in a batch and also enables execution of attention and decoder networks for S × B hypotheses in a batch.
+The rest of the paper is organized as follows. Original implementation of beam search is described in Section 2. Our contributions, vectorization of hypotheses and utterances, are described in Section 3. Experiments are conducted using librispeech corpus and CSJ corpus in Section 4, followed by conclusions in Section 5.
+2. BEAM SEARCH
+2.1. Deﬁnition
+Let Ht = (ht1, ht2, · · · , htb, · · · htB) be a set of hypotheses in the FIFO-queue at decoding time step t. Hypothesis htb has its own label
+1It is not a pure time-synchronous beam search because we used an attention-mechanism and bidirectional LSTM in the experiment. The proposed search algorithm is applicable to other online neural network architectures for pure time-synchronous beam search.
+
+history accumulated up to time step t:
+
+htb = lb1 · lb2 · · · lbt,
+
+(1)
+
+where lbk ∈ L denotes the k-th output label of htb in distinct output label set L.
+At next time step t + 1, the decoder network generates |L| new labels with its posterior probabilities which leads to |L| × B hypotheses. Let L = {i ∈ N : i ≤ |L|} be a set of indices for output labels, and B = {b ∈ N : b ≤ B} for current hypotheses. Then the hypotheses at next time step t + 1 are stored in a queue as the
+following equation:
+
+Ht+1 ← {htb+|L1|+i|i ∈ L, b ∈ B}
+
+(2)
+
+where htb+|L1|+i = htb · lit+1
+
+(3)
+
+Each hypothesis has a score which is an accumulation of log posterior probability α up to decoding time step t, and it is updated by adding the output of decoder network:
+
+Qt+1 ← {α(hti|+L1|+b)|i ∈ L, b ∈ B}
+
+(4)
+
+α(hti|+L1|+b) = α(htb) + log(patt(lit+1))
+
+(5)
+
+where patt(lit+1) is the probability of label li calculated by output of the decoder network. Let patt(l∗) be a set of posterior probabilities generated by the decoder network and patt(li) be the posterior probability of i-th label. In this paper, we follow the notation in [12]:
+
+patt(l∗t+1) = Generate(ctb+1, rbt),
+
+(6)
+
+rbt+|L1|+i = Recurrency(rbt, ctb+1, lit+1),
+
+(7)
+
+where r is the decoder state and c is the context vector. Please refer to [12] for detail.
+For the reduction of search space, the expanded hypotheses are pruned at each time step. In the experiment, we pruned the hypotheses in two step procedure, local pruning and global pruning. At the local pruning, the log probabilities computed by the decoder network at time step t are sorted in descending order, and top B probabilities are selected as candidates. When we deﬁne the function to select top B-candidates with its indices from the set of hypotheses Q as Select(Q, B), the local pruning is represented as:
+
+Qtb+1′ , ζbt+1′ = Select {α(htb) + log patt(lit+1) for i ∈ L}, B ,
+Qt+1′ = {Qtb+1′ for b ∈ B}, ζt+1′ = {ζbt+1′ for b ∈ B}, (8)
+
+resulting B×B hypotheses (and corresponding accumulated scores), where ζ is a set of selected indices. At the global pruning, they are further pruned to B hypotheses as:
+
+Qt+1′′ , ζt+1′′ = Select Qt+1′ , B .
+
+(9)
+
+Other search parameters, e.g., labels and cells in recurrent connections, are pruned for next time step by tracking the indices. When we deﬁne this function as IndexSelect, the hypotheses, for example, is represented as:
+
+Ht+1′′ = IndexSelect(Ht+1, ζt+1′ , ζt+1′′ ).
+
+(10)
+
+Fig. 1. Procedure of our beam algorithm at time step t. Hypotheses are expanded and added with scores of RNNLM as shallow fusion. The candidate hypotheses are pruned by applying local and global pruning.
+
+2.2. Implementation
+The decoder network in Eq. (6) takes previous label information at time step t to output the posterior probabilities at time step t + 1. Other than the previous label, the networks with recurrent connection have its internal states (e.g., rbt in Eq. (6), ctb in Eq. (7), and attention weight) which will be used in a future time step. These states also need to be pruned same as hypotheses. At implementation level, each hypothesis is represented as a dictionary data structure consists of these states, and stored in the FIFO-queue to reduce the execution of Eq. (10).
+
+3. HYPOTHESES AND SPEECH VECTORIZATION
+
+3.1. Deﬁnition
+
+In this section, we reformulate the beam search algorithm in Section 2 by vectorizing the hypotheses and eliminating the loop with regard to beam size B. We further batch S multiple utterances for the reduction of computational time assuming ofﬂine decoding scenario. In case of online decoding scenario, the batch size S is set to 1. Figure 1 shows an overview of the proposed hypotheses expansion and pruning techniques at time step t.
+For this purpose, we vectorize each element in the dictionary consists of the internal states as described in Section 2.2. At time step t = 0, the previous labels are deﬁned as a vector of ”start-ofsequence” symbols:
+
+l0[S×B] = [<sos>, · · · , <sos>]⊺,
+
+(11)
+
+and the accumulated scores are deﬁned as:
+
+Q0[S×B] = [0.0, · · · , 0.0]⊺,
+
+(12)
+
+The size of vector is represented in the square brackets. By concatenating S utterances, the encoder network can compute the hidden representations for S utterances at once. The output of encoder network is then duplicated to B hypotheses to match the number of
+hypotheses. Then, the decoder network computes the posterior probabilities for all B beam hypotheses of S utterances in a batch. Let γ[tS×B,|L|] be the calculated posterior probabilities for S × B candidates. The attention-based decoder network in Eqs. (6) and (7) are
+
+replaced as:
+
+γ[tS+×1B,|L|] = Generate(ct[S+×1B], rt[S×B]),
+
+rt+1 [S×B]
+
+=
+
+R
+
+ecurrency
+
+(rt[S
+
+×B
+
+]
+
+,
+
+ct+1 [S×B
+
+]
+
+,
+
+lt+1 [S×B
+
+]
+
+),
+
+(13) (14)
+
+After the expansion of hypotheses, the local pruning is applied to reduce the number of hypotheses from |L| to B for all B hypotheses and S utterances. We deﬁne this function as Select(γ[tS×B,|L|], B, idx) where B is a number for return of top-B candidates, and idx is a target index of selection2. The selected log probabilities are added to the accumulated score. To match the
+dimension of the log probabilities and the accumulated score, we
+duplicated the accumulated score up to B by introducing a new axis:
+
+αt[S×B,B] ← Duplicate(αt[S×B], B).
+
+(15)
+
+The accumulated score at time step t + 1 is:
+
+Qt[S+×1 B,B],
+
+ζ[′St+×1B,B]
+
+=
+
+S
+
+elect
+
+(
+
+γ
+
+t+1 [S×
+
+B
+
+,
+
+|
+
+L|
+
+]
+
+,
+
+B
+
+,
+
+2)
+
+,
+
+Q′[tS+×1B,B] = αt[S×B,B] + Qt[S+×1 B,B]
+
+(16) (17)
+
+where ζ′ is the indices of top-B output label candidates of B hypotheses of S utterances. The accumulated score Q′[tS+×1B,B] is resized to Q′[tS+,B1×B] for global pruning targeting B × B candidates
+for S utterances. The global pruning is represented as:
+
+Q′[tS+,B1×B] = Resize(Q′[tS+×1B,B]),
+
+Q′[′St,+B1], ζ[′S′t,+B1]
+
+=
+
+S
+
+elect
+
+(
+
+Q
+
+′t+1 [S,B
+
+×
+
+B
+
+]
+
+,
+
+B
+
+,
+
+2)
+
+.
+
+(18) (19)
+
+Same as Section 2, the other variables are pruned by tracking the selected indices. In case of the hypotheses, the labels are duplicated to match the size of selected indices in Eq. (16):
+
+I[S×B,|L|] = Duplicate(L, S × B)⊺.
+
+(20)
+
+The duplicated labels are pruned and concatenated to update the hypotheses:
+
+H[tS+×1B] = H[tS×B] ⊕ IndexSelect(I[S×B,|L|], ζ[′St+×1B,B], ζ[′S′t,+B1] ),
+
+(21)
+
+where ⊕ is the operation for element-wise concatenation of accumulated label history and the current label.
+
+3.2. Shallow fusion of external modules
+
+During beam search, scores of RNNLM (recurrent neural network
+language model) and CTC preﬁx score are integrated as shallow fu-
+sion. ESPnet [13] combines these scores and the ﬁnal log probability, log phyb, is deﬁned as weighted sum of CTC preﬁx score (pctc), decoder network (patt), and RNNLM (plm):
+
+log phyb(lt+1|l1:t, O) = λ log pctc(lt+1|l1:t, O)
+
++ (1 − λ) log patt(lt+1|l1:t, O)
+
++ κ log plm(lt+1|l1:t),
+
+(22)
+
+where λ and ν are hyper-parameters and these values control contribution of each score. Please refer to [13] for further detailed explanation. The Eq. (13) is rewritten as Eq. (22) to combine the scores of RNNLM and CTC.
+2PyTorch supports this function as torch.topk.
+
+4. EXPERIMENTS
+4.1. Experimental setup
+We used English and Japanese speech corpora, Librispeech [14] and CSJ (Corpus of Spontaneous Japanese) [15, 16]3. As input feature, we used 80-dimensional log Mel ﬁlterbank coefﬁcients and pitch features with its delta and delta delta features (80+3=83dimension) extracted using Kaldi tools [17]. Joint CTC/attention-based encoder decoder networks [5] were trained by using PyTorch [18].
+On Librispeech corpus, we used a 8 layer BLSTM as the encoder network. The 2nd and 3rd bottom layers of the encoder network subsample hidden vector by the factor of 2 [19]. Each BLSTM layer has 320 cells in each direction, and is followed by a linear projection layer with 320 units to combine the forward and backward LSTM outputs. The decoder network has an 1-layer LSTM with 300 cells. The number of labels was set to 29 including alphabets and special tokens. On CSJ corpus, we used a 4 layer BLSTM as the encoder network with the subsampling technique. Each BLSTM layer has 1024 cells in each direction, and is followed by a linear projection layer with 320 units to combine the forward and backward LSTM outputs. The decoder network has an 1-layer LSTM with 1024 cells. The number of labels was set to 3,260 including Japanese Kanji/Hiragana/Katakana characters and special tokens.
+Beam search was performed using Intel Xeon Processor E52667 v3 for CPU-based search and Tesla K80 for GPU-based search. As evaluation set, we used randomly selected 1,000 utterances (≈ 124.7 minutes) on librispeech corpus and evalution set-1 (≈ 110.1 minutes) on CSJ corpus.
+4.1.1. Search parameters
+In the case of shallow fusion, we used λ = 0.3 and κ = 0.3 on both librispeech and CSJ. The beam size B was set to 20 in decoding under all conditions. For the recognition without vectorization, we conducted thread parallelism and process parallelism to accelerate decoding time. In the case of thread parallelism, we controlled an environment variable OMP NUM THREADS and activated OpenMP. We did not change other parameters and left it to the back-end PyTorch. In case of process parallelism, test data is split into multiple subsets and each subset is recognized in parallel using multiple CPU cores independently.
+4.2. Online decoding scenario
+Table 1 shows a duration (minutes) and real-time factor on Librispeech which parallelize hypotheses assuming online scenario. The row ”CPUconv” shows durations of recognition time based on conventional beam search algorithm using attention decoder (ATT) and attention decoder with RNNLM (+RNNLM). ”batch” is a number of utterances S for concatenation. ”threads” is a number of threads for thread parallelism and ”procs” is a number of CPU cores used for process parallelism. In the case of ATT, recognition time of original beam search was 318.5 minutes, and it was decreased to 85.0 minutes by parallelizing 20 beam hypotheses on CPU. It was further decreased to 30.4 minutes by changing processing unit to GPU. Recognition based on ATT+RNNLM also showed speed improvement. Table 2 shows a duration (minutes) and real-time factor on CSJ corpus. The result on CSJ also showed the effectiveness of hypotheses vectorization with the usage of GPU for all conditions, ATT and ATT+RNNLM.
+3Recipes are available at ESPnet [13].
+
+Table 1. Duration (minutes) and real time factor in parenthesis on
+
+librispeech in online scenario
+
+batch threads procs ATT +RNNLM
+
+318.5 518.3
+
+CPUconv
+
+1
+
+1
+
+1 (2.6)
+
+(4.2)
+
+85.0
+
+108.2
+
+CPU
+
+1
+
+1
+
+1 (0.7)
+
+(0.9)
+
+30.4
+
+33.0
+
+GPU
+
+1
+
+1
+
+1 (0.2)
+
+(0.3)
+
+Table 2. Duration (minutes) and real time factor in parenthesis on
+
+CSJ in online scenario batch threads procs ATT +RNNLM
+
+591.3 713.7
+
+CPUconv
+
+1
+
+1
+
+1 (5.4)
+
+(6.5)
+
+163.6 190.4
+
+CPU
+
+1
+
+1
+
+1 (1.5)
+
+(1.7)
+
+32.2
+
+32.2
+
+GPU
+
+1
+
+1
+
+1 (0.3)
+
+(0.3)
+
+Our algorithm achieved signiﬁcant gain from the conventional beam search algorithm on both librispeech corpus and CSJ corpus by vectorizing 20 hypotheses and eliminating the for-loop program for hypothesis traversal. In the case of ATT and ATT+RNNLM, real time factors were less than 1.0 and are applicable to online decoding scenario.
+4.3. Ofﬂine decoding scenario
+Table 3 shows recognition time of thread parallelism (threads > 1), process parallelism (procs > 1), and our hypothesis and speech vectorization method (batch > 1) on librispeech corpus. When we used 8 threads and decoded using decoder network, recognition time was comparable to the single thread execution as in Table 1.
+When multiple utterances are vectorized and recognized on CPU using the decoder network, the recognition time was 96.1 minutes. It was comparable to the process parallelism (80.3 minutes) even though our program consumed only one CPU core. The recognition time was further decreased to 16.0 minutes by changing the processing unit to GPU. Comparison with Table 1 showed the advantage of utterance vectorization: in the case of GPU-based execution, recognition time without utterance vectorization was 30.4 minutes, however, vectorization of multiple utterances decreased the recognition time to 16.0 minutes. In case of ATT+RNNLM, execution on one CPU core with vectorization of utterance and hypothesis consumed 104.8 minutes and it was comparable to the recognition time of process parallelism. Again, execution on GPU decreased the recognition time from 104.8 minutes to 16.1 minutes.
+Table 4 shows the recognition time on CSJ. When the recognition was performed using the score of decoder network, the recognition time was decreased from 591.3 minutes (in Table 2) to 127.6
+
+Table 3. Duration (minutes) on librispeech in ofﬂine scenario
+
+batch threads procs ATT +RNNLM
+
+1
+
+8
+
+1 317.9 403.2
+
+CPUconv
+
+1
+
+1
+
+8
+
+80.3
+
+136.4
+
+1
+
+1
+
+16 56.4
+
+102.6
+
+CPU
+
+8
+
+1
+
+16
+
+1
+
+1
+
+96.1
+
+104.8
+
+1 102.6 112.2
+
+GPU
+
+8
+
+1
+
+16
+
+1
+
+1 16.0
+
+16.1
+
+1 15.2
+
+14.5
+
+Table 4. Duration (minutes) on CSJ in ofﬂine scenario
+
+CPUconv
+
+batch 1
+
+threads 1
+
+procs 8
+
+ATT 150.6
+
++RNNLM 162.1
+
+CPU
+
+8
+
+1
+
+1 127.6 138.1
+
+GPU
+
+8
+
+1
+
+1 16.1
+
+17.0
+
+Table 5. Duration (minutes) on librispeech with shallow fusion of
+
+RNNLM and CTC preﬁx score.
+
+CPUconv
+
+batch 1
+
+threads 1
+
+procs 1
+
+ATT+RNNLM/CTC 742.9
+
+CPU
+
+1
+
+1
+
+1
+
+205.0
+
+GPU
+
+1
+
+1
+
+1
+
+CPUconv
+
+1
+
+1
+
+8
+
+270.6 134.3
+
+CPU
+
+8
+
+1
+
+1
+
+162.9
+
+GPU
+
+8
+
+1
+
+1
+
+51.3
+
+minutes, and it was further decreased to 16.1 minutes by changing processing unit to GPU.
+By vectorizing 8 multiple utterances, recognition time of our algorithm showed comparable performance with process parallelism with 8 CPU cores on both two corpora. In addition, execution based on GPU can fully exploit the advantage of GPU, and achieved further reduction of recognition time in case of ATT and ATT+RNNLM.
+4.4. Fusion of CTC preﬁx score
+Table 5 shows recognition time which use scores of RNNLM and CTC preﬁx score as shallow fusion. Recognition time of the original beam search was 742.9 minutes, and it was decreased by vectorizing hypotheses. Usage of GPU further decreased the recognition time to 270.6 minutes and achieved 2.7× speedup. We further vectorized 8 utterances in a batch. The recognition time was 51.3 minutes and it showed better result than the usage of 8 core CPU.
+In the case of ATT+RNNLM/CTC, computation of CTC preﬁx score requires operations proportional to a length of hidden vector generated by the encoder network. The logsumexp operation in this computation slow down the speed especially when a large set of labels are used, and it was signiﬁcant at CSJ corpus (3260 vs 29). The recognition time of our algorithm based on GPU with 8batch was 343.0 minutes and showed better result than the original program with single core CPU (742.9). However, it was slightly slower than the one with 8 core CPU (210.4). Acceleration of CTC preﬁx score is one of our future direction.
+5. CONCLUSIONS
+In this paper, we proposed a novel approach to speed up recognition time of beam search algorithm by vectorizing search hypotheses and multiple input utterances. We achieved 3.7× speedup compared with the original beam search algorithm by vectoring hypotheses on librispeech corpus, and 3.6 × speed up on CSJ corpus. We further proposed a technique to batch multiple utterances. In the case of GPU-based execution, vectorization of multiple utterances further achieved 1.9 × speed up on librispeech corpus and 2.0 × speed up on CSJ corpus. This is available at open source project ESPnet.
+6. ACKNOWLEDGEMENT
+We would like to thank Dr. Rohit Prabhavalkar at Google for many insightful discussions.
+
+7. REFERENCES
+[1] Wayne Xiong, Jasha Droppo, Xuedong Huang, Frank Seide, Mike Seltzer, Andreas Stolcke, Dong Yu, and Geoffrey Zweig, “The Microsoft 2016 conversational speech recognition system,” in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2017, pp. 5934–5938.
+[2] Kartik Audhkhasi, Brian Kingsbury, Bhuvana Ramabhadran, George Saon, and Michael Picheny, “Building competitive direct acoustics-to-word models for english conversational speech recognition,” in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2018, pp. 4759–4763.
+[3] Chung-Cheng Chiu, Tara N. Sainath, Yonghui Wu, Rohit Prabhavalkar, Patrick Nguyen, Zhifeng Chen, Anjuli Kannan, Ron J. Weiss, Kanishka Rao, Ekaterina Gonina, Navdeep Jaitly, Bo Li, Jan Chorowski, and Michiel Bacchiani, “Stateof-the-art speech recognition with sequence-to-sequence models,” in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2018, pp. 4774–4778.
+[4] Jinyu Li, Guoli Ye, Amit Das, Rui Zhao, and Yifan Gong, “Advancing acoustic-to-word CTC model,” in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2018, pp. 5794–5798.
+[5] Takaaki Hori, Shinji Watanabe, Yu Zhang, and Chan William, “Advances in joint CTC-Attention based end-to-end speech recognition with a deep CNN encoder and RNN-LM,” in Interspeech, 2017, pp. 949–953.
+[6] Willian Chan, Navdeep Jaitly, Quoc Le, and Oriol Vinyals, “Listen, attend and spell: A neural network for large vocabulary conversational speech recognition,” in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2016, pp. 4960–4964.
+[7] Albert Zeyer, Kazuki Irie, Ralf Schlter, and Hermann Ney, “Improved training of end-to-end attention models for speech recognition,” in Proc. Interspeech, 2018, pp. 7–11.
+[8] Paul R Dixon, Tasuku Oonishi, and Sadaoki Furui, “Harnessing graphics processors for the fast computation of acoustic likelihoods in speech recognition,” Computer Speech & Language, vol. 23, no. 4, pp. 510–526, 2009.
+[9] Jike Chong, Ekaterina Gonina, Youngmin Yi, and Kurt Keutzer, “A fully data parallel WFST-based large vocabulary continuous speech recognition on a graphics processing unit,” in Proc. Interspeech 2009, 2009, pp. 1183–1186.
+[10] Zhehuai Chen, Justin Luitjens, Hainan Xu, Yiming Wang, Daniel Povey, and Sanjeev Khudanpur, “A GPU-based WFST decoder with exact lattice generation,” arXiv preprint arXiv:1804.03243, 2018.
+[11] Xavier L Aubert, “An overview of decoding techniques for large vocabulary continuous speech recognition,” Computer Speech & Language, vol. 16, no. 1, pp. 89–114, 2002.
+[12] Suyoun Kim, Takaaki Hori, and Shinji Watanabe, “Joint CTCattention based end-to-end speech recognition using multitask learning,” in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2017, pp. 4835– 4839.
+[13] Shinji Watanabe, Takaaki Hori, Shigeki Karita, Tomoki Hayashi, Jiro Nishitoba, Yuya Unno, Nelson Enrique Yolta Soplin, Jahn Heymann, Matthew Wiesner, Nanxin Chen, Adithya
+
+Renduchintala, and Tsubasa Ochiai, “ESPnet: end-to-end speech processing toolkit,” arXiv preprint arXiv:1804.00015, 2018.
+[14] Vassil Panayotov, Guoguo Chen, Daniel Povey, and Sanjeev Khudanpur, “LIBRISPEECH: An ASR corpus based on public domain audio books,” in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2015, pp. 5206–5210.
+[15] Kikuo Maekawa, Hanae Koiso, Sadaoki Furui, and Hitoshi Isahara, “Spontaneous speech corpus of Japanese,” in International Conference on Language Resources and Evaluation (LREC), 2000, vol. 2, pp. 947–952.
+[16] Kikuo Maekawa, “Corpus of Spontaneous Japanese: Its design and evaluation,” in ISCA & IEEE Workshop on Spontaneous Speech Processing and Recognition, 2003.
+[17] Daniel Povey, Arnab Ghoshal, Gilles Boulianne, Lukas Burget, Ondrej Glembek, Nagendra Goel, Mirko Hannemann, Petr Motlicek, Yanmin Qian, Petr Schwarz, Jan Silovsky, Georg Stemmer, and Karel Vesely, “The kaldi speech recognition toolkit,” in IEEE Workshop on Automatic Speech Recognition and Understanding (ASRU), Dec. 2011.
+[18] Adam Paszke, Sam Gross, Soumith Chintala, Gregory Chanan, Edward Yang, Zachary DeVito, Zeming Lin, Alban Desmaison, Luca Antiga, and Adam Lerer, “Automatic differentiation in PyTorch,” in NIPS-W, 2017.
+[19] Dzmitry Bahdanau, Jan Chorowski, Dmitriy Serdyuk, Philemon Brakel, and Yoshua Bengio, “End-to-end attentionbased large vocabulary speech recognition,” in IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), 2016, pp. 4945–4949.
+
+

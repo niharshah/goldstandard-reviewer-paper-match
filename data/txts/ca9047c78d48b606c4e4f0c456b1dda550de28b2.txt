@@ -1,0 +1,3165 @@
+arXiv:2110.13985v1 [cs.LG] 26 Oct 2021
+
+Combining Recurrent, Convolutional, and Continuous-time Models with Linear State-Space Layers
+Albert Gu†, Isys Johnson†, Karan Goel†, Khaled Saab†, Tri Dao†, Atri Rudra‡, and Christopher Ré†
+†Department of Computer Science, Stanford University ‡Department of Computer Science and Engineering, University at Buﬀalo, SUNY
+{albertgu,knrg,ksaab,trid}@stanford.edu, {isysjohn,atri}@buffalo.edu, chrismre@cs.stanford.edu
+October 28, 2021
+Abstract
+Recurrent neural networks (RNNs), temporal convolutions, and neural diﬀerential equations (NDEs) are popular families of deep learning models for time-series data, each with unique strengths and tradeoﬀs in modeling power and computational eﬃciency. We introduce a simple sequence model inspired by control systems that generalizes these approaches while addressing their shortcomings. The Linear StateSpace Layer (LSSL) maps a sequence u → y by simply simulating a linear continuous-time state-space representation x˙ = Ax + Bu, y = Cx + Du. Theoretically, we show that LSSL models are closely related to the three aforementioned families of models and inherit their strengths. For example, they generalize convolutions to continuous-time, explain common RNN heuristics, and share features of NDEs such as time-scale adaptation. We then incorporate and generalize recent theory on continuous-time memorization to introduce a trainable subset of structured matrices A that endow LSSLs with long-range memory. Empirically, stacking LSSL layers into a simple deep neural network obtains state-of-the-art results across time series benchmarks for long dependencies in sequential image classiﬁcation, real-world healthcare regression tasks, and speech. On a diﬃcult speech classiﬁcation task with length-16000 sequences, LSSL outperforms prior approaches by 24 accuracy points, and even outperforms baselines that use hand-crafted features on 100x shorter sequences.
+1 Introduction
+A longstanding challenge in machine learning is eﬃciently modeling sequential data longer than a few thousand time steps. The usual paradigms for designing sequence models involve recurrence (e.g. RNNs), convolutions (e.g. CNNs), or diﬀerential equations (e.g. NDEs), which each come with tradeoﬀs. For example, RNNs are a natural stateful model for sequential data that require only constant computation/storage per time step, but are slow to train and suﬀer from optimization diﬃculties (e.g., the "vanishing gradient problem" [39]), which empirically limits their ability to handle long sequences. CNNs encode local context and enjoy fast, parallelizable training, but are not sequential, resulting in more expensive inference and an inherent limitation on the context length. NDEs are a principled mathematical model that can theoretically address continuous-time problems and long-term dependencies [37], but are very ineﬃcient.
+Ideally, a model family would combine the strengths of these paradigms, providing properties like parallelizable training (convolutional), stateful inference (recurrence) and time-scale adaptation (diﬀerential equations), while handling very long sequences in a computationally eﬃcient way. Several recent works have turned to this question. These include the CKConv, which models a continuous convolution kernel [44]; several ODE-inspired RNNs, such as the UnICORNN [47]; the LMU, which speeds up a speciﬁc linear recurrence using convolutions [12, 58]; and HiPPO [24], a generalization of the LMU that introduces a theoretical
+1
+
+𝑦
+
+Output
+
+𝐶
+
+𝑦 𝑦!−1
+
+𝑦!
+
+𝑦!+1
+
+Discretize
+𝑥
+
+𝐶̅
+
+𝐶̅
+
+𝐶̅
+
+or
+
+𝐷
+
+! 𝑑𝑡
+
+𝐴
+
+Δ𝑡
+
+𝐷%
+
+𝑥!−1
+
+𝐴̅
+
+𝑥!
+
+𝐴̅
+
+𝑥!+1
+
+𝑥̇ 𝐵# 𝐵# 𝐵#
+
+𝐵
+
+𝑢!−1
+
+𝑢!
+
+𝑢!+1
+
+Input
+
+𝐾& = (𝐶̅𝐴̅!𝐵-)
+*
+𝑢
+
+𝑢
+Continuous-time
+✓ continuous data ✓ irregular sampling
+
+Recurrent
+✓ unbounded context ✓ efficient inference
+
+Convolutional
+✓ local information ✓ parallelizable training
+
+Figure 1: (Three views of the LSSL) A Linear State Space Layer layer is a map ut ∈ R → yt ∈ R, where each feature ut → yt is deﬁned by discretizing a state-space model A, B, C, D with a parameter ∆t. The underlying state space model deﬁnes a discrete recurrence through combining the state matrix A and timescale ∆t into a transition matrix A. (Left) As an implicit continuous model, irregularly-spaced data can be handled by discretizing the same matrix A using a diﬀerent timescale ∆t. (Center) As a recurrent model, inference can be performed eﬃciently by computing the layer timewise (i.e., one vertical slice at a time (ut, xt, yt), (ut+1, xt+1, yt+1), . . .), by unrolling the linear recurrence. (Right) As a convolutional model, training can be performed eﬃciently by computing the layer depthwise in parallel (i.e., one horizontal slice at a time (ut)t∈[L], (yt)t∈[L], . . .), by convolving with a particular ﬁlter.
+
+framework for continuous-time memorization. However, these model families come at the price of reduced expressivity: intuitively, a family that is both convolutional and recurrent should be more restrictive than either.
+Our ﬁrst goal is to construct an expressive model family that combines all 3 paradigms while preserving their strengths. The Linear State-Space Layer (LSSL) is a simple sequence model that maps a 1-dimensional function or sequence u(t) → y(t) through an implicit state x(t) by simulating a linear continuous-time state-space representation in discrete-time
+
+x˙ (t) = Ax(t) + Bu(t)
+
+(1)
+
+y(t) = Cx(t) + Du(t),
+
+(2)
+
+where A controls the evolution of the system and B, C, D are projection parameters. The LSSL can be viewed as an instantiation of each family, inheriting their strengths (Fig. 1):
+
+• LSSLs are recurrent. If a discrete step-size ∆t is speciﬁed, the LSSL can be discretized into a linear recurrence using standard techniques, and simulated during inference as a stateful recurrent model with constant memory and computation per time step.
+
+• LSSLs are convolutional. The linear time-invariant systems deﬁned by (1)+(2) are known to be explicitly representable as a continuous convolution. Moreover, the discrete-time version can be parallelized during training using convolutions [12, 44].
+
+• LSSLs are continuous-time. The LSSL itself is a diﬀerential equation. As such, it can perform unique applications of continuous-time models, such as simulating continuous processes, handling missing data [45], and adapting to diﬀerent timescales.
+
+Surprisingly, we show that LSSLs do not sacriﬁce expressivity, and in fact generalize convolutions and RNNs. First, classical results from control theory imply that all 1-D convolutional kernels can be approximated
+
+2
+
+by an LSSL [59]. Additionally, we provide two results relating RNNs and ODEs that may be of broader interest, e.g. showing that some RNN architectural heuristics (such as gating mechanisms) are related to the step-size ∆t and can actually be derived from ODE approximations. As corollaries of these results, we show that popular RNN methods are special cases of LSSLs.
+The generality of LSSLs does come with tradeoﬀs. In particular, we describe and address two challenges that naive LSSL instantiations face when handling long sequences: (i) they inherit the limitations of both RNNs and CNNs at remembering long dependencies, and (ii) choosing the state matrix A and timescale ∆t appropriately are critical to their performance, yet learning them is computationally infeasible. We simultaneously address these challenges by specializing LSSLs using a carefully chosen class of structured matrices A, such that (i) these matrices generalize prior work on continuous-time memory [24] and mathematically capture long dependencies with respect to a learnable family of measures, and (ii) with new algorithms, LSSLs with these matrices A can be theoretically sped up under certain computation models, even while learning the measure A and timescale ∆t.
+We empirically validate that LSSLs are widely eﬀective on benchmark datasets and very long time series from healthcare sensor data, images, and speech.
+• On benchmark datasets, LSSLs obtain SoTA over recent RNN, CNN, and NDE-based methods across sequential image classiﬁcation tasks (e.g., by over 10% accuracy on sequential CIFAR) and healthcare regression tasks with length-4000 time series (by up to 80% reduction in RMSE).
+• To showcase the potential of LSSLs to unlock applications with extremely long sequences, we introduce a new sequential CelebA classiﬁcation task with length-38000 sequences. A small LSSL comes within 2.16 accuracy points of a specialized ResNet-18 vision architecture that has 10x more parameters and is trained directly on images.
+• Finally, we test LSSLs on a diﬃcult dataset of high-resolution speech clips, where usual speech pipelines pre-process the signals to reduce the length by 100x. When training on the raw length-16000 signals, the LSSL not only (i) outperforms previous methods by over 20 accuracy points in 1/5 the training time, but (ii) outperforms all baselines that use the pre-processed length-160 sequences, overcoming the limitations of hand-crafted feature engineering.
+Summary of Contributions
+• We introduce Linear State-Space Layers (LSSLs), a simple sequence-to-sequence transformation that shares the modeling advantages of recurrent, convolutional, and continuous-time methods. Conversely, we show that RNNs and CNNs can be seen as special cases of LSSLs (Section 3).
+• We prove that a structured subclass of LSSLs can learn representations that solve continuous-time memorization, allowing it to adapt its measure and timescale (Section 4.1). We also provide new algorithms for these LSSLs, showing that they can be sped up computationally under an arithmetic complexity model Section 4.2.
+• Empirically, we show that LSSLs stacked into a deep neural network are widely eﬀective on time series data, even (or especially) on extremely long sequences (Section 5).
+2 Technical Background
+We summarize the preliminaries on diﬀerential equations that are necessary for this work. We ﬁrst introduce two standard approximation schemes for diﬀerential equations that we will use to convert continuous-time models to discrete-time, and will be used in our results on understanding RNNs. We give further context on the step size or timescale ∆t, which is a particularly important parameter involved in this approximation process. Finally, we provide a summary of the HiPPO framework for continuous-time memorization [24], which will give us a mathematical tool for constructing LSSLs that can address long-term dependencies.
+3
+
+Approximations of diﬀerential equations. Any diﬀerential equation x˙ (t) = f (t, x(t)) has an equivalent integral equation x(t) = x(t0)+ tt0 f (s, x(s)) ds. This can be numerically solved by storing some approximation for x, and keeping it ﬁxed inside f (t, x) while iterating the equation. For example, Picard iteration is often used to prove the existence of solutions to ODEs by iterating the equation xi+1(t) := xi(t0) + tt0 f (s, xi(s)) ds . In other words, it ﬁnds a sequence of functions x0(t), x1(t), . . . that approximate the solution x(t) of the
+integral equation.
+
+Discretization. On the other hand, for a desired sequence of discrete times ti, approximations to x(t0), x(t1), . . . can be found by iterating the equation x(ti+1) = x(ti) + ttii+1 f (s, x(s)) ds. Diﬀerent ways of approximating the RHS integral lead to diﬀerent discretization schemes. We single out a discretization method called the generalized bilinear transform (GBT) which is specialized to linear ODEs of the form (1). Given a step size ∆t, the GBT update is
+
+x(t + ∆t) = (I − α∆t · A)−1(I + (1 − α)∆t · A)x(t) + ∆t(I − α∆t · A)−1B · u(t).
+
+(3)
+
+Three important cases are: α = 0 becomes the classic Euler method which is simply the ﬁrst-order approxi-
+
+mation
+
+x(t + ∆t)
+
+=
+
+x(t) + ∆t · x
+
+(t);
+
+α
+
+=
+
+1
+
+is
+
+called
+
+the
+
+backward
+
+Euler
+
+method;
+
+and
+
+α
+
+=
+
+1 2
+
+is
+
+called
+
+the
+
+bilinear method, which preserves the stability of the system [61].
+
+In Section 3.2 we will show that the backward Euler method and Picard iteration are actually related
+
+to RNNs. On the other hand, the bilinear discretization will be our main method for computing accurate
+
+discrete-time approximations of our continuous-time models. In particular, deﬁne A and B to be the matrices
+
+appearing in (3) for α = 21 . Then the discrete-time state-space model is
+
+xt = Axt−1 + But
+
+(4)
+
+yt = Cxt + Dut.
+
+(5)
+
+∆t as a timescale. In most models, the length of dependencies they can capture is roughly proportional to ∆1t . Thus we also refer to the step size ∆t as a timescale. This is an intrinsic part of converting a continuous-time ODE into a discrete-time recurrence, and most ODE-based RNN models have it as an important and non-trainable hyperparameter [24, 47, 58]. On the other hand, in Section 3.2 we show that the gating mechanism of classical RNNs is a version of learning ∆t. Moreover when viewed as a CNN, the timescale ∆t can be viewed as controlling the width of the convolution kernel (Section 3.2). Ideally, all ODE-based sequence models would be able to automatically learn the proper timescales.
+
+Continuous-time memory. Consider an input function u(t), a ﬁxed probability measure ω(t), and a sequence of N basis functions such as polynomials. At every time t, the history of u before time t can be projected onto this basis, which yields a vector of coeﬃcients x(t) ∈ RN that represents an optimal approximation of the history of u with respect to the provided measure ω. The map taking the function u(t) ∈ R to coeﬃcients x(t) ∈ RN is called the High-Order Polynomial Projection Operator (HiPPO) with respect to the measure ω. In special cases such as the uniform measure ω = I{[0, 1]} and the exponentially-decaying measure ω(t) = exp(−t), Gu et al. [24] showed that x(t) satisﬁes a diﬀerential equation x˙ (t) = A(t)x(t) + B(t)u(t) (i.e., (1)) and derived closed forms for the matrix A. Their framework provides a principled way to design memory models handling long dependencies; however, they prove only these few special cases.
+
+3 Linear State-Space Layers (LSSL)
+We deﬁne our main abstraction, a model family that generalizes recurrence and convolutions. Section 3.1 ﬁrst formally deﬁnes the LSSL, then discusses how to compute it with multiple views. Conversely, Section 3.2 shows that LSSLs are related to mechanisms of the most popular RNNs.
+
+4
+
+3.1 Diﬀerent Views of the LSSL
+Given a ﬁxed state space representation A, B, C, D, an LSSL is the sequence-to-sequence mapping deﬁned by discretizing the linear state-space model (1) and (2).
+Concretely, an LSSL layer has parameters A, B, C, D, and ∆t. It operates on an input u ∈ RL×H representing a sequence of length L where each timestep has an H-dimensional feature vector. Each feature h ∈ [H] deﬁnes a sequence (u(th))t∈[L], which is combined with a timescale ∆th to deﬁne an output y(h) ∈ RL via the discretized state-space model (4)+(5).
+Computationally, the discrete-time LSSL can be viewed in multiple ways (Fig. 1).
+
+As a recurrence. The recurrent state xt−1 ∈ RH×N carries the context of all inputs before time t. The current state xt and output yt can be computed by simply following equations (4)+(5). Thus the LSSL is a recurrent model with eﬃcient and stateful inference, which can consume a (potentially unbounded) sequence of inputs while requiring ﬁxed computation/storage per time step.
+
+As a convolution. For simplicity let the initial state be x−1 = 0. Then (4)+(5) explicitly yields
+
+k
+
+k−1
+
+yk = C A Bu0 + C A Bu1 + · · · + CABuk−1 + Buk + Duk.
+
+(6)
+
+Then y is simply the (non-circular) convolution y = KL(A, B, C) ∗ u + Du, where
+
+KL(A, B, C) = CAiB i∈[L] ∈ RL = (CB, CAB, . . . , CAL−1B). (7)
+
+Thus the LSSL can be viewed as a convolutional model where the entire output y ∈ RH×L can be computed at once by a convolution, which can be eﬃciently implemented with three FFTs.
+
+The computational bottleneck. We make a note that the bottleneck of (i) the recurrence view is matrix-vector multiplication (MVM) by the discretized state matrix A when simulating (4), and (ii) the convolutional view is computing the Krylov function KL (7). Throughout this section we assumed the LSSL parameters were ﬁxed, which means that A and KL(A, B, C) can be cached for eﬃciency. However, learning the parameters A and ∆t would involve repeatedly re-computing these, which is infeasible in practice. We revisit and solve this problem in Section 4.2.
+
+3.2 Expressivity of LSSLs
+For a model to be both recurrent and convolutional, one might expect it to be limited in other ways. Indeed, while [12, 44] also observe that certain recurrences can be replaced with a convolution, they note that it is not obvious if convolutions can be replaced by recurrences. Moreover, while the LSSL is a linear recurrence, popular RNN models are nonlinear sequence models with activation functions between each time step. We now show that LSSLs surprisingly do not have limited expressivity.
+
+Convolutions are LSSLs. A well-known fact about state-space systems (1)+(2) is that the output y is
+
+related to the input u by a convolution y(t) = h(τ )u(t − τ )dτ with the impulse response h of the system.
+
+Conversely, a convolutional ﬁlter h that is a rational function of degree N can be represented by a state-space
+
+model of size N [59]. Thus, an arbitrary convolutional ﬁlter h can be approximated by a rational function
+
+(e.g., by Padé approximants) and represented by an LSSL.
+
+In the particular case of LSSLs with HiPPO matrices (Sections 2 and 4.1), there is another intuitive
+
+interpretation of how LSSL relate to convolutions. Consider the special case when A corresponds to a uniform
+
+measure (in the literature known as the LMU [58] or HiPPO-LegT [24] matrix). Then for a ﬁxed dt, equation
+
+(1)
+
+is
+
+simply
+
+memorizing
+
+the
+
+input
+
+within
+
+sliding
+
+windows
+
+of
+
+1 ∆t
+
+elements,
+
+and
+
+equation
+
+(2)
+
+extracts
+
+features
+
+from this window. Thus the LSSL can be interpreted as automatically learning convolution ﬁlters with a
+
+learnable kernel width.
+
+5
+
+RNNs are LSSLs. We show two results about RNNs that may be of broader interest. Our ﬁrst result says that the ubiquitous gating mechanism of RNNs, commonly perceived as a heuristic to smooth optimization [28], is actually the analog of a step size or timescale ∆t.
+Lemma 3.1. A (1-D) gated recurrence xt = (1 − σ(z))xt−1 + σ(z)ut, where σ is the sigmoid function and z is an arbitrary expression, can be viewed as the GBT(α = 1) (i.e., backwards-Euler) discretization of a 1-D linear ODE x˙ (t) = −x(t) + u(t).
+Proof. Applying a discretization requires a positive step size ∆t. The simplest way to parameterize a positive function is via the exponential function ∆t = exp(z) applied to any expression z. Substituting this into (3) with A = −1, B = 1, α = 1 exactly produces the gated recurrence.
+While Lemma 3.1 involves approximating continuous systems using discretization, the second result is about approximating them using Picard iteration (Section 2). Roughly speaking, each layer of a deep linear RNN can be viewed as successive Picard iterates x0(t), x1(t), ... approximating a function x(t) deﬁned by a non-linear ODE. This shows that we do not lose modeling power by using linear instead of non-linear recurrences, and that the nonlinearity can instead be “moved” to the depth direction of deep neural networks to improve speed without sacriﬁcing expressivity.
+Lemma 3.2. (Inﬁnitely) deep stacked LSSL layers of order N = 1 with position-wise non-linear functions can approximate any non-linear ODE x˙ (t) = −x + f (t, x(t)).
+We note that many of the most popular and eﬀective RNN variants such as the LSTM [28], GRU [14], QRNN [5], and SRU [33], involve a hidden state xt ∈ RH that involves independently “gating” the H hidden units. Applying Lemma 3.1, they actually also approximate an ODE of the form in Lemma 3.2. Thus LSSLs and these popular RNN models can be seen to all approximate the same type of underlying continuous dynamics, by using Picard approximations in the depth direction and discretization (gates) in the time direction. Appendix C gives precise statements and proofs.
+3.3 Deep LSSLs
+The basic LSSL is deﬁned as a sequence-to-sequence map from RL → RL on 1D sequences of length L, parameterized by parameters A ∈ RN×N , B ∈ RN×1, C ∈ R1×N , D ∈ R1×1, ∆t ∈ R. Given an input
+sequence with hidden dimension H (in other words a feature dimension greater than 1), we simply broadcast the parameters B, C, D, ∆t with an extra dimension H. Each of these H copies is learned independently, so that there are H diﬀerent versions of a 1D LSSL processing each of the input features independently. Overall, the standalone LSSL layer is a sequence-to-sequence map with the same interface as standard sequence model layers such as RNNs, CNNs, and Transformers.
+The full LSSL architecture in a deep neural network is deﬁned similarly to standard sequence models such as deep ResNets and Transformers, involving stacking LSSL layers connected with normalization layers and residual connections. Full architecture details are described in Appendix B, including the initialization of A and ∆t, computational details, and other architectural details.
+4 Combining LSSLs with Continuous-time Memorization
+In Section 3 we introduced the LSSL model and showed that it shares the strengths of convolutions and recurrences while also generalizing them. We now discuss and address its main limitations, in particular handling long dependencies (Section 4.1) and eﬃcient computation (Section 4.2).
+4.1 Incorporating Long Dependencies into LSSLs
+The generality of LSSLs means they can inherit the issues of recurrences and convolutions at addressing long dependencies (Section 1). For example, viewed as a recurrence, repeated multiplication by A could suﬀer from the vanishing gradients problem [39, 44]. We conﬁrm empirically that LSSLs with random state matrices A are actually not eﬀective (Section 5.4) as a generic sequence model.
+6
+
+However, one advantage of these mathematical continuous-time models is that they are theoretically analyzable, and speciﬁc A matrices can be derived to address this issue. In particular, the HiPPO framework (Section 2) describes how to memorize a function in continuous time with respect to a measure ω [24]. This operator mapping a function to a continuous representation of its past is denoted hippo(ω), and was shown to have the form of equation (1) in three special cases. However, these matrices are non-trainable in the sense that no other A matrices were known to be hippo operators.
+To address this, we theoretically resolve the open question from [24], showing that hippo(ω) for any measure ω 1 results in (1) with a structured matrix A.
+Theorem 1 (Informal). For an arbitrary measure ω, the optimal memorization operator hippo(ω) has the form x˙ (t) = Ax(t) + Bu(t) (1) for a low recurrence-width (LRW) [17] state matrix A.
+For measures covering the classical orthogonal polynomials (OPs) [52] (in particular, corresponding to Jacobi and Laguerre polynomials), there is even more structure.
+Corollary 4.1. For ω corresponding to the classical OPs, hippo(ω) is 3-quasiseparable.
+Although beyond the scope of this section, we mention that LRW matrices are a type of structured matrix that have linear MVM [17]. In Appendix D we deﬁne this class and prove Theorem 1. Quasi-separable matrices are a related class of structured matrices with additional algorithmic properties. We deﬁne these matrices in Deﬁnition 4 and prove Corollary 4.1 in Appendix D.3.
+Theorem 1 tells us that a LSSL that uses a state matrix A within a particular class of structured matrices would carry the theoretical interpretation of continuous-time memorization. Ideally, we would be able to automatically learn the best A within this class; however, this runs into computational challenges which we address next (Section 4.2). For now, we deﬁne the LSSL-ﬁxed or LSSL-f to be one where the A matrix is ﬁxed to one of the HiPPO matrices prescribed by [24].
+4.2 Theoretically Eﬃcient Algorithms for the LSSL
+Although A and ∆t are the most critical parameters of an LSSL which govern the state-space (c.f. Section 4.1) and timescale (Sections 2 and 3.2), they are not feasible to train in a naive LSSL. In particular, Section 3.1 noted that it would require eﬃcient matrix-vector multiplication (MVM) and Krylov function (7) for A to compute the recurrent and convolutional views, respectively. However, the former seems to involve a matrix inversion (3), while the latter seems to require powering A up L times.
+In this section, we show that the same restriction of A to the class of quasiseparable (Corollary 4.1), which gives an LSSL the ability to theoretically remember long dependencies, simultaneously grants it computational eﬃciency.
+First of all, it is known that quasiseparable matrices have eﬃcient (linear-time) MVM [40]. We show that they also have fast Krylov functions, allowing eﬃcient training with convolutions.
+Theorem 2. For any k-quasiseparable matrix A (with constant k) and arbitrary B, C, the Krylov function KL(A, B, C) can be computed in quasi-linear time and space O˜(N + L) and logarithmic depth (i.e., is parallelizable). The operation count is in an exact arithmetic model, not accounting for bit complexity or numerical stability.
+We remark that Theorem 2 is non-obvious. To illustrate, it is easy to see that unrolling (7) for a general matrix A takes time LN 2. Even if A is extremely structured with linear computation, it requires LN operations and linear depth. The depth can be reduced with the squaring technique (batch multiply by A, A2, A4, . . .), but this then requires LN intermediate storage. In fact, the algorithm for Theorem 2 is quite sophisticated (Appendix E) and involves a divide-and-conquer recursion over matrices of polynomials, using the observation that (7) is related to the power series C(I − Ax)−1B .
+Unless speciﬁed otherwise, the full LSSL refers to an LSSL with A satisfying Corollary 4.1. In conclusion, learning within this structured matrix family simultaneously endows LSSLs with long-range memory through Theorem 1 and is theoretically computationally feasible through Theorem 2. We note the caveat that Theorem 2 is over exact arithmetic and not ﬂoating point numbers, and thus is treated more as a proof of concept that LSSLs can be computationally eﬃcient in theory. We comment more on the limitations of the LSSL in Section 6.
+1To be precise, the measures that correspond to orthogonal polynomials [52].
+7
+
+Table 1: (Pixel-by-pixel image classiﬁcation.) (Top) our methods. (Middle) recurrent baselines. (Bottom) convolutional + other baselines.
+
+Model
+LSSL LSSL-ﬁxed
+LipschitzRNN LMUFFT [12] UNIcoRNN [47] HiPPO-RNN [24] URGRU [25] IndRNN [34] Dilated RNN [8] r-LSTM [56]
+CKConv [44] TrellisNet [4] TCN [3] Transformer [56]
+
+sMNIST
+99.53 99.50
+99.4 98.9 99.27 99.0 98.0 98.4
+99.32 99.20 99.0 98.9
+
+pMNIST
+98.76 98.60
+96.3 98.49 98.4 98.3 96.51 96.0 96.1 95.2
+98.54 98.13 97.2 97.9
+
+sCIFAR
+84.65 81.97
+64.2 61.1 74.4 72.2
+63.74 73.42 62.2
+
+Table 2: (Vital signs prediction.) RMSE for predicting respiratory rate (RR), heart rate (HR), and blood oxygen (SpO2). * indicates our own runs to complete results for the strongest baselines.
+
+Model
+LSSL LSSL-ﬁxed
+UnICORNN [47] coRNN [47] CKConv NRDE [37] IndRNN [47] expRNN [47] LSTM Transformer
+XGBoost [55] Random Forest [55] Ridge Regress. [55]
+
+RR
+0.350 0.378
+1.06 1.45 1.214* 1.49 1.47 1.57 2.28 2.61*
+1.67 1.85 3.86
+
+HR
+0.432 0.561
+1.39 1.81 2.05* 2.97 2.1 1.87 10.7 12.2*
+4.72 5.69 17.3
+
+SpO2
+0.141 0.221
+0.869* 1.051* 1.29 3.02*
+1.52 1.74 4.16
+
+5 Empirical Evaluation
+We test LSSLs empirically on a range of time series datasets with sequences from length 160 up to 38000 (Sections 5.1 and 5.2), where they substantially improve over prior work. We additionally validate the computational and modeling beneﬁts of LSSLs from generalizing all three main model families (Section 5.3), and analyze the beneﬁts of incorporating principled memory representations that can be learned (Section 5.4).
+
+Baselines. Our tasks have extensive prior work and we evaluate against previously reported best results. We highlight our primary baselines, three very recent works explicitly designed for long sequences: CKConv (a continuous-time CNN) [44], UnICORNN (an ODE-inspired RNN) [47], and Neural Controlled/Rough Diﬀerential Equations (NCDE/NRDE) (a sophisticated NDE) [31, 37]. These are the only models we are aware of that have experimented with sequences of length >10k.
+
+5.1 Image and Time Series Benchmarks
+We test on the sequential MNIST, permuted MNIST, and sequential CIFAR tasks (Table 1), popular benchmarks which were originally designed to test the ability of recurrent models to capture long-term dependencies of length up to 1k [2]. LSSL sets SoTA on sCIFAR by more than 10 points. We note that all results were achieved with at least 5x fewer parameters than the previous SoTA (Appendix F).
+We additionally use the BDIMC healthcare datasets (Table 2), a suite of widely studied time series regression problems of length 4000 on estimating vital signs. LSSL reduces RMSE by more than two-thirds on all datasets.
+
+Table 3:
+
+(Sequential
+
+CelebA Classiﬁcation.)
+
+Att. MSO Smil. WL
+
+LSSL-f
+78.89 92.36 90.95 90.57
+
+ResNet
+81.35 93.92 92.89 93.25
+
+5.2 Speech and Image Classiﬁcation for Very Long Time Series
+Raw speech is challenging for ML models due to high-frequency sampling resulting in very long sequences. Traditional systems involve complex pipelines that require feeding mixed-and-matched hand-crafted features into DNNs [42]. Table 4 reports results for the Speech Commands (SC) dataset [31] for classiﬁcation of 1-second audio clips. Few methods have made progress on the raw speech signal, instead requiring preprocessing with standard mel-frequency cepstrum coeﬃcients (MFCC). By contrast, LSSL sets SoTA on this dataset while training on the raw signal. We note that MFCC extracts sliding window frequency coeﬃcients
+
+8
+
+Table 4: (Raw Speech Classiﬁcation; Timescale Shift.) (Top): Raw signals (length 16000); 1 → f indicates test-time change in sampling rate by a factor of f . (Bottom): Pre-processed MFCC features used in prior work (length 161).  denotes computationally infeasible.
+
+1→1 1 → 21
+MFCC
+
+LSSL
+95.87 88.66
+93.58
+
+LSSL-f
+90.64 78.01
+92.55
+
+CKConv
+71.66 65.96
+95.3
+
+UnICORNN
+11.02 11.07
+90.64
+
+N(C/R)DE
+16.49 15.12
+89.8
+
+ODE-RNN [45]
+ 
+65.9
+
+GRU-ODE [16]
+ 
+47.9
+
+Table 5: (Modeling and Computational Beneﬁts of LSSLs.) In each benchmark category, we compare the number of epochs (ep.) it takes a LSSL-f to reach the previous SoTA (PSoTA) results as well as a near-SoTA target. We also report the wall clock time it took to reach PSoTA relative to the previous best model.
+
+LSSL-ﬁxed CKConv UnICORNN
+
+Permuted MNIST
+
+98% Acc. PSoTA Time
+
+16 ep. 118 ep. 75 ep.
+
+104 ep. 200 ep. 
+
+0.19× 1.0× 
+
+BDIMC Heart Rate
+
+1.5 RMSE PSoTA Time
+
+9 ep.  116 ep.
+
+10 ep.  467 ep.
+
+0.07×  1.0×
+
+Speech Commands RAW
+
+65% Acc. PSoTA Time
+
+9 ep. 188 ep. 
+
+10 ep. 280 ep. 
+
+0.14× 1.0× 
+
+and thus is related to the coeﬃcients x(t) deﬁned by LSSL-f (Section 2, Section 4.1, [24], Appendix D). Consequently, LSSL may be interpreted as automatically learning MFCC-type features in a trainable basis.
+To stress-test the LSSL’s ability to handle extremely long sequences, we create a challenging new sequentialCelebA task, where we classify 178 × 218 images = 38000-length sequences for 4 facial attributes: Attractive (Att.), Mouth Slightly Open (MSO), Smiling (Smil.), Wearing Lipstick (WL) [36]. We chose the 4 most class-balanced attributes to avoid well-known problems with class imbalance. LSSL-f comes close to matching the performance of a specialized ResNet-18 image classiﬁcation architecture that has 10× the parameters (Table 3). We emphasize we are the ﬁrst to demonstrate that this is possible to do with a generic sequence model.
+5.3 Advantages of Recurrent, Convolutional, and Continuous-time Models
+We validate that the generality of LSSLs endows it with the strengths of all three families. Convergence Speed. As a recurrent and NDE model that incorporates new theory for continuous-time
+memory (Section 4.1), the LSSL has strong inductive bias for sequential data, and converges rapidly to SoTA results on our benchmarks. With its convolutional view, training can be parallelized and it is also computationally eﬃcient in practice. Table 5 compares the time it takes the LSSL-f to achieve SoTA, in either sample (measured by epochs) or computational (measured by wall clock) complexity. In all cases, LSSLs reached the target in a fraction of the time of the previous model.
+Timescale Adaptation. Table 4 also reports the results of continuous-time models that are able to handle unique settings such as missing data in time series, or test-time shift in timescale (we note that this is a realistic problem, e.g., when deployed healthcare models are tested on EEG signals that are sampled at a diﬀerent rate [48, 49]). We note that many of these baselines were custom designed for such settings, which is of independent interest. On the other hand, LSSLs perform timescale adaptation by simply changing its ∆t values at inference time, while still outperforming the performance of prior methods with no shift. Additional results on the CharacterTrajectories dataset from prior work [31, 44] are in Appendix F, where LSSL is competitive with the best baselines.
+5.4 LSSL Ablations: Learning the Memory Dynamics and Timescale
+We demonstrate that the ∆t and A parameters, which LSSLs are able to automatically learn in contrast to prior work, are indeed critical to the performance of these continuous-time models. We note that learning ∆t
+
+9
+
+adds only O(H) parameters and learning A adds O(N ) parameters, adding less than 1% parameter count compared to the base models with O(HN ) parameters.
+Memory dynamics A. We validate that vanilla LSSLs suﬀer from the modeling issues described in Section 4. We tested that LSSLs with random A matrices (normalized appropriately) perform very poorly (e.g., 62% on pMNIST). Further, we note the consistent increase in performance from LSSL-f to LSSL despite the negligible parameter diﬀerence. These ablations show that (i) incorporating the theory of Theorem 1 is actually necessary for LSSLs, and (ii) further training the structured A is additionally helpful, which can be interpreted as learning the measure for memorization (Section 4.1).
+Timescale ∆t. Section 3.2 showed that LSSL’s ability to learn ∆t is its direct generalization of the critical gating mechanism of popular RNNs, which previous ODE-based RNN models [12, 24, 47, 58] cannot learn. We note that on sCIFAR, LSSL-f with poorly-speciﬁed ∆t gets only 49.3% accuracy. Additional results in Appendix F show that learning ∆t alone provides an orthogonal boost to learning A, and visualizes the noticeable change in ∆t over the course of training.
+6 Discussion
+In this work we introduced a simple and principled model (LSSL) inspired by a fundamental representation of physical systems. We showed theoretically and empirically that it generalizes and inherits the strengths of the main families of modern time series models, that its main limitations of long-term memory can be resolved with new theory on continuous-time memorization, and that it is empirically eﬀective on diﬃcult tasks with very long sequences.
+Related work. The LSSL is related to several rich lines of work on recurrent, convolutional, and continuous-time models, as well as sequence models addressing long dependencies. Appendix A provides an extended related work connecting these topics.
+Tuning. Our models are very simple, consisting of identical L(inear )SSL layers with simple position-wise non-linear modules between layers (Appendix B). Our models were able to train at much higher learning rates than baselines and were not sensitive to hyperparameters, of which we did light tuning primarily on learning rate and dropout. In contrast to previous baselines [4, 31, 44], we did not use hyperparameters for improving stability and regularization such as weight decay, gradient clipping, weight norm, input dropout, etc. While the most competitive recent works introduce at least one hyperparameter of critical importance (e.g. depth and step size [37], α and ∆t [47], ω0 [44]) that are diﬃcult to tune, the LSSL-ﬁxed has only ∆t, which the full LSSL can even learn automatically (at the expense of speed).
+Limitations. Sections 1 and 3 and Fig. 1 mention that a potential beneﬁt of having the recurrent representation of LSSLs may endow it with eﬃcient inference. While this is theoretically possible, this work did not experiment on any applications that leverage this. Follow-up work showed that it is indeed possible in practice to speed up some applications at inference time.
+Theorem 2’s algorithm is sophisticated (Appendix D) and was not implemented in the ﬁrst version of this work. A follow-up to this paper found that it is not numerically stable and thus not usable on hardware. Thus the algorithmic contributions in Theorem 2 serve the purpose of a proof-of-concept that fast algorithms for the LSSL do exist in other computation models (i.e., arithmetic operations instead of ﬂoating point operations), and leave an open question as to whether fast, numerically stable, and practical algorithms for the LSSL exist.
+As described in Appendix B, by freezing the A matrix and ∆t timescale, the LSSL-ﬁxed is able to be computed much faster than the full LSSL, and is comparable to prior models in practice (Table 5). However, beyond computational complexity, there is also a consideration of space eﬃciency. Both the LSSL and LSSL-ﬁxed suﬀer from a large amount of space overhead (described in Appendix B) – using O(N L) instead of O(L) space when working on a 1D sequence of length L – that essentially stems from using the latent state representation of dimension N . Consequently, the LSSL can be space ineﬃcient and we used multi-GPU training for our largest experiments (speech and high resolution images, Tables 3 and 4).
+These fundamental issues with computation and space complexity were revisited and resolved in followup work to this paper, where a new state space model (the Structured State Space) provided a new parameterization and algorithms for state spaces.
+Conclusion and future work. Modern deep learning models struggle in applications with very long
+10
+
+temporal data such as speech, videos, and medical time-series. We hope that our conceptual and technical contributions can lead to new capabilities with simple, principled, and less engineered models. We note that our pixel-level image classiﬁcation experiments, which use no heuristics (batch norm, auxiliary losses) or extra information (data augmentation), perform similar to early convnet models with vastly more parameters, and is in the spirit of recent attempts at unifying data modalities with a generic sequence model [18]. Our speech results demonstrate the possibility of learning better features than hand-crafted processing pipelines used widely in speech applications. We are excited about potential downstream applications, such as training other downstream models on top of pre-trained state space features.
+Acknowledgments
+We thank Arjun Desai, Ananya Kumar, Laurel Orr, Sabri Eyuboglu, Dan Fu, Mayee Chen, Sarah Hooper, Simran Arora, and Trenton Chang for helpful feedback on earlier drafts. We thank David Romero and James Morrill for discussions and additional results for baselines used in our experiments. This work was done with the support of Google Cloud credits under HAI proposals 540994170283 and 578192719349. AR and IJ are supported under NSF grant CCF-1763481. KS is supported by the Wu Tsai Neuroscience Interdisciplinary Graduate Fellowship. We gratefully acknowledge the support of NIH under No. U54EB020405 (Mobilize), NSF under Nos. CCF1763315 (Beyond Sparsity), CCF1563078 (Volume to Velocity), and 1937301 (RTML); ONR under No. N000141712266 (Unifying Weak Supervision); ONR N00014-20-1-2480: Understanding and Applying Non-Euclidean Geometry in Machine Learning; N000142012275 (NEPTUNE); the Moore Foundation, NXP, Xilinx, LETI-CEA, Intel, IBM, Microsoft, NEC, Toshiba, TSMC, ARM, Hitachi, BASF, Accenture, Ericsson, Qualcomm, Analog Devices, the Okawa Foundation, American Family Insurance, Google Cloud, Salesforce, Total, the HAI-AWS Cloud Credits for Research program, the Stanford Data Science Initiative (SDSI), and members of the Stanford DAWN project: Facebook, Google, and VMWare. The Mobilize Center is a Biomedical Technology Resource Center, funded by the NIH National Institute of Biomedical Imaging and Bioengineering through Grant P41EB027060. The U.S. Government is authorized to reproduce and distribute reprints for Governmental purposes notwithstanding any copyright notation thereon. Any opinions, ﬁndings, and conclusions or recommendations expressed in this material are those of the authors and do not necessarily reﬂect the views, policies, or endorsements, either expressed or implied, of NIH, ONR, or the U.S. Government.
+References
+[1] George B. (George Brown) Arfken, Hans Jürgen Weber, and Frank E Harris. Mathematical methods for physicists : a comprehensive guide / George B. Arfken, Hans J. Weber, Frank E. Harris. Academic Press, Amsterdam, 7th ed. edition, 2013. ISBN 0-12-384654-4.
+[2] Martin Arjovsky, Amar Shah, and Yoshua Bengio. Unitary evolution recurrent neural networks. In The International Conference on Machine Learning (ICML), pages 1120–1128, 2016.
+[3] Shaojie Bai, J Zico Kolter, and Vladlen Koltun. An empirical evaluation of generic convolutional and recurrent networks for sequence modeling. arXiv preprint arXiv:1803.01271, 2018.
+[4] Shaojie Bai, J Zico Kolter, and Vladlen Koltun. Trellis networks for sequence modeling. In The International Conference on Learning Representations (ICLR), 2019.
+[5] James Bradbury, Stephen Merity, Caiming Xiong, and Richard Socher. Quasi-recurrent neural networks. arXiv preprint arXiv:1611.01576, 2016.
+[6] John Charles Butcher and Nicolette Goodwin. Numerical methods for ordinary diﬀerential equations, volume 2. Wiley Online Library, 2008.
+[7] Bo Chang, Minmin Chen, Eldad Haber, and Ed H Chi. Antisymmetricrnn: A dynamical system view on recurrent neural networks. In International Conference on Learning Representations, 2019.
+11
+
+[8] Shiyu Chang, Yang Zhang, Wei Han, Mo Yu, Xiaoxiao Guo, Wei Tan, Xiaodong Cui, Michael Witbrock, Mark Hasegawa-Johnson, and Thomas S Huang. Dilated recurrent neural networks. In Advances in Neural Information Processing Systems (NeurIPS), 2017.
+[9] Zhengping Che, Sanjay Purushotham, Kyunghyun Cho, David Sontag, and Yan Liu. Recurrent neural networks for multivariate time series with missing values. Scientiﬁc reports, 8(1):1–12, 2018.
+[10] Tian Qi Chen, Yulia Rubanova, Jesse Bettencourt, and David K Duvenaud. Neural ordinary diﬀerential equations. In Advances in neural information processing systems, pages 6571–6583, 2018.
+[11] T. S. Chihara. An introduction to orthogonal polynomials. Dover Books on Mathematics. Dover Publications, 2011. ISBN 9780486479293.
+[12] Narsimha Chilkuri and Chris Eliasmith. Parallelizing legendre memory unit training. The International Conference on Machine Learning (ICML), 2021.
+[13] François Chollet. Xception: Deep learning with depthwise separable convolutions. In Proceedings of the IEEE conference on computer vision and pattern recognition, pages 1251–1258, 2017.
+[14] Junyoung Chung, Caglar Gulcehre, KyungHyun Cho, and Yoshua Bengio. Empirical evaluation of gated recurrent neural networks on sequence modeling. arXiv preprint arXiv:1412.3555, 2014.
+[15] Jared Quincy Davis, Albert Gu, Tri Dao, Krzysztof Choromanski, Christopher Ré, Percy Liang, and Chelsea Finn. Catformer: Designing stable transformers via sensitivity analysis. In The International Conference on Machine Learning (ICML), 2021.
+[16] Edward De Brouwer, Jaak Simm, Adam Arany, and Yves Moreau. Gru-ode-bayes: Continuous modeling of sporadically-observed time series. In Advances in Neural Information Processing Systems (NeurIPS), 2019.
+[17] Christopher De Sa, Albert Gu, Rohan Puttagunta, Christopher Ré, and Atri Rudra. A two-pronged progress in structured dense matrix vector multiplication. In Proceedings of the Twenty-Ninth Annual ACM-SIAM Symposium on Discrete Algorithms, pages 1060–1079. SIAM, 2018.
+[18] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, et al. An image is worth 16x16 words: Transformers for image recognition at scale. arXiv preprint arXiv:2010.11929, 2020.
+[19] Y. Eidelman and I. Gohberg. On a new class of structured matrices. Integral Equations and Operator Theory, 34, 1999.
+[20] N Benjamin Erichson, Omri Azencot, Alejandro Queiruga, Liam Hodgkinson, and Michael W Mahoney. Lipschitz recurrent neural networks. In International Conference on Learning Representations, 2021.
+[21] Karl J Friston, Lee Harrison, and Will Penny. Dynamic causal modelling. Neuroimage, 19(4):1273–1302, 2003.
+[22] Ken-ichi Funahashi and Yuichi Nakamura. Approximation of dynamical systems by continuous time recurrent neural networks. Neural networks, 6(6):801–806, 1993.
+[23] Gene H Golub and Charles F Van Loan. Matrix computations, volume 3. JHU press, 2013.
+[24] Albert Gu, Tri Dao, Stefano Ermon, Atri Rudra, and Christopher Ré. Hippo: Recurrent memory with optimal polynomial projections. In Hugo Larochelle, Marc’Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, and Hsuan-Tien Lin, editors, Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual, 2020. URL https://proceedings.neurips.cc/paper/2020/hash/ 102f0bb6efb3a6128a3c750dd16729be-Abstract.html.
+12
+
+[25] Albert Gu, Caglar Gulcehre, Tom Le Paine, Matt Hoﬀman, and Razvan Pascanu. Improving the gating mechanism of recurrent neural networks. In The International Conference on Machine Learning (ICML), 2020.
+[26] Ramin Hasani, Mathias Lechner, Alexander Amini, Lucas Liebenwein, Max Tschaikowski, Gerald Teschl, and Daniela Rus. Closed-form continuous-depth models. arXiv preprint arXiv:2106.13898, 2021.
+[27] Ramin Hasani, Mathias Lechner, Alexander Amini, Daniela Rus, and Radu Grosu. Liquid time-constant networks. In Proceedings of the AAAI Conference on Artiﬁcial Intelligence, 2021.
+[28] Sepp Hochreiter and Jürgen Schmidhuber. Long short-term memory. Neural computation, 9(8):1735–1780, 1997.
+[29] Ian D Jordan, Piotr Aleksander Sokół, and Il Memming Park. Gated recurrent units viewed through the lens of continuous time dynamical systems. Frontiers in computational neuroscience, page 67, 2021.
+[30] Anil Kag, Ziming Zhang, and Venkatesh Saligrama. Rnns incrementally evolving on an equilibrium manifold: A panacea for vanishing and exploding gradients? In International Conference on Learning Representations, 2020.
+[31] Patrick Kidger, James Morrill, James Foster, and Terry Lyons. Neural controlled diﬀerential equations for irregular time series. arXiv preprint arXiv:2005.08926, 2020.
+[32] Mathias Lechner and Ramin Hasani. Learning long-term dependencies in irregularly-sampled time series. arXiv preprint arXiv:2006.04418, 2020.
+[33] Tao Lei, Yu Zhang, Sida I Wang, Hui Dai, and Yoav Artzi. Simple recurrent units for highly parallelizable recurrence. arXiv preprint arXiv:1709.02755, 2017.
+[34] Shuai Li, Wanqing Li, Chris Cook, Ce Zhu, and Yanbo Gao. Independently recurrent neural network (IndRNN): Building a longer and deeper RNN. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition, pages 5457–5466, 2018.
+[35] Liyuan Liu, Xiaodong Liu, Jianfeng Gao, Weizhu Chen, and Jiawei Han. Understanding the diﬃculty of training transformers. The International Conference on Machine Learning (ICML), 2020.
+[36] Ziwei Liu, Ping Luo, Xiaogang Wang, and Xiaoou Tang. Deep learning face attributes in the wild. In ICCV, pages 3730–3738. IEEE Computer Society, 2015. ISBN 978-1-4673-8391-2. URL http: //dblp.uni-trier.de/db/conf/iccv/iccv2015.html#LiuLWT15.
+[37] James Morrill, Cristopher Salvi, Patrick Kidger, James Foster, and Terry Lyons. Neural rough diﬀerential equations for long time series. The International Conference on Machine Learning (ICML), 2021.
+[38] Murphy Yuezhen Niu, Lior Horesh, and Isaac Chuang. Recurrent neural networks in the eye of diﬀerential equations. arXiv preprint arXiv:1904.12933, 2019.
+[39] Razvan Pascanu, Tomas Mikolov, and Yoshua Bengio. On the diﬃculty of training recurrent neural networks. In International conference on machine learning, pages 1310–1318, 2013.
+[40] Clément Pernet. Computing with quasiseparable matrices. In Proceedings of the ACM on International Symposium on Symbolic and Algebraic Computation, pages 389–396, 2016.
+[41] KB Petersen and MS Pedersen. The matrix cookbook, version 20121115. Technical Univ. Denmark, Kongens Lyngby, Denmark, Tech. Rep, 3274, 2012.
+[42] M. Ravanelli, T. Parcollet, and Y. Bengio. The pytorch-kaldi speech recognition toolkit. In In Proc. of ICASSP, 2019.
+[43] David W Romero, Robert-Jan Bruintjes, Jakub M Tomczak, Erik J Bekkers, Mark Hoogendoorn, and Jan C van Gemert. Flexconv: Continuous kernel convolutions with diﬀerentiable kernel sizes. arXiv preprint arXiv:2110.08059, 2021.
+13
+
+[44] David W Romero, Anna Kuzina, Erik J Bekkers, Jakub M Tomczak, and Mark Hoogendoorn. Ckconv: Continuous kernel convolution for sequential data. arXiv preprint arXiv:2102.02611, 2021.
+[45] Yulia Rubanova, Tian Qi Chen, and David K Duvenaud. Latent ordinary diﬀerential equations for irregularly-sampled time series. In Advances in Neural Information Processing Systems, pages 5321–5331, 2019.
+[46] T. Konstantin Rusch and Siddhartha Mishra. Coupled oscillatory recurrent neural network (cornn): An accurate and (gradient) stable architecture for learning long time dependencies. In International Conference on Learning Representations, 2021.
+[47] T Konstantin Rusch and Siddhartha Mishra. Unicornn: A recurrent model for learning very long time dependencies. The International Conference on Machine Learning (ICML), 2021.
+[48] Khaled Saab, Jared Dunnmon, Christopher Ré, Daniel Rubin, and Christopher Lee-Messer. Weak supervision as an eﬃcient approach for automated seizure detection in electroencephalography. NPJ Digital Medicine, 3(1):1–12, 2020.
+[49] Vinit Shah, Eva Von Weltin, Silvia Lopez, James Riley McHugh, Lillian Veloso, Meysam Golmohammadi, Iyad Obeid, and Joseph Picone. The Temple University hospital seizure detection corpus. Frontiers in neuroinformatics, 12:83, 2018.
+[50] Jie Shen, Tao Tang, and Li-Lian Wang. Orthogonal Polynomials and Related Approximation Results, pages 47–140. Springer Berlin Heidelberg, Berlin, Heidelberg, 2011. ISBN 978-3-540-71041-7. doi: 10.1007/978-3-540-71041-7_3. URL https://doi.org/10.1007/978-3-540-71041-7_3.
+[51] Victor Shoup. A computational introduction to number theory and algebra. Cambridge university press, 2009.
+[52] G. Szegö. Orthogonal Polynomials. Number v.23 in American Mathematical Society colloquium publications. American Mathematical Society, 1967. ISBN 9780821889527.
+[53] G. Szegő. Orthogonal Polynomials. American Mathematical Society: Colloquium publications. American Mathematical Society, 1975. ISBN 9780821810231.
+[54] Corentin Tallec and Yann Ollivier. Can recurrent neural networks warp time? In The International Conference on Learning Representations (ICLR), 2018.
+[55] Chang Wei Tan, Christoph Bergmeir, Francois Petitjean, and Geoﬀrey I Webb. Time series extrinsic regression. Data Mining and Knowledge Discovery, pages 1–29, 2021. doi: https://doi.org/10.1007/ s10618-021-00745-9.
+[56] Trieu H Trinh, Andrew M Dai, Minh-Thang Luong, and Quoc V Le. Learning longer-term dependencies in RNNs with auxiliary losses. In The International Conference on Machine Learning (ICML), 2018.
+[57] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Information Processing Systems (NeurIPS), 2017.
+[58] Aaron Voelker, Ivana Kajić, and Chris Eliasmith. Legendre memory units: Continuous-time representation in recurrent neural networks. In Advances in Neural Information Processing Systems, pages 15544–15553, 2019.
+[59] Robert L Williams, Douglas A Lawrence, et al. Linear state-space control systems. Wiley Online Library, 2007.
+[60] Max A Woodbury. Inverting modiﬁed matrices. Memorandum report, 42:106, 1950.
+[61] Guofeng Zhang, Tongwen Chen, and Xiang Chen. Performance recovery in digital implementation of analogue systems. SIAM journal on control and optimization, 45(6):2207–2223, 2007.
+14
+
+[62] Huaguang Zhang, Zhanshan Wang, and Derong Liu. A comprehensive review of stability analysis of continuous-time recurrent neural networks. IEEE Transactions on Neural Networks and Learning Systems, 25(7):1229–1262, 2014.
+15
+
+A Related Work
+We provide an extended related work comparing the LSSL to previous recurrent, convolutional, and continuoustime models.
+HiPPO The LSSL is most closely related to the HiPPO framework for continuous-time memory [24] and its predecessor, the Legendre Memory Unit (LMU) [58]. The HiPPO-RNN and the LMU deﬁne dynamics of the form of equation (1), and incorporate it into an RNN architecture. A successor to the LMU, the LMU-FFT [12] keeps the original linear dynamics, allowing the LMU to be computed with a cached convolution kernel.
+These methods all suﬀer from two main limitations. First, the state matrix A and discretization timescale ∆t cannot be trained due to both limitations in theoretical understanding of which A matrices are eﬀective, as well as computational limitations. Second, (1) is a 1-D to N -D map, requiring states to be projected back down to 1-D. This creates an overall 1-D bottleneck in the state, limiting the expressivity of the model.
+Compared to these, the LSSL does not use a conventional RNN architecture, instead keeping the linear recurrence (4) and downprojecting it with the second part of the state space representation (5). To avoid the 1-D feature bottlneck, it simply computes H copies of this 1-D to 1-D independently, creating an overall H-dimensional sequence-to-sequence model. However, this exacerbates the computational issue, since the work is increased by a factor of H.
+This work resolves the expressivity issue with new theory. Compared to HiPPO and the LMU, LSSL allows training the A matrix by showing generalized theoretical results for the HiPPO framework, showing that there is a parameterized class of structured state spaces that are HiPPO operators.
+The LSSL makes progress towards the second issue with new algorithms for these structured matrices (Theorem 2). However, as noted in Sections 4.2 and 6, the algorithm presented in Theorem 2 was later found to be not practical, and an improved representation and algorithm was found in subsequent work.
+Continuous-time CNNs. The CKConv is the only example of a continuous-time CNN that we are aware of, and is perhaps the strongest baseline in our experiments. Rather than storing a ﬁnite sequence of weights for a convolution kernel, the CKConv parameterizes it as an implicit function from [0, 1] → R which allows sampling it at any resolution. A successor to the CKConv is the FlexConv [43], which learns convolutional kernels with a ﬂexible width. This is similar to the convolution interpretation of LSSL when using certain HiPPO bases (Section 3.2).
+Continuous-time RNNs. The connection from RNNs to continuous-time models have been known since their inception, and recent years have seen an explosion of CT-RNN (continuous-time RNN) models based on dynamical systems or ODEs. We brieﬂy mention a few classic and modern works along these lines, categorizing them into a few main topics.
+First are theoretical works that analyze the expressivity of RNNs from a continuous-time perspective. The connection between RNNs and dynamical systems has been studied since the 90s [22], ﬂeshing out the correspondence between diﬀerent dynamical systems and RNN architectures [38]. Modern treatments have focused on analyzing the stability [62] and dynamics [29] of RNNs.
+Second, a large class of modern RNNs have been designed that aim to combat vanishing gradients from a dynamical systems analysis. These include include the AntisymmetricRNN [7], iRNN [30], and LipschitzRNN [20], which address the exploding/vanishing gradient problem by reparatermizing the architecture or recurrent matrix based on insights from an underlying dynamical system.
+Third is a class of models that are based on an explicit underlying ODE introduced to satisfy various properties. This category includes the UnICORNN [47] and its predecessor coRNN [46] which discretize a second-order ODE inspired by oscillatory systems. Other models include the Liquid Time-Constant Networks (LTC) [27] and successor CfC [26], which use underlying dynamical systems with varying time-constants with stable behavior and provable rates of expressivity measured by trajectory length. The LTC is based on earlier dynamic causal models (DCM) [21], which are a particular ODE related to state spaces with an extra bilinear term. Finally, the LMU [58] and HiPPO [24] also fall in this category, whose underlying ODEs are mathematically derived for continuous-time memorization.
+Fourth, the recent family of neural ODEs [10], originally introduced as continuous-depth models, have been adapted to continuous-time, spawning a series of “ODE-RNN” models. Examples include the ODE-RNN [45],
+16
+
+GRU-ODE-Bayes [16], and ODE-LSTM [32], which extend adjoint-based neural ODEs to the discrete input setting as an alternative to standard RNNs. Neural Controlled Diﬀerential Equations (NCDE) [31] and Neural Rough Diﬀerential Equations (NRDE) [37] are memory eﬃcient versions that integrate observations more smoothly and can be extended to very long time series.
+Gating mechanisms. As a special case of continuous-time RNNs, some works have observed the relation between gating mechanisms and damped dynamical systems [54]. Some examples of continuous-time RNNs based on such damped dynamical systems include the LTC [27] and iRNN [30]. Compared to these, Lemma 3.1 shows a stronger result that sigmoid gates are not just motivated by being an arbitrary monotonic function with range (0, 1), but the exact formula appears out of discretizing a damped ODE.
+
+B Model Details
+
+B.1 (M)LSSL Computation
+
+Section 3.1 noted that some of the computations for using the LSSL are expensive to compute. When the LSSL ﬁxes the A and ∆t parameters (e.g. when they are not trained, or at inference time), these computational diﬃculties can be circumvented by caching particular computations. In particular, this case applies to the LSSL-f. Note that in this case, the other state-space matrices C and D comprise the O(HN ) trainable parameters of the ﬁxed-transition LSSL.
+In particular, we assume that there is a black-box inference algorithm for this system, i.e. matrix-vector multiplication by A (an example of implementing this black box for a particular structured class is in Appendix E.2). We then compute and cache
+
+• the transition matrix A, which is computed by applying the black-box A MVM algorithm to the identity matrix I.
+
+• the Krylov matrix
+
+K(A, B) = (B, AB, (A)2B, ...) ∈ RN×L,
+
+(8)
+
+which is computed in a parallelized manner by the squaring technique for exponentiation, i.e. batch multiply by A, (A)2, (A)4, . . ..
+
+At inference time, the model can be unrolled recurrently with A. At training time, the convolutional ﬁlter KL(A, B, C) (equation (7)) is computed with a matrix multiplication C · K(A, B) before convolving with the input u.
+Table 7 provides more detailed complexity of this version of the LSSL with ﬁxed A, ∆t. Note that as mentioned in Section 6, this cached algorithm is fairly fast, but the main drawback is that materializing the Krylov matrix (8) requires O(N L) instead of O(L) space.
+
+B.2 Initialization of A
+The LSSL initializes the A parameter in (1) to the HiPPO-LegS operator, which was derived to solve a particular continuous-time memorization problem. This matrix A ∈ RN×N is
+
+ (2n
+
++
+
+1)1/2(2k
+
++
+
+1)1/2
+
+
+
+
+
+Ank = n + 1
+
+0
+
+if n > k if n = k . if n < k
+
+Note that the LSSL-f is the LSSL with a non-trainable A (and ∆t), so that A is ﬁxed to the above matrix.
+
+17
+
+B.3 Initialization of ∆t
+One distinction between the LSSL and the most related prior work is that the inclusion of the projection (2) makes the layer a 1-dimensional to 1-dimensional map, instead of 1-D to N -D [24, 58]. This enables us to concatenate H copies of this map (at the expense of computation, cf. Section 4.2 and Appendix D). Even when ∆t is not trained as in the LSSL-f, these H copies allow multiple timescales to be considered by setting ∆t diﬀerently for each copy.
+In particular, we initialize ∆t log-uniformly in a range ∆tmin, ∆tmax (i.e., ∆t is initialized within this range, such that log ∆t is uniformly distributed). The maximum and minimum values were generally chosen to be a factor of 100 apart such that the length of the sequences in the dataset are contained in this range. Speciﬁc values for each model and dataset are in Appendix F. We did not search over these as a hyperparameter, but we note that it can be tuned for additional performance improvements in our experiments.
+B.4 Deep Neural Network Architecture
+The Deep LSSL models used in our experiments simply stack together LSSL layers in a simple deep neural network architecture. We note the following architecture details.
+Channels. The state-space model (1)+(2) accepts a 1-dimensional input u, but does not strictly have to return a 1-dimensional output y. By making the matrices in (2) dimension C ∈ RM×N , D ∈ RM×1, the output y will be dimension M instead of 1.
+We call M the number of channels in the model.
+Feedforward. There are two drawbacks with the current deﬁnition of LSSL:
+• They are deﬁned by running H independent copies of a state-space model, which means the H input features do not interact at all.
+• If the channel dimension is M > 1, then the LSSL is a map from dimension 1 to M , which means residuals cannot be applied.
+These are both addressed by introducing a position-wise feedforward layer after the LSSL of shape H · M → H. This simultaneously mixes the hidden features, and projects the output back to dimension 1 if necessary. There is also an optional non-linearity in between the LSSL and this feedforward projection; we ﬁx it to the GeLU activation function in our models.
+We note that this factorization of parallel convolutions on the H features followed by a position-wise linear map is very similar to depth-wise separable convolutions [13].
+Residuals and normalization. To stack multiple layers of LSSLs together, we use very standard architectures for deep neural networks. In particular, we use residual connections and a layer normalization (either pre-norm or post-norm) in the style of standard Transformer architectures. Whether to use pre-norm or post-norm was chosen on a per-dataset basis, and depended on whether the model overﬁt; recent results have shown that pre-norm architectures are more stable [15, 35], so we used it on harder datasets with less overﬁtting. We note that we could have additionally inserted MLP modules in between LSSL layers, in the style of Transformers [57], but did not experiment with this.
+Parameter count. The overall parameter count of an LSSL model is M · H · (H + N ). We primarily used two model sizes in our experiments, which were chosen simply to produce round
+numbers of parameters:
+• LSSL small (≈ 200K parameters): 6 layers, H = 128, N = 128, M = 1.
+• LSSL large (≈ 2M parameters): 4 layers, H = 256, N = 256, M = 4.
+We did not search over additional sizes, but for some datasets reduced the model size for computational reasons.
+18
+
+C LSSL Proofs
+This section gives reﬁnements of the statements in Section 3, additional results, and proofs of all results. Appendix C.1 has a more detailed (and self-contained) summary of basic methods in ODE approximation
+which will be used in the results and proofs. Appendix C.2 give more general statements and proofs of Lemma 3.1 and Lemma 3.2 in Lemma C.1 and
+Theorem 4, respectively.
+
+C.1 Approximations of ODEs
+
+We consider the standard setting of a ﬁrst-order initial value problem (IVP) ordinary diﬀerential equation
+
+(ODE) for a continuous function f (t, x)
+
+x˙ (t) = f (t, x(t))
+
+.
+
+(9)
+
+x(t0) = x0
+
+This diﬀerential form has an equivalent integral form
+
+t
+
+x(t) = x0 + f (s, x(s)) ds.
+
+(10)
+
+t0
+
+Appendices C.1.1 and C.1.2 overview the Picard theorem and ﬁrst-order numerical integration methods, which apply to any IVP (9). Appendix C.1.3 then shows how to specialize it to linear systems as in equation (1).
+At a high level, the basic approximation methods considered here use the integral form (10) and approximate the integral in the right-hand side by simple techniques.
+
+C.1.1 Picard Iteration
+The Picard-Lindelöf Theorem gives suﬃcient conditions for the existence and uniqueness of solutions to an IVP. As part of the proof, it provides an iteration scheme to compute this solution.
+
+Theorem 3 (Picard-Lindelöf). In the IVP (9), if there is an interval around t0 such that f is Lipschitz in
+its second argument, then there is an open interval I t0 such that there exists a unique solution x(t) to the IVP in I. Furthermore, the sequence of Picard iterates x(0), x(1), . . . deﬁned by
+
+x(0)(t) = x0 x( )(t) = x0 +
+
+t
+f (s, x( −1)(s)) ds
+t0
+
+converges to x.
+
+The Picard iteration can be viewed as approximating (10) by holding the previous estimate of the solution x( −1) ﬁxed inside the RHS integral.
+
+C.1.2 Numerical Integration Methods
+
+Many methods for numerical integration of ODEs exist, which calculate discrete-time approximations of the solution. We discuss a few of the simplest methods, which are ﬁrst-order methods with local error O(h2) [6].
+These methods start by discretizing (10) into the form
+
+tk
+
+x(tk) − x(tk−1) =
+
+f (s, x(s)) ds.
+
+(11)
+
+tk−1
+
+Here we assume a sequence of discrete times t0, t1, t2, . . . is ﬁxed. For convenience, let xk denote x(tk) and let ∆tk := tk − tk−1. The goal is now to approximate the integral in the RHS of (11).
+
+19
+
+Euler method. The Euler method approximates (11) by holding the left endpoint constant throughout
+
+the integral (i.e., the “rectangle rule” with left endpoint), f (s, x(s)) ≈ f (tk−1, x(tk−1)). The discrete-time
+
+update becomes
+
+xk − xk−1 = (tk − tk−1)f (tk−1, x(tk−1)) = ∆tkf (tk−1, xk−1).
+
+(12)
+
+Backward Euler method. The backward Euler method approximates (11) by holding the right endpoint constant throughout the integral (i.e., the “rectangle rule” with right endpoint), f (s, x(s)) ≈ f (tk, x(tk)). The discrete-time update becomes
+xk − xk−1 = (tk − tk−1)f (tk, x(tk)) (13) = ∆tkf (tk, xk).
+
+C.1.3 Discretization of State-Space Models In the case of a linear system, the IVP is specialized to the case
+
+f (t, x(t)) = Ax(t) + Bu(t).
+
+Note that here u is treated as a ﬁxed external input, which is constant from the point of view of this ODE in x. Let uk denote the average value in each discrete time interval,
+
+1 uk = ∆tk
+
+tk
+u(s) ds.
+tk−1
+
+The integral equation (11) can be specialized to this case, and more generally a convex combination of the
+
+left and right endpoints can be taken to approximate the integral, weighing them by 1 − α and α respectively.
+
+Note that the case α = 0, 1 are specializations of the forward and backward Euler method, and the case
+
+α
+
+=
+
+1 2
+
+is
+
+the
+
+classic
+
+“trapezoid
+
+rule”
+
+for
+
+numerical
+
+integration.
+
+x(tk) − x(tk−1) = =
+
+tk
+
+tk
+
+Ax(s) ds +
+
+Bu(s) ds
+
+tk−1
+
+tk−1
+
+tk
+
+Ax(s) ds + ∆tkBuk
+tk−1
+
+≈ ∆tk [(1 − α)Axk−1 + αAxk] + ∆tkBuk.
+
+Rearranging yields
+
+(I − α∆tk · A)xk = (I + (1 − α)∆tk · A)xk−1 + ∆tk · Buk xk = (I − α∆tk · A)−1(I + (1 − α)∆tk · A)xk−1 + (I − α∆tk · A)−1∆tk · Buk
+
+This derives the generalized bilinear transform (GBT) [61]. The bilinear method is the case
+
+α
+
+=
+
+1 2
+
+of
+
+special
+
+signiﬁcance,
+
+and
+
+was
+
+numerically
+
+found
+
+to
+
+be
+
+better
+
+than
+
+the
+
+forward
+
+and
+
+backward
+
+Euler
+
+methods α = 0, 1 both in synthetic function approximation settings and in end-to-end experiments [24, Figure
+
+4].
+
+C.2 RNNs are LSSLs: Proof of Results in Section 3.2
+We provide more detailed statements of Lemmas 3.1 and 3.2 from Section 3.2. In summary, LSSLs and popular families of RNN methods all approximate the same continuous-time dynamics
+
+x˙ (t) = −x + f (t, x(t))
+
+(14)
+
+by viewing them with a combination of two techniques. We note that these results are about two of the most commonly used architecture modiﬁcations for RNNs.
+First, the gating mechanism is ubiquitous in RNNs, and usually thought of as a heuristic for smoothing
+
+20
+
+Table 6: A summary of the characteristics of popular RNN methods and their approximation mechanisms for capturing the dynamics x˙ (t) = −x(t) + f (t, x(t)) (equation (14)). The LSSL entries are for the very speciﬁc case with order N = 1 and A = −1, B = 1, C = 1, D = 0; LSSLs are more general.
+
+Method Variant Special cases
+Deep? Continuous? Linear?
+Approximation Depth-wise Time-wise
+
+RNN Gated LSTM [28], GRU [14]
+Single-layer Discrete-time Non-linear
+Backwards Euler
+
+RNN Gated, linear QRNN [5], SRU [33]
+Deep Discrete-time Linear
+Picard iteration GBT(α = 1)
+
+LSSL Discrete (4)+(5)
+Deep Discrete-time Linear
+Picard iteration GBT(α = 12 ) (i.e. Bilinear)
+
+LSSL Continuous (1)+(2)
+Deep Continuous-time Linear
+Picard iteration -
+
+optimization [28]. Second, many of the eﬀective large-scale RNNs use linear (gated) recurrences and deeper models, which is usually thought of as a heuristic for computational eﬃciency [5]. Our results suggest that neither of these are heuristics after all, and arise from standard ways to approximate ODEs.
+To be more speciﬁc, we show that:
+• Non-linear RNNs discretize the dynamics (14) by applying backwards Euler discretization to the linear term, which arises in the gating mechanism of RNNs (Appendix C.2.2, Lemma C.1).
+• A special case of LSSLs approximates the dynamics (14) (in continuous-time) by applying Picard iteration to the non-linear term (Appendix C.2.3, Theorem 4).
+• Deep linear RNNs approximate the dynamics (14) with both Picard iteration in the depth direction to linearize the non-linear term, and discretization (gates) in the time direction to discretize the equation (Appendix C.2.4, Corollary C.3).
+A comparison is summarized in Table 6. In the remainder of this section, we assume that there is an underlying function x(t) that satisﬁes (14) on
+some interval for any initial condition, and that f is continuous and Lipschitz in its second argument. Our goal is to show that several families of models approximate this in various ways.
+
+C.2.1 Intuition / Proof Sketches
+We sketch the idea of how LSSLs capture popular RNNs. More precisely, we will show how approximating the dynamics (14) in various ways lead to types of RNNs and LSSLs.
+The ﬁrst step is to look at the simpler dynamics
+
+x˙ (t) = −x(t) + u(t)
+
+where there is some input u(t) that is independent of x. (In other words, in (14), the function f (t, x) does not depend on the second argument.)
+By directing applying the GBT discretization with α = 1, this leads to a gated recurrence (Lemma 3.1). The second step is that by applying the backwards Euler discretization more directly to (14), this leads to a gated RNN where the input can depend on the state (Lemma C.1). Alternatively, we can apply Picard iteration on (14), which says that the iteration
+
+t
+
+t
+
+x( )(t) = x0 + −x( −1)(s) ds + f (s, x( −1)(s)) ds
+
+t0
+
+t0
+
+converges to the solution x(t).
+However, the ﬁrst integral term is simple and can be tightened. We can instead try to apply Picard iteration on only the second term, leaving the ﬁrst integral in terms of x( ). Intuitively this should still
+
+21
+
+converge to the right solution, since this is a weaker iteration; we’re only using the Picard approximation on the second term.
+
+t
+
+t
+
+x( )(t) = x0 + −x( )(s) ds + f (s, x( −1)(s)) ds
+
+t0
+
+t0
+
+Diﬀerentiating, this equation is the ODE
+
+x˙ ( )(t) = −x( )(t) + f (t, x( −1)(t))
+
+This implies that alternating point-wise functions with a simple linear ODE x˙ ( )(t) = −x( )(t) + u( )(t) also captures the dynamics (14). But this is essentially what an LSSL is.
+To move to discrete-time, this continuous-time layer can be discretized with gates as in Lemma 3.1, leading to deep linear RNNs such as the QRNN, or with the bilinear discretization, leading to the discrete-time LSSL. We note again that in the discrete-time LSSL, A and B play the role of the gates σ, 1 − σ.
+
+C.2.2 Capturing gates through discretization Lemma C.1. Consider an RNN of the form
+
+xk = (1 − σ(zk))xk−1 + σ(zk)f (k, xk−1),
+
+(15)
+
+where f (k, x) is an arbitrary function that is Lipschitz in its second argument (e.g., it may depend on an
+
+external input uk).
+
+Then equation (15) is a discretization of the dynamics (14) with step sizes ∆tk = exp(zk), i.e. xk ≈ x(tk)
+
+where tk =
+
+k i=1
+
+∆ti.
+
+Proof. Apply the backwards Euler discretization (13) to equation (14) to get
+
+xk − xk−1 = ∆tk [−xk + f (tk, xk)]
+
+(1 + ∆tk)xk = xk−1 + ∆tkf (tk, xk)
+
+xk = 1 xk−1 + ∆tk f (tk, xk).
+
+1 + ∆tk
+
+1 + ∆tk
+
+Note that 1+∆∆tktk = 1+ezekzk = 1+e1−zk and 1+1∆tk = 1 − 1+∆∆tktk , thus
+
+xk = (1 − σ(zk))xk−1 + σ(zk)f (k, xk−1).
+
+Here we are denoting f (k, x) = f (tk, x) to be a discrete-time version of f evaluatable at the given timesteps tk .
+Note that a potential external input function u(t) or sequence uk is captured through the abstraction f (t, x). For example, a basic RNN could deﬁne f (k, x) = f (tk, x) = tanh(W x + U uk).
+
+C.2.3 Capturing non-linearities through Picard iteration
+The main result of this section is Theorem 4 showing that LSSLs can approximate the same dynamics as the RNNs in the previous section. This follows from a technical lemma.
+Lemma C.2. Let f (t, x) be any function that satisﬁes the conditions of the Picard-Lindelöf Theorem (Theorem 3).
+Deﬁne a sequence of functions x( ) by alternating the (point-wise) function f with solving an ODE
+x(0)(t) = x0 u( )(t) = f (t, x( −1)(t)) x˙ ( )(t) = Ax( )(t) + u( )(t).
+
+22
+
+Then x( ) converges to a solution x( )(t) → x(t) of the IVP
+
+x˙ (t) = Ax(t) + f (t, x(t)) x(t0) = x0.
+
+Theorem 4. A (continuous-time) deep LSSL with order N = 1 and A = −1, B = 1, C = 1, D = 0 approximates the non-linear dynamics (14).
+Proof. Applying the deﬁnition of an LSSL (equations (1)+(2)) with these parameters results in a layer mapping u(t) → y(t) where y is deﬁned implicitly through the ODE
+
+y˙(t) = −y(t) + u(t).
+
+This can be seen since the choice of C, D implies y(t) = x(t) and the choice of A, B gives the above equation. Consider the deep LSSL deﬁned by alternating this LSSL with position-wise (in time) non-linear functions
+u( )(t) = f (t, y( −1)(t)) y˙( )(t) = −y( )(t) + u( )(t).
+
+But this is exactly a special case of Lemma C.2, so that we know y( )(t) → y(t) such that y(t) satisﬁes
+
+y˙(t) = −y(t) + f (t, y(t))
+
+as desired.
+
+Proof of Lemma C.2. Let
+
+z(t) = e−Atx(t)
+
+(and z0 = z(t0) = x(t0) = x0). Note that
+z˙(t) = e−At [x˙ (t) − Ax(t)] = e−Atf (t, x(t)) = e−Atf (t, eAtz(t)).
+
+Since f satisﬁes the conditions of the Picard Theorem (i.e., is continuous in the ﬁrst argument and Lipschitz in the second), so does the function g where g(t, x) := e−Atf (t, eAtx) for some interval around the initial
+time. By Theorem 3, the iterates z( ) deﬁned by
+
+t
+z( )(t) = z0 + e−Asf (s, eAsz( −1)(s)) ds
+t0
+
+(16)
+
+converges to z. Deﬁne x( )(t) = eAtz( )(t). Diﬀerentiate (16) to get
+
+z˙( )(t) = e−Atf (t, eAtz( −1)(t)) = e−Atf (t, x( −1)(t)) = e−Atu( )(t).
+
+But z˙( )(t) = e−At x˙ ( )(t) − Ax( )(t) ,
+
+so x˙ ( )(t) = Ax( )(t) + u( )(t).
+
+Since z( ) → z and x( )(t) = eAtz( )(t) and x(t) = eAtz(t), we have x( ) → x.
+
+23
+
+C.2.4 Capturing Deep, Linear, Gated RNNs
+We ﬁnally note that several types of RNNs exist which were originally motivated by approximating linearizing gated RNNs for speed. Although these were treated as a heuristic for eﬃciency reasons, they are explained by combining our two main technical results.
+Lemma C.1 shows that a single-layer, discrete-time, non-linear RNN approximates the dynamics (14) through discretization, which arises in the gating mechanism.
+Theorem 4 shows that a deep, continuous-time, linear RNN approximates (14) through Picard iteration, where the non-linearity is moved to the depth direction.
+Combining these two results leads to Corollary C.3, which says that a deep, discrete-time, linear RNN can also approximate the same dynamics (14).
+
+Corollary C.3. Consider a deep, linear RNN of the form
+
+x(k ) = (1 − σ(zk))x(k−) 1 + σ(zk)u(k ) u(k ) = f (k, xk( −1)).
+
+This is a discretization of the dynamics (14) with step sizes ∆tk = exp(zk), i.e. xk ≈ x(tk) where tk =
+
+k i=1
+
+∆ti.
+
+Proof. By Lemma C.1, the ﬁrst equation is a discretization of the continuous-time equation
+
+x˙ ( )(t) = −x( )(t) + u( )(t)
+
+where
+
+u( )(t) = f (t, x( −1)(t))
+
+uses the continuous-time version f of f . But by Lemma C.2, this is an approximation of the dynamics (14) using Picard iteration.
+Notable examples of this type of model include the Quasi-RNN or QRNN [5] and the Simple Recurrent Unit (SRU) [33], which are among the most eﬀective models in practice. We remark that these are the closest models to the LSSL and suggest that their eﬃcacy is a consequence of the results of this section, which shows that they are not heuristics.
+We note that there are many more RNN variants that use a combination of these gating and linearization techniques that were not mentioned in this section, and can be explained similarly.
+
+D LSSL Proofs and Algorithms
+This section proves the results in Section 4.1, and is organized as follows:
+• Appendix D.1 gives a self-contained synopsis of the HiPPO framework [24].
+• Appendix D.2 proves Theorem 1, which shows that the hippo operators for any measure lead to a simple linear ODE of the form of equation (1).
+• Appendix D.3 proves Corollary 4.1, including a formal deﬁnition of quasiseparable matrices (i.e., how LSSL matrices are deﬁned) in Deﬁnition 4.
+Notation This section is technically involved and we adopt notation to simplify reasoning about the shapes of objects. In particular, we use bold capitals (e.g. A) to denote matrices and bold lowercase (e.g. b) to denote vectors. For example, equation (1) becomes x˙ = Ax + bu. These conventions are adopted throughout Appendices D and E.
+
+24
+
+D.1 Preliminaries: HiPPO Framework and Recurrence Width
+This section summarizes technical preliminaries taken directly from prior work. We include this section so that this work is self-contained and uses consistent notation, which may deviate from prior work. For example, we use modiﬁed notation from Gu et al. [24] in order to follow conventions in control theory (e.g., we denote input by u and state by x as in (1)).
+Appendix D.1.1 formally deﬁnes the HiPPO operator mathematically as in [24, Section 2.2], and Appendix D.1.2 overviews the steps to derive the HiPPO operator as in [24, Appendix C]. Appendix D.1.3 deﬁnes the class of Low Recurrence Width (LRW) matrices, which is the class of matrices that our generalization of the HiPPO results (Theorem 1) uses.
+
+D.1.1 Deﬁnition of HiPPO Operator
+Deﬁnition 1 ([24], Deﬁnition 1). Given a time-varying measure µ(t) supported on (−∞, t], an N-dimensional subspace G of polynomials, and a continuous function u : R≥0 → R, HiPPO deﬁnes a projection operator projt and a coeﬃcient extraction operator coeft at every time t, with the following properties:
+1. projt takes a function u restricted up to time t, u≤t := u(x)|x≤t, and maps it to a polynomial g(t) ∈ G, that minimizes the approximation error u≤t − g(t) L2(µ(t)).
+2. coeft : G → RN maps the polynomial g(t) to the coeﬃcients c(t) ∈ RN of the basis of orthogonal polynomials deﬁned with respect to the measure µ(t).
+The composition coeft ◦ projt is called hippo, which is an operator mapping a function u : R≥0 → R to the optimal projection coeﬃcients c : R≥0 → RN (i.e (hippo(u))(t) = coeft(projt(f )).
+
+D.1.2 HiPPO Framework for Deriving the HiPPO Operator
+The main ingredients of HiPPO consists of an approximation measure and an orthogonal polynomial basis. We recall how they are deﬁned in [24] (we note that compared to Gu et al. [24], our notation has changed from input f (t) coeﬃcients (state) c(t) to input u(t) and coeﬃcients (state) x(t), following conventions in controls).
+
+Approximation Measures At every t, the approximation quality is deﬁned with respect to a measure
+µ(t) supported on (−∞, t]. We assume that the measures µ(t) have densities ω(t, Y ) := ddµY(t) . Note that this implies that integrating with respect to dµ(t) is the same as integrating with respect to ω(t, Y ) dY .
+
+Orthogonal Polynomial basis Let {Pn(t)}n∈N denote a sequence of orthogonal polynomials with respect to some time-varying measure µ(t). Let p(nt) be the normalized version of of orthogonal Pn(t), and deﬁne
+pn(t, Y ) = p(nt)(Y ).
+In particular, the above implies that
+t
+p(nt)(Y ) · p(mt)(Y )ω(t, Y ) dY = δm,n.
+−∞
+In the general framework, HiPPO does not require an orthogonal polynomial basis as the selected basis. The choice of basis is generalized by tilting with χ.
+
+Tilted measure and basis For any scaling function χ(t, Y ), the functions pn(t, Y )χ(t, Y ) are orthogonal
+
+with respect to the density
+
+ω χ2
+
+at every time t.
+
+Deﬁne ν(t) to be the normalized measure with density
+
+proportional to χω2 , with normalization constant ζ(t) = 0t χω((tt,,YY))2 dx.
+
+We express the coeﬃcients xn(t) calculated by the HiPPO framework as:
+
+1
+
+t
+
+ω(t, Y )
+
+xn(t) = ζ(t) 0 u(Y )pn(t, Y ) χ(t, Y ) dY. (17)
+
+25
+
+To use this to derive x˙ n(t), let h(t, Y ) = u(Y )pn(t, Y )ω(t, Y ). We see that
+
+dt x˙ n(t) = dt 0 u(Y )pn(t, Y )ω(t, Y )dY
+
+dt
+
+=
+
+h(t, Y )dY
+
+dt 0
+
+t∂
+
+=
+
+h(t, Y )dY + h(t, t)
+
+0 ∂t
+
+t
+
+∂
+
+t
+
+∂
+
+= 0 u(Y ) ∂t pn (t, Y ) ω (t, Y ) dY + 0 f (Y )pn (t, Y ) ∂t ω (t, Y ) dY
+
++ u(t)pn(t, t)ω(t, t).
+
+This allows x˙ n(t) to be written as
+
+t
+
+∂
+
+x˙ n(t) = u(t)pn(t, t)ω(t, t) + 0 u(Y ) ∂t pn (t, Y ) ω (t, Y ) dY
+
+t
+
+∂
+
++ 0 f (Y )pn (t, Y ) ∂t ω (t, Y ) dY. (18)
+
+Although Gu et al. [24] describe the framework in the full generality above and use χ as another degree of freedom, in their concrete derivations they always ﬁx χ = ω. Our general results also use this setting. For the remainder of this section, we assume the “full tilting” case χ = ω. In particular, this means that in Eq. (18), we essentially substitute ω above with 1 and divide each term by the inverse square root of our normalization constant, ζ, to get the coeﬃcient dynamics that we will use in our arguments:
+
+1
+
+1
+
+t
+
+∂
+
+x˙ n(t) = ζ(t) u(t)pn(t, t) + ζ(t) 0 u(Y ) ∂t pn (t, Y ) dY (19)
+
+Now, if we can show that each of the integrated terms in (18) are linear combinations of xn(t), this would be the same as saying that x˙ n(t) = A(t)x(t) + b(t)u(t) for some A(t). Therefore, the incremental update operation would be bounded by the runtime of the matrix-vector operation A(t)x(t).
+
+D.1.3 Recurrence Width
+
+Our ﬁnal goal is to show that x˙ n(t) = A(t)x(t) + b(t)u(t) for some A(t) with constant recurrence width (see Deﬁnition 2). This will show Theorem 1, and also imply that the MVM A(t)x(t) can be computed in O˜(N ) time. To build this argument, we borrow the fact that OPs all have recurrence width 2 and results regarding matrix-vector multiplication of matrices with constant recurrence width along with their inverses.
+
+Deﬁnition 2 ([17]). An N × N matrix A has recurrence width t if the polynomials ai(X) = satisfy deg(ai) ≤ i for i < t, and
+t
+ai(X) = gi,j (X)ai−j (X)
+j=1
+
+Nj=−01 A[i, j]Xj
+
+for i ≥ t, where the polynomials gi,j ∈ R[X] have degree at most j.
+
+Theorem 5 ([17], Theorem 4.4). For any N × N matrix A with constant recurrence width, any vector x ∈ Rn, Ax can be computed with O˜(N ) operations over R.
+
+Theorem 6 ([17], Theorem 7.1). For any N × N matrix A with constant recurrence width, any vector x ∈ Rn, A−1x can be computed with O˜(N ) operations over R.
+
+For the rest of the note we’ll assume that any operation over R can be done in constant time. It would be
+
+useful for us to deﬁne P ∈ RN×N such that the coeﬃcients of the OP pi(X), i.e. pi(X) =
+
+N −1 j=0
+
+P[i,
+
+j
+
+]X
+
+j
+
+.
+
+26
+
+D.2 Proof of Theorem 1
+This section proves Theorem 1, which is restated formally in Corollary D.4. Appendix D.2.1 proves some results relating orthogonal polynomials to recurrence width (Appendix D.1.3). Appendix D.2.2 proves Corollary D.4. Appendices D.2.3 and D.2.4 provides examples showing how Corollary D.4 can be specialized to exactly recover the HiPPO-LegT, HiPPO-LagT, HiPPO-LegS methods [24].
+
+D.2.1 Relating Orthogonal Polynomials and Recurrence Width
+
+Next we introduce the following lemma, which will be useful in our arguments:
+
+Lemma D.1. For any n, there exists ordered sets of coeﬃcients αn = {αn,i}, βn = {βn,i},
+
+(i) pn(Z) =
+
+n−1 i=0
+
+αn,ipi(Z
+
+)
+
+(ii) Zpn(Z) =
+
+n−1 i=0
+
+βn,ipi(Z
+
+)
+
+Proof. Follows from the fact that pi(z) for 0 ≤ i < N forms a basis and the observation of the degrees of the polynomials on the LHS.
+
+The following matrices will aid in showing verifying that matrix vector multiplication with a given matrix A can be computed in O(N˜ ) time.
+
+Deﬁnition 3. D1, D2 ∈ RN×N are the matrices such that
+
+N −1
+
+N −1
+
+pi(Z) = D1[i, j]Zj, and Zpi(Z) = D2[i, j]Zj.
+
+j=0
+
+j=0
+
+Let S be the “right shift" matrix, i.e. for any matrix M, MS has the columns of M shifted to right by one. Note that ST corresponds to the “left shift" matrix.
+We now note that:
+
+Lemma D.2. D1 = P · diag(0, 1, . . . , N − 1) · ST and D2 = P · diag(0, 1, . . . , N − 1). In particular, D1z and D2z can be computed in O˜(N ) time for any z ∈ RN .
+
+Proof. Recall that P has the coeﬃcients of the OP polynomials p0(Z), . . . , pN−1(Z) as its rows. Then note that
+n−1
+
+pn(Z) = i · P[n, i] · Zi−1.
+
+(20)
+
+i=0
+
+The claim on D1 = P · diag(0, 1, . . . , N − 1) · ST follows from the above. Recall that D has recurrence width
+of 2. The claim on the runtime of computing D1z then follows from Theorem 5 and the fact that both diag(0, 1, . . . , N − 1) and ST is n-sparse.
+
+From Eq. (20), it is easy to see that
+
+n−1
+Zpn(Z) = i · P[n, i] · Zi.
+i=0
+
+The claim on the structure of D2 then follows from the above expression. The claim on runtime of computing D2z follows from essentially the same argument as for D1z.
+
+Finally, we make the following observation:
+Lemma D.3. Let A and B be deﬁned such that A [n, i] = αn,i and B [n, i] = βn,i. Then both A and B are both products of three matrices: two of which have recurrence width at most 2 and the third is the inverse of a matrix that has recurrence width 2.
+Proof. We note that since P expresses the orthogonal polynomials in standard basis, P−1 changes from OP basis to standard basis. This along with Lemma D.2 implies that A = P · diag(0, 1, . . . , N − 1) · ST · P−1. It is easy to check that diag(0, 1, . . . , N − 1) · ST has recurrence width 1 and the claim on A follows since P has recurrence width 2. A similar argument proves the claim on B .
+
+27
+
+D.2.2 HiPPO for General Measures
+
+Let θ : R≥0 → R≥0 be a function such that for all t, θ(t) ≤ t and θ(t) is diﬀerentiable.
+
+In what follows, deﬁne
+
+2(Y − t)
+
+z=
+
++ 1.
+
+θ(t)
+
+We note that dz = 2 . (21) dY θ(t)
+
+Further, note that:
+
+dz d 2(Y − t)
+
+=
+
++1
+
+dt dt θ(t)
+
+2 2(Y − t)θ (t)
+
+=− − θ(t)
+
+θ2(t)
+
+2 = − θ2(t) (θ(t) + (Y − t)θ (t)) .
+
+From the deﬁnition of z, we see that Y − t = (z−12)θ(t) . Then
+
+dz
+
+2
+
+z−1
+
+=−
+
+1+
+
+θ (t)
+
+dt θ(t)
+
+2
+
+= − 2 − (z − 1)θ (t) . (22)
+
+θ(t)
+
+θ(t)
+
+Additionally, given a measure ω on [-1,1] and OP family p0(Y ), p1(Y ), . . . such that for all i = j,
+
+1
+pi(Y )pj(Y )ω(Y )dY = δi,j,
+−1
+
+deﬁne
+
+Then we can adjust (17) to:
+
+ω(Y, t) = 2 ω(z) and pn(Y, t) = pn(z). θ(t)
+
+t
+
+2
+
+xn(t) = t−θ(t) u(Y )pn(z) θ(t) dY. (23)
+
+The Leibniz integral rule states that
+
+∂ β(t)
+
+β(t) ∂
+
+h(t, Y )dY =
+
+h(t, Y )dY − α (t)h(α(t), t) + β (t)h(t, t).
+
+∂t α(t)
+
+α(t) ∂t
+
+If we let α(t) = t − θ(t) and β(t) = t, then applying the Leibniz rule to (23) we get:
+
+t
+
+∂
+
+2
+
+2
+
+x˙ n(t) = t−θ(t) u(Y ) ∂t pn(z) θ(t) dY − (1 − θ (t))u(t − θ(t))pn(t − θ(t), t) θ(t)
+
+2 + u(t)pn(t, t) θ(t)
+
+2
+
+2
+
+= −(1 − θ (t))u(t − θ(t))pn(−1) θ(t) + u(t)pn(1) θ(t)
+
+t
+
+dz
+
+2
+
+θ (t) t
+
+2
+
++ t−θ(t) u(Y ) dt pn(z) θ(t) dY − θ(t) t−θ(t) u(Y )pn(z) θ(t) dY.
+
+28
+
+From (22), it follows that
+
+2(1 − θ (t))u(t − θ(t))pn(−1) 2 · u(t)pn(1) 2 t
+
+2
+
+x˙ n(t) = − θ(t)
+
++ θ(t) − θ(t) t−θ(t) u(Y )pn(z) θ(t) dY −
+
+θ (t) t
+
+2
+
+θ (t) t
+
+2
+
+θ(t) t−θ(t) u(Y )(z − 1)pn(z) θ(t) dY − θ(t) t−θ(t) u(Y )pn(z) θ(t) dY. (24)
+
+Because deg (pn(z)) ≤ n − 1 and deg ((z − 1)pn(z)) ≤ n, they can be written as a linear combination of {pi}i≤n. Let us deﬁne {αn,j}, {βn,j} such that
+
+n−1
+
+n
+
+pn(z) = αn,jpj(z) and (z − 1)pn(z) = βn,jpj(z).
+
+j=0
+
+j=0
+
+(25)
+
+Then by using (25) in (24), we get:
+
+x˙ n(t) = − 2(1 − θ (t))u(t + θ(t))pn(−1) + 2 · u(t)pn(1)
+
+θ(t)
+
+θ(t)
+
+2 n−1 − θ(t) αn,j
+j=0
+
+t
+
+2
+
+t−θ(t) u(Y )pj (z) θ(t) dY
+
+θ (t) n − θ(t) βn,j
+j=0
+
+t
+
+2
+
+θ (t)
+
+t−θ(t) u(Y )pj(z) θ(t) dY − θ(t)
+
+t
+
+2
+
+t−θ(t) u(Y )pn(z) θ(t) dY
+
+= − 2(1 − θ (t))u(t + θ(t))pn(−1) + 2 · u(t)pn(1)
+
+θ(t)
+
+θ(t)
+
+2 n−1
+
+θ (t) n
+
+θ (t)
+
+− θ(t)
+
+αn,jxj(t) − θ(t)
+
+βn,jxj(t) − θ(t) xn(t).
+
+j=0
+
+j=0
+
+Thus, in vector form we get
+
+Theorem 7.
+
+ ... 
+
+ ... 
+
+1
+
+2
+
+
+
+2
+
+
+
+x˙ n(t) = − A1(t)x(t) − (1 − θ (t))u(t − θ(t)) pn(−1) + u(t) pn(1)
+
+θ(t)
+
+θ(t)
+
+ ..  θ(t)  .. 
+
+.
+
+.
+
+ 2αn,k + θ (t)βn,k  where A1(t)[n, k] = θ (t)βn,n + θ (t)
+0
+
+if k < n if k = n otherwise
+
+for αn,k,βn,k as deﬁned in (25).
+
+Corollary D.4. The matrix A1 in Theorem 7 can be re-written as
+
+A1 = 2 · A + θ (t) · B + θ (t) · I.
+
+(26)
+
+In particular, both A and B both products of three matrices: two of which have recurrence width at most 2 and the third is the inverse of a matrix that has recurrence width 2.
+
+Proof. Eq. (26) follows from Theorem 7 and deﬁning A and B to contain the αn,k and βn,k coeﬃcients.
+
+D.2.3 Translated HiPPO (Sliding Windows)
+The case when θ(t) = θ for all t represents a constant-size sliding window, which Gu et al. [24] denote as the “Translated HiPPO” case with instantiations such as HiPPO-LegT (Translated Legendre) and HiPPO-LagT (Translated Laguerre).
+We now state a corollary of Theorem 7 for the case of θ(t) = θ for all t.
+
+29
+
+Corollary D.5. Let θ(t) = θ for all t. Then
+
+ ... 
+
+ ... 
+
+1
+
+2
+
+
+
+2  
+
+x˙ n(t) = − A1x(t) − u(t − θ) pn(−1) + u(t) pn(1) .
+
+θ
+
+θ
+
+ ..  θ  .. 
+
+.
+
+.
+
+where A1[n, j] = 2αn,k 0
+
+if k < n .
+otherwise
+
+Next, we use the approximation
+
+N −1
+u(x) ≈ xk(t)pk(z).
+k=0
+
+to handle the u(t − θ) term in Corollary D.5.
+
+Corollary D.6. Let θ(t) = θ for all t. Then
+
+ ... 
+
+1
+
+2 
+
+x˙ n(t) ≈ − Ax(t) + u(t) pn(1)
+
+θ
+
+θ  .. 
+
+.
+
+where A = A1 + 2A2 for A1 as deﬁned in Corollary D.5 and A2[n, k] = pn(−1)pk(−1).
+
+Proof. To approximate u(t − θ), we note that when Y = t − θ, z = −1. Then
+
+Then by Corollary D.5,
+
+N −1
+u(t − θ) ≈ xk(t)pk(−1).
+k=0
+
+N −1
+
+ ... 
+
+ ... 
+
+x˙ n(t) ≈ − 1 A1x(t) − 2 xk(t)pk(−1) pn(−1) + 2 u(t) pn(−1) . (27)
+
+θ θ k=0
+
+ ...  θ  ... 
+
+Let us deﬁne a matrix, A2 ∈ RN×N matrix such that A2[n, k] = pn(−1)pk(−1). Then the claim follows.
+
+We now show that the special case of Corollary D.6 for Legendre matches the results from [24]. Corollary D.7. Let pn(z) = 2n2+1 1/2 Pn(z) where Pn(z) are the Legendre polynomials. Then
+
+where
+1
+and b[n] = 2n2+1 2 .
+
+1
+
+2
+
+x˙ n(t) ≈ θ Ax(t) + θ bu(t)
+
+1
+
+1
+
+A[n, k] = (2n + 1) 2 (2k + 1) 2
+
+1 (−1)n−k
+
+if k ≤ n ,
+if k ≥ n
+
+30
+
+Proof. From Corollary D.6,
+
+ ... 
+
+1
+
+2 
+
+x˙ n(t) ≈ − Ax(t) + u(t) pn(1)
+
+θ
+
+θ  ... 
+
+where A = A1 + 2A2 for A1 as deﬁned in Corollary D.5 and A2[n, k] = pn(−1)pk(−1). It is known from (7.21.1) and in [53] that
+
+1
+
+pn(−1) =
+
+2n + 1
+
+2
+Pn(−1) and Pn(−1) = (−1)n.
+
+(28)
+
+2
+
+Further,
+
+1
+
+2n + 1 2
+
+pn(1) =
+
+Pn(1) and Pn(1) = 1.
+
+(29)
+
+2
+
+1
+
+Then b[n] =
+
+2n+1 2
+
+2 follows from Corollary D.6 and (29).
+
+From the following recurrence relations [1, Chapter 12]:
+
+implies that
+
+(2n + 1)Pn(z) = Pn+1(z) + Pn−1(z)
+
+which in turn implies Pn+1(z) = (2n + 1)Pn(z) + (2n + 1)Pn−2(z) + · · · +,
+
+Then
+
+Pn = (2n − 1)Pn−1(z) + (2n − 5)Pn−3(z) + . . . .
+
+pn(z) = =
+
+2n + 1 2
+2n + 1 2
+
+1 2
+· Pn(z)
+1 2
+(2n − 1)
+
+2 2n − 1
+
+1 2
+Pn−1(z) + (2n − 5)
+
+2 2n − 5
+
+1
+
+1
+
+1
+
+= (2n + 1) 2 (2n − 1) 2 Pn−1(z) + (2n − 5) 2 Pn−3(z) + . . . .
+
+1 2
+Pn−3(z) + . . .
+
+Thus, we have
+
+(2n
+
++
+
+1)
+
+1 2
+
+(2k
+
++
+
+1)
+
+1 2
+
+if
+
+k<n
+
+and
+
+n−k
+
+is
+
+odd,
+
+αn,k = 0 is otherwise. ,
+
+Recalling that A1[n, k] = 2αn,k.
+We note that from (28), A2[n, k] = Recalling A = A1 + 2A2, we get:
+
+1
+2n+1 2 2
+
+1
+
+1
+
+1
+
+2k2+1 2 (−1)n(−1)k = (2n+1) 22(2k+1) 2 (−1)n−k.
+
+ 2
+
++
+
+(−1)n−k
+
+
+
+A[n,
+
+k]
+
+=
+
+(2n
+
++
+
+1
+1) 2
+
+(2k
+
++
+
+1
+1) 2
+
+ 0
+
++
+
+(−1)n−k
+
+(−1)n−k
+
+Note that the above is the same as:
+
+if k < n if k < n if k ≥ n
+
+and n − k is odd and n − k is even .
+
+1
+
+1
+
+A[n, k] = (2n + 1) 2 (2k + 1) 2
+
+which completes our claim.
+
+1 (−1)n−k
+
+if k ≤ n , if k ≥ n
+
+31
+
+D.2.4 Scaled HiPPO: Recovering HiPPO-LegS
+We now use Theorem 7 to recover the HiPPO-LegS instantiation for the “Scaled Legendre” measure, the main method from Gu et al. [24].
+Corollary D.8. Let pn(z) = 2n2+1 1/2 Pn(z) where Pn(z) are the Legendre polynomials and let δ(t) = t for all t. Then
+
+1
+
+2
+
+x˙ n(t) = t Ax(t) + t bu(t)
+
+where
+
+
+
+1
+
+1
+
+(2n + 1) 2 (2k + 1) 2
+
+
+
+A[n, k] = n + 1
+
+ 0
+
+if k < n if k = n , if k > n
+
+1
+and b[n] = 2n2+1 2 . Proof. Let θ(t) = t. By Theorem 7 and noting that θ(t) = 1, we get:
+
+ ... 
+
+1
+
+2 
+
+x˙ n(t) = − A1x(t) + u(t) pn(1)
+
+t
+
+t  ... 
+
+where
+
+ 2αn,k + βn,k if k < n 
+
+A1(t)[n, k] = βn,n + 1
+
+if k = n
+
+(30)
+
+0
+
+otherwise
+
+for αn,k,βn,k as deﬁned in (25).
+
+1
+
+Using the same arguments as in the proof of Corollary D.7, b[n] =
+
+2n+1 2
+
+2 follows from Corollary D.6
+
+and (29). Also using similar arguments as the proof of Corollary D.7, we have
+
+(2n
+
++
+
+1)
+
+1 2
+
+(2k
+
++
+
+1)
+
+1 2
+
+if
+
+k<n
+
+and
+
+n−k
+
+is
+
+odd,
+
+αn,k = 0 is otherwise. .
+
+From (8) in [24], we know that
+
+(z + 1)Pn(z) = nPn(z) + (2n + 1)Pn−1(z) + (2n − 3)Pn−2(z) + . . . .
+
+Including
+
+the
+
+normalization
+
+constant
+
+(2n
+
++
+
+1)
+
+1 2
+
+,
+
+we
+
+note
+
+that
+
+(z
+
+− 1)pn(z)
+
+=
+
+(z
+
++ 1)pn(z) − 2pn(z).
+
+Then
+
+we get
+
+1
+
+1
+
+1
+
+1
+
+(z + 1)pn(z) = npn(z) − (2n + 1) 2 (2n − 1) 2 pn−1(z) + (2n + 1) 2 (2n − 3) 2 pn−2(z) − . . . .
+
+In other words,
+
+−(2n
+
++
+
+1)
+
+1 2
+
+(2k
+
++
+
+1)
+
+1 2
+
+if
+
+k<n
+
+and
+
+n−k
+
+is
+
+odd,
+
+
+
+ 
+
+1
+
+1
+
+(2n + 1) 2 (2k + 1) 2
+
+if
+
+k<n
+
+and
+
+n−k
+
+is
+
+even
+
+βn,k = n if n = k .
+
+
+
+ 0 otherwise.
+
+Recalling that the deﬁnition for A1 from (30), we get:
+
+which completes our claim.
+
+
+
+1
+
+1
+
+(2n + 1) 2 (2k + 1) 2
+
+
+
+A[n, k] = n + 1
+
+ 0
+
+if k < n if k = n , if k > n
+
+32
+
+D.3 Proof of Corollary 4.1: HiPPO for Classical Orthogonal Polynomials
+This section proves Corollary 4.1, showing that the HiPPO matrices for measures corresponding to classical families of orthogonal polynomials [11] are quasiseparable. We deﬁne quasi-separability in Appendix D.3.1. Theorem 8 proves the claimed result for Jacobi polynomials and Lemma D.11 proves the claimed result for Laguerre polynomials.
+We note that there is a third family of classical OPs, the Hermite polynomials [11], which have a two-sided inﬁnite measure. However, since HiPPO is about continuous-time memorization of a function’s history, it requires a one-sided measure and therefore the Hermite polynomials are not appropriate.
+D.3.1 Quasiseparable Matrices Deﬁnition 4 (from [19]). A matrix R ∈ RN×N is (p, q)-quasiseparable if
+• Every matrix contained strictly above the diagonal has rank at most p.
+• Every matrix contained strictly below the diagonal has rank at most q.
+A (q, q)-quasiseparable matrix is called q-quasiseparable.
+We are interested in showing the A matrices for a broad class of OPs in Corollary D.6 are O(1)quasiseperable. We now state some properties of q-quasiseparable matrices:
+Lemma D.9. Let Q be q-quasiseparable. Then:
+(i) For any q -quasiseparable matrix Q ∈ RN×N , Q ± Q is (q + q )-quasiseparable. (ii) For any E ∈ RN×N , E is r-quasiseparable where r = rank(E). (iii) For any two diagonal matrices D1, D2 ∈ RN×N , D1QD2 is q-quasiseparable.
+Proof. We argue each point separately:
+(i) Any submatrix contained strictly below or above the diagonal in Q has rank ≤ q and its corresponding submatrix in Q also has rank ≤ q . This implies that the corresponding submatrix in Q ± Q has rank ≤ q + q . Therefore Q ± Q is (q + q )-quasiseparable.
+(ii) Let the r = rank(E). Thus any submatrix in E has rank ≤ r. Then E is r-quasiseparable.
+(iii) Multiplication by diagonal matrices only scales the rows and columns, leaving the rank of each submatrix unchanged.
+
+D.3.2 Jacobi Polynomials
+The Jacobi polynomial of degree n with parameters α, β > −1 will be denoted Jnα,β (z). The Jacobi polynomials are orthogonal with respect to measure ω(z) = (1 − z)α(1 + z)β. In particular, it is known from (eq. (4.3.3) from [53]) that
+
+1
+
+α,β
+
+α,β
+
+2α+β+1
+
+Γ(n + α + 1)Γ(n + β + 1)
+
+−1 Jn (z) Jm (z) ω(z)dz = 2n + α + β + 1 · Γ(n + α + β + 1)n! δn,m,
+
+where Γ(·) is the gamma function. Let
+
+1
+
+α,β
+
+2α+β+1
+
+Γ(n + α + 1)Γ(n + β + 1) 2
+
+λn
+
+=
+
+· 2n + α + β + 1
+
+Γ(n + α + β + 1)n!
+
+33
+
+be our normalization constant. We note that the normalized Jacobi polynomials
+
+α,β
+
+Jnα,β (z)
+
+pn (z) = α,β
+
+λn
+
+(31)
+
+form an orthonormal OP family. We now discuss some useful properties of Jacobi polynomials. It is known that ([50], eq. (3.100)):
+
+Jnα,β (z) = n + α1 + β (n + β)Jnα,β−1(z) + (n + α)Jnα−1,β (z) . (32) From (4.21.7) in [53], it is known that the derivative of Jnα,β (z) is proportional to Jnα−+11,β+1 (z):
+
+∂∂z Jnα,β(z) = 12 (n + α + β + 1)Jnα−+11,β+1 (z) . (33) From (32) and (33), it follows that
+
+∂∂z Jnα,β (z) = 21 · (n + β)Jnα−+11,β (z) + (n + α)Jnα−,β1+1 (z) . (34)
+Additionally, the Jacobi polynomials Jnα−+11,β (z) and Jnα−,β1+1 (z) can be written as sums of Jnα−,β1 (z) polynomials. In particular from [50] (3.112) and (3.115),
+
+α+1,β
+
+Γ(n + β)
+
+n−1 (2k + α + β + 1)Γ(k + α + β + 1) α,β
+
+Jn−1
+
+(z) =
+
+·
+
+Γ(n + α + β + 1)
+
+Γ(k + β + 1)
+
+Jk (z) ,
+
+(35)
+
+k=0
+
+and
+
+α,β+1
+
+Γ(n + α)
+
+n−1 n−k−1 (2k + α + β + 1)Γ(k + α + β + 1) α,β
+
+Jn−1
+
+(z) =
+
+·
+
+Γ(n + α + β + 1)
+
+(−1)
+
+Γ(k + α + 1)
+
+Jk (z) . (36)
+
+k=0
+
+Using
+
+(35)
+
+and
+
+(36)
+
+in
+
+(34)
+
+allows
+
+us
+
+to
+
+write
+
+∂ ∂z
+
+Jnα,β
+
+(z)
+
+as
+
+a
+
+sum
+
+of
+
+Jkα,β (z)
+
+as follows:
+
+k≤n
+
+∂∂z Jnα,β (z) = n +2 β
+
+Γ(n + β) n−1 (2k + α + β + 1)Γ(k + α + β + 1) α,β
+
+Γ(n + α + β + 1)
+
+Γ(k + β + 1)
+
+Jk (z)
+
+k=0
+
+n+α
+
+Γ(n + α) n−1 n−k (2k + α + β + 1)Γ(k + α + β + 1) α,β
+
+− 2
+
+(−1) Γ(n + α + β + 1)
+
+Γ(k + α + 1)
+
+Jk (z) .
+
+(37)
+
+k=0
+
+We
+
+use
+
+these
+
+properties
+
+to
+
+write
+
+∂ ∂z
+
+pαn,β
+
+(z)
+
+as
+
+a
+
+sum
+
+of
+
+pαk ,β (z)
+
+:
+
+k≤n
+
+Corollary D.10. Let pαn,β (z) and λαn,β be as deﬁned in (31). Then
+
+∂∂z λαn,βpαn,β (z) = (n +2 β) ·
+
+Γ(n + β) n−1 (2k + α + β + 1)Γ(k + α + β + 1) α,β α,β
+
+Γ(n + α + β + 1)
+
+Γ(k + β + 1)
+
+λk pk (z)
+
+k=0
+
+(n + α)
+
+−
+
+·
+
+2
+
+Γ(n + α) n−1 n−k (2k + α + β + 1)Γ(k + α + β + 1) α,β α,β
+
+(−1) Γ(n + α + β + 1)
+
+Γ(k + β + 1)
+
+λk pk (z)
+
+k=0
+
+Proof. Recall that Jnα,β (z) = λαn,βpαn,β. Then the claim follows from (37).
+
+34
+
+D.3.3 HiPPO for Jacobi Polynomials Theorem 8. Let pαn,β (z) be deﬁned as in (31) and ω(z) = (1 − z)α(1 + z)β. Then
+
+1
+
+2
+
+x˙ n(t) ≈ − θ Ax(t) + θ bu(t)
+
+where A is 3-quasiseperable.
+
+Proof. From Corollary D.6,
+
+ ... 
+
+x˙ n(t)
+
+≈
+
+1 − Ax(t)
+
++
+
+2 u(t)
+
+pα,β (1)
+
+θ
+
+θ
+
+n
+ .. 
+
+.
+
+where A = A1 + 2A2 for A1 as deﬁned in Corollary D.5 and A2[n, k] = pαn,β(−1)pαn,β(−1). From Corollary D.10, we observe that
+
+ (n+β) · Γ(n+β) · (2k+α+β+1)Γ(k+α+β+1) λα,β −
+
+ 
+
+2
+
+λαn,β
+
+Γ(n+α+β+1)
+
+Γ(k+β+1)
+
+k
+
+
+
+A1[n, k] = 2 · 
+
+(n+α) · Γ(n+α) · (−1)n−k (2k+α+β+1)Γ(k+α+β+1) λα,β
+
+2 λαn,β Γ(n+α+β+1)
+
+Γ(k+α+1)
+
+k
+
+ 0
+
+if k < n . otherwise
+
+(38)
+
+Then we note that,
+
+A1 = D11Q1D12 − D21Q1D22,
+
+(39)
+
+where D11, D12, D21, D22 are the diagonal matrices such that
+
+1
+
+Γ(n + β + 1)
+
+D11[n, n]
+
+=
+
+λα,β
+
+·
+
+Γ(n + α + β
+
+, + 1)
+
+n
+
+D12[k, k] = (2k + α + βΓ(+k +1)Γβ(+k +1)α + β + 1) λαk,β,
+
+D21[n, n] = (−1)n · (1 · Γ(n + α + 1) λαn,β Γ(n + α + β + 1)
+D22[k, k] = (−1)k · (2k + α + βΓ(+k +1)Γα(+k +1)α + β + 1) λαk,β, and
+
+1 Q1[n, k] =
+0
+
+if k < n . otherwise.
+
+(39) makes use of the fact that (−1)n+k = (−1)n−k along with the deﬁnitions above. Any submatrix of Q1 below the diagonal contains all 1s, and submatrix of Q1 above the diagonal contains all 0s. Then any submatrix above or below the diagonal has rank 1. Therefore Q1 is 1-quasiseparable. Since Q1 is 1-quasiseparable and D11, D12, D21, D22 are all diagonal matrices, part (iii) of Lemma D.9 implies that the matrices D11Q1D12 and D21Q1D22 are both 1-quasiseparable. Therefore part (i) of Lemma D.9 implies that A1 is 2-quasiseparable. From (4.1.1) and (4.1.4) in [53], it is known that
+
+pα,β(1) = 1
+
+n
+
+λαn,β
+
+n+α n
+
+and pα,β(1) = (−1)n
+
+n
+
+λαn,β
+
+n+β n
+
+35
+
+where
+
+z =
+n
+
+Γ(z+1) Γ(n+1)Γ(z−n+1)
+0
+
+if n ≥ 0 .
+if n < 0
+
+Then A2 can be written D3Q2D4 where D3, D4 are the diagonal matrices such that
+
+(−1)n n + β
+
+(−1)k k + β
+
+D3[n, n] = λα,β
+
+n , D4[k, k] = λα,β
+
+, k
+
+n
+
+k
+
+where Q2[n, k] = 1 for all 0 ≤ n, k < N . Q2 has rank 1, and D3, D4 are diagonal matrices. Hence by part (ii) and (iii) Lemma D.9, A2 is 1-quasiseparable.
+Since A1 is 2-quasiseparable and A2 is 1-quasiseparable, part (i) of Lemma D.9 implies that A = A1 +2A2 is 3-quasiseparable and the claim follows.
+
+D.3.4 HiPPO-LagT The Laguerre polynomial of degree n with parameters α > −1 will be denoted Lαn (z). The Laguerre polynomials are orthogonal with respect to measure zαe−z. In particular, from (5.1.1) in [53] we know that
+
+Let λn =
+
+Γ(n+1) Γ(n+α+1)
+
+∞
+
+α
+
+α
+
+α −z
+
+Γ(n + α + 1)!
+
+−1 Ln (z) Lm (z) z e dz = Γ(n + 1) δn,m.
+
+1
+2 be our normalization constant. We note that the normalized Laguerre polynomials
+
+pn (z) = λnLαn(t − Y )
+
+(40)
+
+form
+
+an
+
+orthonormal
+
+OP
+
+family
+
+with
+
+respect
+
+to
+
+measure
+
+ω
+
+=
+
+(t
+
+−
+
+Y
+
+)αe−(t−Y
+
+1) (−∞,t)
+
+for
+
+a
+
+ﬁxed
+
+α
+
+and
+
+tilting
+
+χ = (t − Y )α exp − 1−2β (t − Y ) 1(−∞,t) for a ﬁxed β.
+
+We use the following result from [24]:
+
+Theorem 9. Let pn(z) be deﬁned as in (40). Then
+
+x˙ n(t) = −Ax(t) + bu(t)
+
+where
+
+ 1+β
+
+ 
+
+2
+
+A[n, k] = 1
+
+0
+
+if k = n if k < n , otherwise
+
+n+α b[n] = λn n ,
+
+We now show that A as deﬁned in Theorem 9 is 1-quasiseperable. Lemma D.11. Let A be deﬁned as in Theorem 9. Then A is 1-quasiseperable. Proof. From Theorem 9, we know that
+
+ 1+β
+
+ 
+
+2
+
+A[n, k] = 1
+
+0
+
+if k = n if k < n , otherwise
+
+n+α b[n] = λn n .
+Below the diagonal, all entries A[n, k] = 1. Then any submatrix below the diagonal has rank 1. Similarly, above the diagonal, all entries A[n, k] = 0. Then any submatrix above the diagonal also has rank 1. Then by Deﬁnition 4, the claim follows.
+
+36
+
+E LSSL Algorithms
+• Appendix E.1 proves Theorem 2, providing an algorithm to compute the Krylov function eﬃciently for LSSLs.
+• Appendix E.2 shows a further simpliﬁcation of Corollary 4.1, presenting an even simpler class of structured matrices that we use in our implementation of LSSL.
+• Appendix E.3 provides technical details of the implementation of LSSL, in particular for computing the MVM black box (multiplication by A) and for computing gradients during backpropagation.
+E.1 Proof of Theorem 2
+This section addresses the computational aspects of the LSSL. In particular, we prove Theorem 2 for the computational speed of computing the Krylov function (7) for quasiseparable matrices A, by providing a concrete algorithm in Appendix E.1.1.
+We restate the Krylov function (7) here for convenience. Recall that L is the length of the input sequence and N is the order of the LSSL internate state, e.g. A ∈ RN×N .
+KL(A, B, C) = CAiB i∈[L] ∈ RL = (CB, CAB, . . . , CAL−1B)
+Remark E.1. We call (7) the Krylov function following the notation of [17], since it can be written K(A, B)T C where K(A, B) is the Krylov matrix deﬁned in (8). Alternative naming suggestions are welcome.
+E.1.1 The Algorithm
+We follow the similar problem of [17, Lemma 6.6] but track the dependence on L and the log factors more precisely, and optimize it in the case of stronger structure than quasiseparability, which holds in our setting (particularly Theorem 11).
+The ﬁrst step is to observe that the Krylov function KL(A, B, C) is actually the coeﬃcient vector of C(I − Ax)−1B (mod xL) as a polynomial in x. (Note that Ax means simply multiplying every entry in A by a scalar variable x.) This follows from expanding the power series (I − Ax)−1 = I + Ax + A2x2 + . . .. Thus we ﬁrst compute C(I − Ax)−1B, which is a rational function of degree at most N in the numerator and denominator (which can be seen by the standard adjoint formula for the matrix inverse).
+The second step is simply inverting the denominator of this rational function (mod xL) and multiplying by the numerator, both of which are operations that need L log(L) time by standard results for polynomial arithmetic [51].
+For the remainder of this section, we focus on computing the ﬁrst part. We make two notational changes: First, we transpose C to make it have the same shape as B. We consider the more general setting where B and C have multiple columns; this can be viewed as handling a “batch” problem with several queries for B, C at the same time.
+Lemma E.2. Let A be a q-quasiseparable matrix. Then
+CT (I − Ax)−1B where A ∈ RN×N B, C ∈ RN×k
+is a k × k matrix of rational functions of degree at most N , which can be computed in O(q3 log4 N ) operations.
+The main idea is that quasiseparable matrices are recursively “self-similar”, in that the principal submatrices are also quasiseparable, which leads to a divide-and-conquer algorithm. In particular, divide A = A00 A01
+A10 A11 into quadrants. Then by Deﬁnition 4, A00, A11 are both q-quasiseparable and A01, A10 are rank q. Therefore the strategy is to view I − Ax as a low-rank perturbation of smaller quasiseparable matrices and reduce the problem to a simpler one.
+Proposition 10 (Binomial Inverse Theorem or Woodbury matrix identity [23, 60]). Over a commutative ring R, let A ∈ RN×N and U, V ∈ RN×p. Suppose A and A + UVT are invertible. Then Ip + VT A−1U ∈ Rp×p is invertible and
+(A + UVT )−1 = A−1 − A−1U(Ip + VT A−1U)−1VT A−1
+37
+
+For our purposes, R will be the ring of rational functions over R.
+
+Proof of Lemma E.2. Since A is q-quasiseparable, we can write A10 = ULVLT and A01 = UU VUT where U·, V· ∈ FN×q. Notice that we can write I − Ax as
+
+I − Ax = I − A00x
+
+0
+
++ 0 UU
+
+0
+
+I − A11x
+
+UL 0
+
+VL 0 T 0 VU x.
+
+Suppose we know the expansions of each of
+
+M1 ∈ Rk×k = CT
+
+I − A00x 0
+
+0
+
+−1
+
+I − A11x B
+
+k×2q
+
+T I − A00x
+
+0
+
+−1 0 UU
+
+M2 ∈ R = C
+
+0
+
+I − A11x
+
+UL 0
+
+2q×2q VL 0 T I − A00x
+
+0
+
+−1 0 UU
+
+M3 ∈ R
+
+= 0 VU
+
+0
+
+I − A11x
+
+UL 0
+
+M4 ∈ R2q×k = VL 0
+
+0 T I − A00x
+
+VU
+
+0
+
+0
+
+−1
+
+I − A11x B.
+
+(41) (42) (43) (44)
+
+By Proposition 10, the desired answer is
+
+CT (X − A)−1B = M1 − M2(I2q + M3)−1M4.
+
+Then the ﬁnal result can be computed by inverting I2t + M3 (O(q3N log(N )) operations), multiplying by M2, M4 (O((kq2 + k2q)N log(N )) operations), and subtracting from M1 (O(k2N log(N )) operations). This is a total of O((q3 + kq2 + k2q)N log(N )) operations. Note that when k = O(q log N ), this becomes O(q3N log3 N ); we will use this in the analysis shortly.
+To compute M1, M2, M3, M4, it suﬃces to compute the following:
+
+CT1 (I − A00x)−1B0 CT0 (I − A00x)−1UU VLT (I − A00x)−1UU VLT (I − A00x)−1B0
+
+CT1 (I − A11x)−1B1 CT1 (I − A11x)−1UL VUT (I − A11x)−1UL VUT (I − A11x)−1B1.
+
+(45)
+
+But to compute those, it suﬃces to compute the following (k + t) × (k + t) matrices:
+
+C0 VL T (I − A00x)−1 B0 UU C1 VU T (I − A11x)−1 B1 UL
+
+(46)
+
+Since A00 and A11 have the same form as A, this is two recursive calls of half the size. Notice that the size of the other input (dimensions of B, C) is growing, but when the initial input is k = 1, it never
+exceeds 1 + q log N (since they increase by q every time we go down a level). Earlier, we noticed that when k = O(q log N ), the reduction step has complexity O(q3N log3(N )) for any recursive call. The recursion adds
+an additional log N multiplicative factor on top of this.
+
+Corollary E.3. Suppose that A is semiseparable instead of quasiseparable, and suppose q is a small constant. Then the cost of Lemma E.2 is O(N log2(N )) operations.
+
+This follows from the fact that in the recursion (45) and (46), the U, V matrices do not have to be
+appended if they already exist in B, C. For intuition, this happens in the case when A is tridiagonal, so
+that U, V have the structure (1, 0, . . . , 0), or the case when the oﬀ-diagonal part of A is all 1 (such as the
+HiPPO-LegT matrix). The matrices in Appendix D.3 and Appendix E.2 (Theorems 8, 9 and 11) actually
+satisfy this stronger structure, so Corollary E.3 applies. Combining everything, this proves Theorem 2 with the exact bound N log2(N ) + L log(L) operations. The
+memory claim follows similarly, and the depth of the algorithm is log2(N )+log(L) from the divide-and-conquer
+recursions.
+
+38
+
+Table 7: Complexity of various sequence models in terms of length (L), batch size (B), and hidden dimension (H). Measures are parameter count, training computation, memory requirement, and inference computation for 1 sample and time-step.
+
+Parameters Training Memory Parallel Inference
+Parameters Training Memory Parallel Inference
+Parameters Training Memory Parallel Inference
+
+Convolution
+LH 2 BLH2 + L log(L)(H2 + BH) BLH + LH2 Yes LH 2
+Attention
+H2 B(L2H + LH2) B(L2 + HL) Yes L2H + H2L
+LSSL-ﬁxed
+HN BL log(L)HN LHN + BLH Yes HN2
+
+RNN
+H2 B LH 2 BLH No H2
+LSSL-naive
+HN + N2 HN 3 + LHN 2 + BL log(L)HN HN 2 + LHN + BLH Yes HN2
+LSSL
+HN BH(N log2 N + L log L) + BL log(L)H BHL Yes HN
+
+E.1.2 Summary of Computation Speed for LSSLs and other Mechanisms
+We provide a summary of complexity requirements for various sequence model mechanisms, including several versions of the LSSL. Note that these are over exact arithmetic as in Theorem 2.
+First, the self-attention mechanism is another common sequence model that has an L2 dependence on the length of the sequence, so it is not suitable for the very long sequences we consider here. (We do note that there is an active line of work on reducing this complexity.)
+Second, we include additional variants of the LSSL. In Table 7, LSSL-naive denotes learning A and ∆t for unstructured A; LSSL-ﬁxed denotes not learning A, ∆t (see Appendix B for details); LSSL denotes the learning A and ∆t for the structured class A.
+We include brief explanations of these complexities for the LSSL variants.
+LSSL-naive
+• Parameters: O(HN ) in the matrices B, C and O(N 2) in the matrix A.
+• Training: O(HN 3) to invert compute the matrix A for all H features. O(LHN 2) to compute the Krylov matrix C, CA, . . .. O(BL log(L)HN to multiply by B and convolve with u.
+• Memory: O(HN 2) to store A. O(LHN ) to store the Krylov matrix. O(BLH) to store the inputs/outputs
+• Inference: O(HN 2) to for MVM by A.
+LSSL-ﬁxed
+• Parameters: O(HN ) in the matrices C.
+• Training: O(BL log(L)H) to convolve with u.
+
+39
+
+• Memory: O(LHN ) to store the Krylov matrix (but cached, so no backprop). puts/outputs.
+• Inference: O(HN 2) to for MVM by A.
+
+O(BLH) for in-
+
+LSSL • Parameters: O(HN ) for A, B, C, ∆t. • Training: BH · O˜(N + L) to compute Krylov, O(BL log(L)H) for the convolution. • Memory: O(BHL) to store Krylov (and inputs/outputs). • Inference: O(HN ) to multiply xt[H, N ] by A[H, N, N ]
+
+E.2 Further Simpliﬁcation with Tridiagonal Matrices
+The algorithm for Theorem 2 for general quasiseparable matrices is still diﬃcult to implement in practice, and we make a further simpliﬁcation using a particular subclass of quasiseparable matrices.
+Theorem 11. The class of N × N matrices SN = {P (D + T −1)Q} with diagonal D, P, Q and tridiagonal T includes the original HiPPO-LegS, HiPPO-LegT, and HiPPO-LagT matrices [24].
+Theorem 11 shows that a simple representation involving tridiagonal and diagonal matrices captures all of the original HiPPO matrices. In particular, our LSSL implementation initializes A to be the HiPPO-LegS matrix (Appendix B) and learns within the class deﬁned by Theorem 11.
+We note that the matrices in Theorem 11 are all 1-quasiseparable and in particular also contain the HiPPO matrices for Gegenbauer and generalized Laguerre orthogonal polynomials derived in Theorem 9. In fact, the notion of semiseparability, which is closely related to (and actually is the predecessor of) quasiseparability, was originally motivated precisely to capture inverses of tridiagonal matrices. Thus the structured class in Theorem 11 can be viewed as an approximation of 3-quasiseparable matrices (Corollary 4.1) to 1-quasiseparable, which still contains many of the HiPPO families of interest.
+Proof. We simply show that each of these speciﬁc matrices can be represented in the proposed form. HiPPO-LegT. Let A denote the HiPPO-LegT transition matrix. Up to row/column scaling (i.e. left- and right-
+multiplication by diagonal P and Q), we can write
+
+Ank =
+
+(−1)n−k 1
+
+if n ≤ k . if n ≥ k
+
+The main observation is that
+
+ 1 1 0 . . . 0 0 0
+
+−1 0 1 . . . 0 0 0
+
+ 
+
+0
+
+−1 0 . . .
+
+0
+
+A−1 = 12  ... ... ... . . . ...
+
+
+
+ 0 0 0 ... 0
+
+0 0
+... ...  
+1 0
+
+
+
+
+
+ 0 0 0 . . . −1 0 1
+
+0 0 0 . . . 0 −1 1
+
+HiPPO-LegS. The HiPPO-LegS matrix is
+
+ (2n
+
++
+
+1)1/2(2k
+
++
+
+1)1/2
+
+
+
+
+
+Ank = − n + 1
+
+0
+
+if n > k if n = k . if n < k
+
+40
+
+This
+
+can
+
+be
+
+written
+
+as
+
+−P A
+
+Q
+
+where
+
+P
+
+=
+
+Q
+
+=
+
+diag((2n
+
++
+
+1)
+
+1 2
+
+)
+
+and
+
+ 1 
+Ank = 0
+1 − 2nn+1
+
+if n > k if n < k . if n = k
+
+Finally, A = D + T −1 where D = − diag( 2nn+1 ) and T is the matrix with 1 on the main diagonal and −1 on the subdiagonal.
+
+HiPPO-LagT. The HiPPO-LagT matrix is
+
+ 1 
+Ank = − 0
+ 1
+2
+
+if n > k if n < k . if n = k
+
+This can be written as −P (D + T −1)Q where P = Q = I, D = − 12 I, and T is the same tridiagonal matrix as in the HiPPO-LegS case.
+
+E.3 Implementation Details
+In this section we provide several implementation details that are useful for implementing LSSLs in practice. Recall that one of the main primitives of LSSLs is the matrix-vector multiplication y = Ax (Section 3.1,
+Appendix B), where A is the state matrix A discretized with step size ∆t using the bilinear method (Appendix C.1.3). In Appendix E.3.1, we describe how this MVM can be performed with simpler MVM primitives which we call the “forward diﬀerence” and “backward diﬀerence”.
+However, if these MVM primitives are implemented in a specialized way for particular classes of A matrices (i.e., not using atoms in a standard autograd framework), then we also need to calculate several additional gradients by hand. Appendix E.3.2 shows that calculating gradients to A, ∆t, x during backpropagation can actually be reduced to those same forward/backward diﬀerence primitives.
+Finally, in the case when A is the structured class of matrices in Theorem 11, Appendix E.2 shows how to eﬃciently calculate those primitives using a black-box tridiagonal solver. Our code2 implements all the algorithms in this section, with bindings to the cuSPARSE library for eﬃcient tridiagonal solving on GPU.
+
+E.3.1 Matrix-vector Multiplication by the Bilinear Discretization
+Bilinear Discretization The discrete state-space system is given by (4) and (5), re-written here for convenience
+
+xt = Axt−1 + But yt = Cxt + Dut
+
+where A is a function of A, δt and A is a function of A, B, δt. In particular, we deﬁne A to be the matrix discretized using the bilinear method (Appendix C.1.3), and the system can be written explicitly:
+
+∆tA −1 xt = I − 2 yt = Cxt + Dut
+
+∆tA
+
+I+ 2
+
+xt−1 + ∆tBut
+
+Thus it suﬃces to compute the maps
+
+F (A, ∆t, x) := (I + ∆tA)x
+2Available at https://github.com/HazyResearch/state-spaces
+
+41
+
+and
+B(A, ∆t, x) := (I + ∆tA)−1x.
+We will call these functions the forward diﬀerence and backward diﬀerence maps, respectively. (The Euler and backward Euler discretizations (Appendix C.1.2) are also known as the “forward diﬀerence” and “backward diﬀerence” methods, which in the case of linear systems reduces down to the maps F and B.)
+
+E.3.2 Gradients through the Forward/Backward Diﬀerence Primitives
+In this section we will let y = F (A, ∆t, x) or y = B(A, ∆t, x) denote the computation of interest, L(y) denote a generic loss function, and dx, dy, . . . denote gradients to x, y, . . . (e.g., dx = ∂L∂(xy) ).
+
+Derivatives of backward diﬀerence. First we have the standard ∂L∂(xy) = ∂L∂(yy) ∂∂xy = ∂L∂(yy) (I + ∆tA)−1. This corresponds to matrix-vector multiplication by (I + ∆A)−T . In other words, it can be computed by the primitive B(AT , ∆t, dy).
+Similarly, in order to compute ∂∂L∆(yt) we require ∂∂∆yt . We need the result ∂Y∂x−1 = −Y −1 ∂∂Yx Y −1for an invertible matrix Y [41, equation (59)]. Then
+
+∂y ∂(I + ∆tA)−1
+
+=
+
+x
+
+∂∆t
+
+∂∆t
+
+= −(I + ∆tA)−1 ∂(I + ∆tA) (I + ∆tA)−1x ∂∆t
+
+= −(I + ∆tA)−1A(I + ∆tA)−1x
+
+and
+
+∂L(y) ∂L(y) ∂y
+
+=
+
+∂∆t
+
+∂y ∂∆t
+
+= − ∂L(y) (I + ∆tA)−1 A (I + ∆tA)−1x ∂y
+
+We can summarize this as follows. Let y = B(A, ∆t, x) = (I + ∆tA)−1x and dy = ∂L(y)/∂y (as a column vector). Then
+
+y = B(A, ∆t, x) dx = B(AT , ∆t, dy) d∆t = −dxT Ay.
+
+Derivatives of forward diﬀerence. The forward case is simpler. Let y = F (A, ∆t, x) = (I + ∆tA)x. Then ∂∂xy = I + ∆tA and ∂∂∆yt = Ax. Thus
+y = F (A, ∆t, x) dx = (I + ∆tA)T dy = F (AT , ∆t, dy) d∆t = dyT Ax.
+
+E.3.3 Computing the Forward/Backward Diﬀerence for Tridiagonal Inverse Matrices
+Theorem 11 uses the classes of matrices A = P (D + T −1)Q for diagonal D, P, Q and tridiagonal T . We describe how the forward and backward diﬀerence MVMs can be performed eﬃciently for this class of matrices by reducing to a black-box tridiagonal solver.
+
+42
+
+Table 8: Test accuracies for irregularly sampled time series on the CharacterTrajectories dataset. p% denotes percent of data that was randomly dropped.
+
+Model
+GRU-ODE [16] GRU-∆t [31] GRU-D [9] ODE-RNN [45] NCDE [31] CKCNN [44] LSSL
+
+0%
+99.53 99.30
+
+30%
+92.6 93.6 94.2 95.4 98.7 98.83 98.83
+
+50%
+86.7 91.3 90.2 96.0 98.8 98.60 98.83
+
+70%
+89.9 90.4 91.9 95.3 98.6 98.14 98.37
+
+Table 9: A and ∆t ablations on sCIFAR.
+
+Learn A Fixed A
+
+Learn ∆t
+82.70 80.61
+
+Fixed ∆t
+80.34 80.18
+
+Forward diﬀerence. It is straightforward to compute F (A, ∆t, x) = (I + ∆t · P (D + T −1)Q)x = x + ∆t · P DQx + ∆t · P T −1Qx
+in terms of multiplication by diagonal matrices x → Dx and tridiagonal solving x → T −1x.
+
+Backward diﬀerence. We will explicitly rewrite the inverse of the matrix G = I + ∆t · P (D + T −1)Q. The core observation is to multiply G by a choice selection of matrices to cancel out the T −1 term:
+T P −1GQ−1 = T P −1Q−1 + ∆tT D + ∆tI.
+
+Rearranging yields
+
+G−1 = Q−1(T P −1Q−1 + ∆tT D + ∆tI)−1T P −1.
+
+Now note that the matrix in the middle is tridiagonal. Hence we have reduced MVM by G−1, i.e. the backward diﬀerence problem, to a series of diagonal and tridiagonal MVMs (easy), and a tridiagonal inverse MVM (a.k.a. a tridiagonal solve).
+
+F Additional Experiments and Experiment Details
+We provide additional experiments and ablations in Appendix F.1. Appendix F.2 describes our training methodology in more detail for each dataset. The hyperparameters for all reported results are in Table 11.
+F.1 Additional Experiments
+Missing Data on CharacterTrajectories. Table 8 has results for a setting considered in previous work involving irregularly-sampled time series. LSSL is competitive with the best prior methods, some of which were specialized to handle this setting.
+A and ∆t ablations. Tables 9 and 10 show results on SpeechCommands-Raw and a smaller model on sCIFAR, ablating that learning either the A or ∆t parameters provides a consistent performance increase.
+Finally, Fig. 2 plots the ∆t values at the beginning and end of training on the SpeechCommands-Raw dataset, conﬁrming that training ∆t does noticeably change their values to better model the data. In particular, the ∆t values spread over time to cover a larger range of timescales.
+
+43
+
+Table 10: A and ∆t ablations on SC-Raw.
+
+Learn A Fixed A
+
+Learn ∆t
+96.07 91.59
+
+Fixed ∆t
+95.20 90.51
+
+F.2 Methodology
+We describe our training procedure on each dataset for our model and any relevant baselines.
+General All models and datasets used the Adam optimizer with a LR decay scheduler that reduced LR by 5x upon validation plateau for 10 or 20 epochs. We ﬁxed the batch size to 50 for the MNIST/CIFAR datasets and 32 for other datasets, reducing if necessary to ﬁt in memory.
+For all models, we chose the hyperparameters that achieved the highest validation accuracy/RMSE (values in Table 11).
+Error Bars We note that the results in Section 5 do not include standard deviations for formatting reasons, since most of the baselines were best results reported in previous papers without error bars. As Section 6 noted, the LSSL was actually quite stable in performance and not particularly sensitive to hyperparameters. We note that for every result in Section 5, the LSSL with error bars was at least one standard deviation above the baseline results.
+F.2.1 Sequential and Permuted MNIST
+The model architecture of LSSL(-f) was ﬁxed to the small architecture with 200K parameters (Appendix B). Following [44], we ﬁxed the learning rate scheduler to decay on plateau by with a factor of 0.2, and the number of epochs to 200. We searched hyperparameters over the product of the following learning rate values: {0.001, 0.002, 0.004, 0.01}, and dropout values: {0.1, 0.2}.
+F.2.2 Sequential CIFAR
+The model architecture of LSSL(-f) was ﬁxed to the large architecture with 2M parameters (Appendix B). We searched over the product of the following learning rate values: {0.001, 0.002, 0.004, 0.01, 0.02}, and dropout values: {0.2, 0.3, 0.4}.
+F.2.3 BIDMC Healthcare
+The BIDMC tasks aim at predicting three vital signs of a patient, respiratory rate (RR), heart rate (HR), and oxygen saturation (SpO2), based on PPG and ECG signals. The clinical data is provided by the Beth Israel Deaconess Medical Center. The PPG and ECG signals were sampled at 125Hz and have a sequence length of 4000.
+For this dataset, we ﬁxed the small LSSL(-f) model (Appendix B). Following [47], we changed the scheduler to a multistep scheduler that decays on ﬁxed epochs, and trained for 500 epochs.
+For our methods, we searched over the product of the following learning rate values: {0.004, 0.01, 0.02}, and dropout values: {0.1, 0.2}.
+Baseline parameters. For CKConv, we searched over ω0 ∈ [10, 50] following the guidelines of Romero et al. [44] (best value ω0 = 20). Since we tuned the sensitive ω0, we ﬁxed the learning rate to 0.001 and dropout to 0.1 which was the default used in [44].
+The transformer model we used was a vanilla transformer with a hidden dimension of 256, 8 attention heads, 4 layers, and a feedforward dimension of 1024. We used a learning rate of 0.001 and a dropout of 0. We tried a few variants, but no transformer model was eﬀective at all.
+
+44
+
+Start
+
+Final
+
+Start
+
+Final
+
+Large Timescales
+24000 22000 20000 18000 16000 14000
+0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30
+Small Timescales
+800
+700
+600
+500
+0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30
+Figure 2: We visualize the 32 largest and smallest ∆t values at the start and end of training for the ﬁrst layer of our state-of-the-art LSSL model on the Speech Commands Raw dataset. The plots visualize ∆1t , which can be interpreted as the timescale at which they operate (Section 2). The plots conﬁrm that LSSL does modify the dt values in order to more appropriately model the speech data.
+F.2.4 CelebA For these larger datasets, we reduced the size of the order N and did not tie it to H. These experiments were computationally heavy and we did not do any tuning (i.e., Table 11 are the only runs). The model size was picked to train in a reasonable amount of time, and the learning rate for the ﬁrst attribute was picked based on general best hyperparameters for other datasets, and then reduced for subsequent experiments on the other attributes.
+Baseline parameters. For ResNet-18, we used the standard implementation with a learning rate of 0.001.
+F.2.5 Speech Commands For Speech Commands, we use the same dataset and preprocessing code from Kidger et al. [31], Romero et al. [44]. We consider the two settings from Kidger et al. [31]: SC-Raw uses very long time-series raw speech signals of 16000 timesteps each, while SC-MFCC uses standard MFCC features of 161 timesteps.
+For our models trained over the raw data, we searched over the product of the following learning rate values: {0.002, 0.004, 0.01}, and dropout values: {0.1, 0.2}. For our models trained over the MFCC features, we searched over the product of the following learning rate values: {0.0001, 0.001, 0.002, 0.004, 0.01}, and dropout values: {0.1, 0.2, 0.3, 0.4}.
+45
+
+Table 11: The values of the best hyperparameters found for each dataset.
+
+Dataset
+sMNIST pMNIST sCIFAR BIDMC-RR BIDMC-HR BIDMC-SpO2 SC Raw SC MFCC sCelebA-Att. sCelebA-MSO sCelebA-Smil. sCelebA-WL
+
+Learning Rate
+0.004 0.001 0.02 0.004 0.01 0.01 0.01 0.004 0.002 0.002 0.01 0.002
+
+Dropout
+0.2 0.2 0.3 0.1 0.2 0.1 0.2 0.4 0.1 0.1 0.1 0.1
+
+Hyperparameters
+
+Batch Size Epochs Depth
+
+50
+
+200
+
+6
+
+50
+
+200
+
+6
+
+50
+
+200
+
+4
+
+32
+
+500
+
+6
+
+32
+
+500
+
+6
+
+32
+
+500
+
+6
+
+16
+
+50
+
+4
+
+32
+
+100
+
+6
+
+32
+
+200
+
+3
+
+32
+
+200
+
+3
+
+32
+
+200
+
+3
+
+32
+
+200
+
+3
+
+Hidden Size H
+128 128 256 128 128 128 256 128 256 256 256 256
+
+Order N
+128 128 256 128 128 128 128 128 128 128 128 128
+
+Channels M
+1 1 4 1 1 1 2 1 4 4 4 4
+
+Baseline parameters. To get more results for the strongest baselines on very long sequences in the literature, we ran the UniCORNN [47] baseline on both Raw and MFCC variants, and the Neural Rough Diﬀerential Equations [37] baseline on the Raw variant.
+For UniCORNN trained over the raw data, we searched over multiple hyperparameters. Speciﬁcally, we searched over alpha: {0, 10, 20, 30, 40}, ∆t values: {0.00001, 0.0001, 0.001, 0.01}, and learning rate values: {0.0001, 0.0004, 0.001, 0.004}. However, since the method was not able to generalize to the validation set for any hyperparameter combination, we used the authors’ reported hyperparameters for the Eigenworms dataset as it also contains very long sequences (≈ 18000). In particular, we used a learning rate of 0.02, hidden dimension of 256, 3 layers with dt values [0.0000281, 0.0343, 0.0343], dropout of 0.1, and alpha of 0.
+For UniCORNN trained over the MFCC features, we used the authors’ reported hyperparameters for the MNIST dataset (again due to similarly sized sequence lengths), and further tuned the learning rate over the values: {0.0001, 0.001, 0.005, 0.01, 0.02}, ∆t values: {0.01, 0.1}, and alpha values: {10, 20, 30}.
+The best model used a learning rate of 0.02, hidden dimension of 256, 3 layers with dt values of 0.19, dropout of 0.1, and alpha of 30.65.
+For NRDE on SC-Raw, we used depth 2, step size 4, hidden dimension 32, and 3 layers. Our results were better than unoﬃcial numbers reported in correspondence with the authors, so we did not tune further.
+F.2.6 Convergence Speed (Table 5)
+The convergence table compared against logs directly from the corresponding baseline’s SoTA models [44, 47], which were either released publicly or found in direct correspondence with the authors. To generate the wall clock numbers, we ran the baseline models on the same hardware as our models and extrapolated to the target epoch.
+F.3 Hyperparameters
+Best hyperparameters for all datasets are reported in Table 11.
+
+46
+
+

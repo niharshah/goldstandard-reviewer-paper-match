@@ -1,0 +1,802 @@
+arXiv:2004.03658v3 [cs.LG] 29 Jan 2021
+
+Faithful Embeddings for Knowledge Base Queries
+Haitian Sun Andrew O. Arnold∗ Tania Bedrax-Weiss Fernando Pereira William W. Cohen Google Research
+{haitiansun,tbedrax,pereira,wcohen}@google.com AWS AI
+anarnld@amazon.com
+Abstract
+The deductive closure of an ideal knowledge base (KB) contains exactly the logical queries that the KB can answer. However, in practice KBs are both incomplete and over-speciﬁed, failing to answer some queries that have real-world answers. Query embedding (QE) techniques have been recently proposed where KB entities and KB queries are represented jointly in an embedding space, supporting relaxation and generalization in KB inference. However, experiments in this paper show that QE systems may disagree with deductive reasoning on answers that do not require generalization or relaxation. We address this problem with a novel QE method that is more faithful to deductive reasoning, and show that this leads to better performance on complex queries to incomplete KBs. Finally we show that inserting this new QE module into a neural question-answering system leads to substantial improvements over the state-of-the-art. 2
+1 Introduction
+The deductive closure of an ideal knowledge base (KB) contains exactly the logical queries that the KB can answer. However, in practice KBs are both incomplete and over-speciﬁed, failing to answer queries that have actual real-world answers. Query embedding (QE) methods extend logical queries to incomplete KBs by representing KB entities and KB queries in a joint embedding space, supporting relaxation and generalization in KB inference [10, 11, 26, 18]. For instance, graph query embedding (GQE) [11] encodes a query q and entities x as vectors such that cosine distance represents x’s score as a possible answer to q. In QE, the embedding for a query q is typically built compositionally; in particular, the embedding for q = q1 ∧ q2 is computed from the embeddings for q1 and q2. In past work, QE has been useful for answering overconstrained logical queries [26] and querying incomplete KBs [10, 11, 18].
+Figure 1 summarizes the relationship between traditional KB embedding (KBE), query embedding (QE), and logical inference. Traditional logical inference enables a system to ﬁnd deductively entailed answers to queries; KBE approaches allow a system to generalize from explicitly-stored KB tuples to similar tuples; and QE methods combine both of these ideas, providing a soft form of logical entailment that generalizes.
+We say that a QE system is logically faithful if it behaves similarly to a traditional logical inference system with respect to entailed answers. In this paper, we present experiments illustrating that QE systems are often not faithful: in particular, experiments with the state-of-the-art QE system Query2Box [18] show that it performs quite poorly in ﬁnding logically-entailed answers. We conjecture this is because models that generalize well do not have the capacity to model all the
+∗Work done while at Google Research. 2Code available at https://github.com/google-research/language
+34th Conference on Neural Information Processing Systems (NeurIPS 2020), Vancouver, Canada.
+
+KB embedding (KBE) methods generalize from known KG facts to plausible ones, and logical inference computes answers to compositional queries that are entailed by known facts. Query embedding (QE) combines both of these tools for extending a set of known facts, by ﬁnding answers to a query that are plausibly entailed by known facts.
+Figure 1: Overview of differences between KBE and QE. Shaded area indicates the kinds of test cases used in prior studies of QE.
+information in a large KB accurately, unless embeddings are impractically large. We thus propose two novel methods for improving faithfulness while preserving the ability to generalize. First, we implement some logical operations using neural retrieval over a KB of embedded triples, rather than with geometric operations in embedding space, thus adding a non-parametric component to QE. Second, we employ a randomized data structure called a count-min sketch to propagate scores of logically-entailed answers. We show that this combination leads to a QE method, called EmQL (Embedding Query Language) which is differentiable, compact, scalable, and (with high probability) faithful. Furthermore, strategically removing the sketch in parts of the QE system allows it to generalize very effectively.
+We show that EmQL performs dramatically better than Query2Box on logically-entailed answers, and also improves substantially on complex queries involving generalization. Finally we show that inserting EmQL into a natural language KB question-answering (KBQA) system leads to substantial improvements over the experimental state-of-the-art for two widely-used benchmarks, MetaQA [30] and WebQuestionsSP [28].
+The main contributions of this work are: (1) a new QE scheme with expressive set and relational operators, including those from previous QE schemes (set intersection, union, and relation following) plus a “relational ﬁltering” operation; (2) a new analysis of QE methods showing that previous methods are not faithful, failing to ﬁnd entities logically entailed as answers; (3) the ﬁrst application of QE as a module in a KBQA system; and (4) evidence that this module leads to substantial gains over the prior state-of-the-art on two widely-used benchmarks, thanks to its superior faithfulness.
+2 Related work
+KBE and reasoning. There are many KB embedding (KBE) methods, surveyed in [27]. Typically KBE methods generalize a KB by learning a model that scores the plausibility of a potential KB triple r(x, y), where r is a KB relation, x is a head (aka subject) entity, and y is a tail (aka object) entity. In nearly all KBE models, the triple-scoring model assumes that every entity x is represented by a vector vx.
+Traditional query languages for symbolic KBs do support testing whether a triple is present in a KB, but also allow expressive compositional queries, often queries that return sets of entities. Several previous works also propose representing sets of entities with embeddings [24, 25, 29]; box embeddings [25], for instance, represent sets with axis-parallel hyperrectangles.
+Many KBE models also support relation projection, sometimes also called relation following. Relation following [4] maps a set of entities X and a set of relations R to a set of entities related to something in X via some relation in R: here we use the notation X.follow(R) ≡ {y | ∃x ∈ X, r ∈ R : r(x, y)}. Many KBEs naturally allow computation of some soft version of relation following, perhaps restricted to singleton sets.3 However, most KBE methods give poor results when relation following operations are composed [10], as in computing X.follow(R1).f ollow(R2). To address this, some KBE systems explicitly learn to follow a path (aka chain) of relations [10, 12, 7].
+Extending this idea, the graph-query embedding (GQE) method [11] deﬁned a query language containing both relation following and set intersection. In GQE inputs and output to the relation
+3E.g., translational embedding schemes like TransE [2] would estimate the embedding for y as ˆey = ex + er, where ex, and er are vectors embedding entity x and relation r respectively. Several other methods [10, 13] estimate ˆey = exMr where Mr is a matrix representing r.
+2
+
+following operation are entity sets, deﬁned by cosine-distance proximity to a central vector. More recently, the Query2Box [18] method varied GQE by adopting a box embedding for sets, and also extended GQE by including a set union operator. In Query2Box unions are implemented by rewriting queries into a normal form where unions are used only as the outermost operation, and then representing set unions as unions of the associated boxes.
+Quantum logic [22] is another neural representation scheme, which might be considered a query language. It does not include relation following, but is closed under intersection and negation, and approximately closed under union (via computation of an upper bound on the union set.)
+Other studies [8, 17] use logical constraints such as transitivity or implication to improve embeddings. Here we go in the opposite direction, from KBE to reasoning, answering compositional queries in an embedded KB that is formed in the absence of prior knowledge about relations.
+Sparse-matrix neural reasoning. An alternative to representing entity sets with embeddings is to represent sets with “k-hot” vectors. Set operations are easily performed on k-hot vectors4 and relation following can be implemented as matrix multiplication [3]. Such “localist” representations can exactly emulate logical, hence faithful, reasoning systems. However, they do not offer a direct way to generalize because entities are just (represented by) array indices.
+
+3 Faithful queries on an embedded KB
+
+Background and notation. The query language EmQL operates on weighted sets of entities. Let U be the set of all entities in a KB. A weighted set X ⊆ U is canonically encoded as a k-hot vector vX ∈ IRN , where N = |U | and vX [i] holds the non-negative real weight of element i in X. However the k-hot encoding is very inefﬁcient if N is large, which we address later. EmQL relies on a learned embedding ei ∈ IRd for each entity i, which together form the matrix E ∈ IRd×N of entity embeddings. A weighted set X will be represented by a pair consisting of (1) a dense vector derived from its entity embeddings {ei}, i ∈ X, plus an efﬁcient sparse representation of the weights vX [i].
+In addition to (weighted) set intersection, union, and difference, which are common to many KBE models, EmQL implements two operators for relational reasoning: relation following and relational ﬁltering. EmQL also supports a limited form of set difference (see Supplemental Material C.) In this section, we will start by discussing how to encode and decode sets with EmQL representations, and then discuss the operators in EmQL for relational reasoning.
+Representing sets. We would like to represent entity sets with a scheme that supports generalization, but also allows for precisely encoding weights of sets that are deﬁned by compositional logic-like operations. Our representation will assume that sets are of limited cardinality, and contain “similar” entities (as deﬁned below).
+We represent a set X with the pair (aX , bX ), aX = i vX [i] ei, bX = SH (vX ) where aX is the weighted centroid of elements of X that identiﬁes the general region containing elements of X, and bX is an optional count-min sketch [5], which encodes additional information on the weights of elements of X. Count-min sketches [5] are a widely used randomized data structure that can approximate the vector vX with limited storage. Supplemental Material B summarizes more technical details, but we summarize count-min sketches below. Our analysis largely follows [6].
+Let h be a hash function mapping {1, . . . , N } to a smaller range of integers {1, . . . , NW }, where NW N . The primitive sketch of vX under h, written sh(vX ), is a vector such that
+
+sh(vX )[j] =
+
+vX [i]
+
+i:h(i)=j
+
+Algorithmically, this vector could be formed by starting with an all-zero’s vector of length NW , then looping over every pair (i, wi) where wi = vX [i] and incrementing each sh[j] by wi.
+A primitive sketch sh contains some information about vX : to look up the value vX [i], we could look up sh[h(i)], and this will have the correct value if no other set element i hashed to the same location. We can improve this by using multiple hash functions. Speciﬁcally, let H = {h1, . . . , hND } be a list of ND hash functions mapping {1, . . . , N } to the smaller range of integers {1, . . . , NW }. The
+4If vA, vB are k-hot vectors for sets A, B, then vA + vB encodes A ∪ B and vA vB encodes A ∩ B.
+
+3
+
+count-min sketch SH (vX ) for a vX under H is a matrix such that each row j is the primitive sketch of vX under hj. This sketch is an NW × ND matrix, where NW is called the sketch width and ND is called the sketch depth.
+Let bX = SH (vX ) be the count-min sketch for X. To “look up” (approximately recover) the value of vX [i], we compute the quantity
+ND
+CM(i, bX ) ≡ min bX [j, hj(i)]
+j=1
+In other words, we look up the hashed value associated with i in each of the ND primitive sketches, and take the minimum value. The “look up” of the count-min sketch provides the following probabilistic guarantee, as proved in Supplementary Material B.
+
+Theorem 1 Let bX be a count-min sketch for X of depth ND and with NW > 2|X|, and let C ⊇ X.
+
+If
+
+ND
+
+>
+
+log2
+
+|C | δ
+
+then
+
+with
+
+probability
+
+at
+
+least
+
+1-δ,
+
+X
+
+can
+
+be
+
+recovered
+
+from
+
+bX
+
+using
+
+C.
+
+To reconstruct a set from this encoding, we ﬁrst take the k elements with highest dot product aTX ei, where k is a ﬁxed hyperparameter. This is done efﬁciently with a maximum inner product search [16] (MIPS), which we write TOPk(aX , E).5 These top k elements are then ﬁltered by the count-min
+sketch, resulting in a sparse (no more than k non-zeros) decoding of the set representation
+
+ˆvX [i] =
+
+CM(i, bX ) · softmax(aTX ei) if i ∈ TOPk(aX , E) 0 else
+
+The two pairs of the centroid-sketch representation are complementary. The region around a centroid will usually contain entities with many similar properties, for example “US mid-size cities,” or “Ph.D. students in NLP”: conceptually, it can be viewed as deﬁning a soft type for the entities in X. However, simple geometric representations like centroids are not expressive enough to encode arbitrary sets X, like “Ph.D. students presenting papers in session z”. Count-min sketches do allow arbitrary weights to be stored, but may return incorrect values (with low probability) when queries. However, in this scheme the sketch is only queried for k candidates close to the centroid, so it is possible to obtain very low error probabilities with small sketches (discussed later).
+The centroid-sketch representation does assume that all elements of the same set are similar in the sense that they all have the same “soft type”—i.e., are all in a sphere around a speciﬁc centroid. It also assumes that sets are of size no more than k. (Note the radius of the sphere is not learned—instead k is simply a hyperparameter.)
+Faithfulness. Below we deﬁne compositional operations (like union, intersection, etc) on centroidsketch set representations. A representation produced this way is associated with a particular logical deﬁnition of a set X (e.g., X = Z1 ∪ Z2), and we say that the representation is faithful to that deﬁnition to the extent that it yields the appropriate elements when decoded (which can be measured experimentally).
+Experimentally sketches improve the faithfulness of EmQL. However, the sketch part of a set representation is optional—speciﬁcally it can be replaced with a vacuous sketch that returns a weight of 1.0 whenever it is queried.6 Removing sketches is useful when one is focusing on generalization.
+Intersection and union. Set interesection and union of sets A and B will be denoted as (aA∩B, bA∩B) and (aA∪B, bA∪B), respectively. Both operations assume that the soft types of A and B are similar, so we can deﬁne the new centroids as
+1 aA∩B = aA∪B = 2 (aA + aB)
+To combine the sketches, we exploit the property (see Supplemental Materials) that if bA and bB are sketches for A and B respectively, then a sketch for A ∪ B is bA + bB, and the sketch for A ∩ B is bA bB (where is Hadamard product). Hence
+bA∩B = bA bB bA∪B = bA + bB
+5While aX could be based on other geometric representations for sets, we use MIPS queries because obtaining candidates this way can be very efﬁcient [16].
+6For count-min sketches, if bI is an all-ones matrix of the correct size, then ∀i CM(i, bI) = 1.
+
+4
+
+Relational following. As noted above, relation following takes a set of entities X and a set of relations R and computes the set of entities related to something in X via some relation in R:
+X.follow(R) ≡ {y | ∃r ∈ R, x ∈ X : r(x, y)}
+where “r(x, y)” indicates that this triple is in the KB (other notation is listed in Supplemental Material A.) For example, to look up the headquarters of the Apple company one might compute Y = X.follow(R) where X and R are singleton sets containing “Apple_Inc” and “headquarters_of ” respectively, and result set Y = {Cupertino}.
+Relation following is implemented using an embedding matrix K for KB triples that parallels the element embedding matrix E: for every triple t = r(x, y) in the KB, K contains a row rt = [er; ex; ey] concatenating the embeddings for r, x, and y. To compute Y = X.follow(R) ﬁrst we create a query qR,X = [λ · aR; aX ; 0] by concatenating the centroids for R and X and padding it to the same dimension as the triple embeddings (and λ is a hyper-parameter scaling the weight of the relation). Next using the query qR,X , we perform a MIPS search against all triples in KB K to get the top k triples matching this query, and these triples are re-scored with the sketches of X and R. Let rt = eri ; exj ; ey be the representation of retrieved triple t = ri(xj, y ). Its score is
+s(rt) = CM(i, bR) · CM(j, bX ) · softmax(qTR,X rt)
+We can then project out the objects from the top k triples as a sparse k-hot vector:
+
+ˆvY ( ) =
+
+s(rt)
+
+rt∈TOPk(qR,X ,K),t=_(_,y )
+
+Finally ˆvY is converted to a set representation (aY , bY ), which represents the output of the operation, Y = X.follow(R). The triple store used for implementing follow is thus a kind of key-value memory
+network [15], augmented with a sparse-dense ﬁlter in the form of a count-min sketch.
+
+Relational ﬁltering. Relational ﬁltering, similar to an existential restriction in description logics, removes from X those entities that are not related to something in set Y via some relation in R:
+
+X.ﬁlter(R, Y ) ≡ {x ∈ X|∃r ∈ R, y ∈ Y : r(x, y)}
+
+For example, X.ﬁlter(R, Y ) would ﬁlter out the companies in X whose headquarters are not in Cupertino, if R and Y are as in the previous example. Relational ﬁltering is implemented similarly to follow. For X.ﬁlter(R, Y ), the query must also be aware of the objects of the triples, since they should be in the set Y . The query vector is thus qR,X,Y = [λ · aR; aX ; aY ]. Again, we perform a retrieval using query qR,X,Y , but we ﬁlter with subject, relation, and object sketches bR, bX , bY , so the score of an encoded triple rt is
+s(rt) = CM(i, bR) · CM(j, bX ) · CM( , bY ) · softmax(qTR,X,Y rt)
+
+The same aggregation strategy is used as for the follow operation, except that scores are aggregated over the subject entities instead of objects.
+
+Unions in EmQL vs Query2Box. By construction, all EmQL operations are closed under composition, because they all take and return the same sparse-dense representations, and the computation graph constructed from an EmQL expression is similar in size and structure to the original EmQL expression. We note this differs from Query2Box, where union is implemented by rewriting a query into a normal form. A disadvantage of the Query2Box normal-form approach is that the normal form can be exponentially larger than the original expression.
+
+However, a disadvantage of EmQL’s approach is that unions are only allowed between sets of similar “soft types”. In fact, EmQL’s centroid-sketch representation will not compactly encode any set of sufﬁciently diverse entities: in a small embedding space, a diverse set like X = {kangaroo, ashtray} will have a centroid far from any element, so a top-k MIPS query with small k would have low recall. This limitation of EmQL could be addressed by introducing a second normal-form disjunction operation that outputs a union of centroid-sketch representations, much as Query2Box’s disjunction outputs a union of boxes—however, we leave such an extension as a topic for future work.
+
+Size and density of sketches. Although the centroid-based geometric constraints are not especially expressive, we note that EmQL’s sparse-dense representation can still express sets accurately, as long as the k-nearest neighbor retrieval has good recall. Concretely, consider a set A with |A| = m and
+
+5
+
+sparse-dense representation (aA, bA). Suppose that k = cm ensures that all m elements of A are
+
+retrieved as k-nearest neighbors of aA; in other words, retrieval precision may be as low as 1/c. By
+
+Theorem
+
+2
+
+in
+
+the
+
+Supplementary
+
+Materials,
+
+a
+
+sketch
+
+of
+
+size
+
+2m log2
+
+cm δ
+
+will
+
+recover
+
+all
+
+the
+
+weights
+
+in A with probability at least 1 − δ.
+
+In our experiments we assume sets are of size m < 100, and that c = 10. Using 32 numbers per potential set member leads to δ ≈ 510 and a sketch size of about 4k. Put another way, sets of 100 elements require about as much storage as the BERT [? ] contextual encoding of 4 tokens;
+alternatively the sketch for 100 elements requires about 1/4 the storage of 100 embeddings with d = 128.7
+
+It is also easy to see that for a set of size m, close to half of the numbers in the sketch will have non-zero values. Thus only a moderate savings in space is obtained by using a sparse-matrix data structure: it is quite practical to encode sketches with GPU-friendly dense-tensor data structures.
+
+Loss function. This representation requires entities that will be grouped into sets to be close in
+embedding space, so entity embeddings must be trained to have this property—ideally, for all sets
+that arise in the course of evaluating queries. In the training process we use to encourage this property, an example is a query (such as “{Apple_Inc}.follow({headquarters_of} ∪ {Sunnyvale}”) and a target output set Y . Evaluation of the query produces an approximation Yˆ , encoded as (ˆaY , bˆY ), and the goal of training is make Yˆ approximate Y .
+
+Let vY be the canonical k-hot encoding of Y . While the sketches prevent an element y ∈ Yˆ from getting too high a score, the top-k operator used to retrieve candidates only has high recall if the elements in Yˆ are close in the inner product space. We thus train embeddings to minimize
+
+cross_entropy(softmax(aˆY T , E), vY /||vY ||1)
+
+Note that this objective ignores the sketch8, so it forces the dense representation to do the best job possible on its own. In training Yˆ can be primitive set, or the result of a computation (see § 4.1).
+
+4 Experiments
+We evaluate EmQL ﬁrst intrinsically for its ability to model set expressions [11], and then extrinsically as the reasoning component in two multi-hop KB question answering benchmarks (KBQA).
+4.1 Learning to reason with a KB
+Generalization. To evaluate performance in generalizing to plausible answers, we follow the procedure of Ren et al. [18] who considered nine different types of queries, as summarized in Table 1, and data automatically constructed from three widely used KB completion (KBC) benchmarks. Brieﬂy, to evaluate performance for QE, Ren et al. ﬁrst hold out some triples from the KB for validation and test, and take the remaining triples as the training KB. Queries are generated randomly using the query templates of Table 1. The gold answer for a query is the traditional logical evaluation on the full KB, but the QE system is trained to approximate the gold answer using only the smaller training KB. Queries used to evaluate the system are also constrained to not be fully answerable using only logical entailment over the training KB. For details, see Supplementary Materials D.
+Query2Box is trained on examples from only ﬁve reasoning tasks (1p, 2p, 3p, 2i, 3i), with the remainder held out to measure the ability to generalize to new query templates.9 EmQL was trained on only two tasks: relational following (a variation of 1p), and set intersection. Speciﬁcally we deﬁne a “basic set” X to be any set of entities that share the same property y with relation r, i.e. X = {x|r(x, y)}. In training EmQL to answer intersection queries (X1 ∩ X2), we let X1 and X2 be non-disjoint basic sets, and for relational following (1p), X is a basic set and R a singleton relation set. Training, using the method proposed in §3, produces entity and relation embeddings, and queries
+7Of course, directly storing 100 embeddings is less useful for modeling, since that representation does not support operations like relation following or intersection.
+8The sketch is not used for this objective, but is used in § 4.1 where we train a QA system which includes EmQL as a component. Hence in general it is necessary for inference with the sketch to be differentiable.
+9Of ccourse, test queries are always distinct from training queries.
+
+6
+
+Query Template
+
+Query Template
+
+1p X.follow(R)
+
+ip (X1.follow(R1) ∩ X2.follow(R2)).follow(R)
+
+2p X.follow(R1).follow(R2)
+
+pi X1.follow(R1).follow(R2) ∩ X2.follow(R3)
+
+3p X.follow(R1).follow(R2).follow(R3)
+
+2u X1.follow(R1) ∪ X2.follow(R2)
+
+2i X1.follow(R1) ∩ X2.follow(R2)
+
+up (X1.follow(R1) ∪ X2.follow(R2)).follow(R)
+
+3i X1.follow(R1) ∩ X2.follow(R2) ∩ X3.follow(R3)
+
+Table 1: Nine query templates used. Query2Box is trained on templates 1p, 2p, 3p, 2i, and 3i. EmQL is trained on a variation of 1p and set intersection.
+
+Generalization 1p
+
+Generalization on FB15k-237 2p 3p 2i 3i ip pi 2u up Avg
+
+GQE Q2B
++d=2000 EmQL (ours)
+− sketch
+Entailment
+Q2B +d=2000
+EmQL (ours) − sketch
+
+40.5 21.3 15.5 29.8 41.1 8.5 18.2 16.9 16.3 23.1 46.7 24 18.6 32.4 45.3 10.8 20.5 23.9 19.3 26.8 37.2 20.7 19.4 22.6 37.1 9.7 16.8 20.0 17.8 22.4 37.7 34.9 34.3 44.3 49.4 40.8 42.3 8.7 28.2 35.8 43.1 34.6 33.7 41.0 45.5 36.7 37.2 15.3 32.5 35.5
+Entailment on FB15k-237 58.5 34.3 28.1 44.7 62.1 11.7 23.9 40.5 22.0 36.2 50.7 30.1 26.1 34.8 55.2 11.4 20.6 32.8 21.5 31.5 100.0 99.5 94.7 92.2 88.8 91.5 93.0 94.7 93.7 94.2 89.3 55.7 39.9 62.9 63.9 51.9 54.7 53.8 44.7 57.4
+
+FB15k Avg
+38.7 48.4 34.5 49.5 48.6 FB15k 43.7 38.3 91.4 55.5
+
+NELL Avg
+24.8 30.6 23.4 46.8 46.8 NELL 51.1 43.7 98.8 82.5
+
+FB15k-237 Avg
+23.1 26.8 22.4 35.8 35.5 FB15k-237 36.2 31.5 94.2 57.4
+
+Table 2: Hits@3 results on the Query2Box datasets. Please see Supplementary Materials for full results on FB15k and NELL995 datasets and for mean reciprocal rank results.
+
+are then executed by computing the EmQL representations for each subexpression in turn.10 Since we are testing generalization, rather then entailment, we replace bYˆ with a vacuous all-ones count-min sketch in the ﬁnal set representation for a query (but not intermediate ones).
+We compare EmQL to two baseline models: GQE [11] and Query2Box (Q2B) [18]. The numbers are shown in Table 2. Following the Query2Box paper [18] we use d = 400 for their model and report Hits@3 (see Supplementary Materials D for other metrics). For EmQL, we use d = 64, k = 1000, NW = 2000 and ND = 20 throughout. In this setting, our model is slightly worse than Query2Box for the 1p queries, much worse for the 2u queries, and consistently better on all the more complex queries. EmQL’s difﬁculties with the 2u queries are because of its different approach to implementing union, in particular the kangaroo-ashtray problem discussed in §3.
+Entailment. To test the ability to infer logically entailed answers, EmQL and Q2B were trained with the full KB instead of the training KB, so only reasoning (not generalization) is required to ﬁnd answers. As we argue above, it is important for a query language to be also be faithful to the KB when answering compositional logical queries. The results in Table 2 show EmQL dramatically outperforms Q2B on all tasks in this setting, with average Hits@3 raised from 36-51 to the 90’s.
+To see if larger embeddings would improve Q2B’s performance on entailment tasks, we increased the dimension size to d = 2000, and observed a decrease in performance, relative to the tuned value d = 400 [18].11 In the ablation experiment(EmQL−sketch), we remove the sketch and only use the centroid to make predictions. The results are comparable for generalization, but worse for entailment.
+4.2 Question answering
+To evaluate QE as a neural component in a larger system, we followed [4] and embed EmQL as a reasoning component in a KBQA model. The reasoner of [4], ReifKB, is a sparse-matrix “reiﬁed KB” rather than a QE method, which does not generalize, but is perfectly faithful for entailment questions. In this section we evaluate replacing ReifKB with EmQL.
+10In particular, intermediate EmQL representations are never “decoded” by converting them to entity lists. 11Here d = 2000 was the largest value of d supported by our GPUs. Note this is still much smaller than the number of entities, which would be number required to guarantee arbitrary sets could be memorized with boxes. .
+7
+
+ReifKB was evaluated on two KBQA datasets, MetaQA [30] and WebQuestionsSP [28], which access different KBs. For both datasets, the input to the KBQA system is a question q in natural language and a set of entities Xq mentioned in the question, and the output is a set of answers Y (but no information is given about the latent logical query that produces Y .) EmQL’s set operations were pre-trained for each KB as in § 4.1, and then the KB embeddings were ﬁxed while training the remaining parts of the QA model. Please see the Supplementary Materials for details.
+The MetaQA model. The MetaQA datasets [30] contain multi-hop questions in the movie domain that are answerable using the WikiMovies KB [14], e.g., “When were the movies directed by Christopher Nolan released?”). One dataset (here called MetaQA2) has 300k 2-hop questions and the other (MetaQA3) has 300k 3-hop questions. We used similar models as those used for ReifKB. The model12 for 2-hop questions is given on the left of Table 3, where W1 and W2 are learned parameters, bI is a vacuous sketch, and encode(q) is obtained by pooling the (non-contextual) embeddings of words in q. The 3-hop case is analogous.13
+
+MetaQA
+
+Yˆ = Xq.f ollow(R1).f ollow(R2) − Xq
+
+R1
+
+=
+
+(a1, bI),
+
+a1
+
+=
+
+W
+
+T 1
+
+encode
+
+(q
+
+)
+
+R2
+
+=
+
+(a2, bI),
+
+a2
+
+=
+
+W
+
+T 2
+
+encode
+
+(q
+
+)
+
+WebQuestionsSP
+X1 = Xq.f ollow(R1e) X2 = Xq.f ollow(R1cvt).f ollow(R2e) Yˆ = X1 ∪ X2 ∪ (X1 ∪ X2).f ilter(R3, Z)
+
+Table 3: EmQL models for MetaQA and WebQuestionsSP datasets.
+
+The WebQuestionsSP model. This dataset [28] contains 4,737 natural language questions generated from Freebase. Questions in WebQuestionsSP are a mixture of 1-hop and 2-hop questions, sometimes followed by a relational ﬁltering operation, which are answerable using a subset of FreeBase. The intermediate entities of 2-hop questions are always “compound value type” (CVT) entities—entities that do not have names, but describe n-ary relationships between entities. For example, the question “Who is Barack Obama’s wife?” might be answered with the query Xq.follow(R1).follow(R2).ﬁlter(R3,Z), where Xq = {Barack_Obama}, R1, R2, and R3 are the relations has_marriage, spouse, and gender, and Z is the set {female}. Here Xq.follow(R1) produces a CVT node representing a marriage relationship for a couple. The model we use (see Table 3, right) is similar to MetaQA model, except that the ﬁnal stage is a union of several submodels—namely, chains of one and two follow operations, with or without relational ﬁltering. The submodels for the R’s also similar to those for MetaQA, except that we used a BERT [? ] encoding of the question, and augmented the entity embeddings with pre-trained BERT representations of their surface forms (see Supplementary Materials.)
+The model in ReifKB [4] does not support relational ﬁltering14, so for it we report results with the simpler model Yˆ = X1 ∪ X2. Of course the EmQL models also differ in being QE models, so they model relations as centroids in embedding space instead of k-hot vectors.
+Experimental results. In addition to ReifKB [4], we report results for GRAPH-Net [20] and PullNet [21], which are Graph-CNN based methods. EmbedKGQA [19] is the current state-of-the-art model that applies KB embeddings ComplEx [23] in KBQA. Since our models make heavy use of the follow operation, which is related to a key-value memory, we also compare to a key-value memory network baseline [14]. The results are shown on Table 4.
+On MetaQA3 and WebQSP datasets we exceed the previous state-of-the-art by a large margin (7.7% and 5.8% hits@1 absolute improvement), and results on MetaQA2 are comparable to the previous state-of-the-art. We also consider two ablated versions of our model, EmQL-sketch and EmQL-ﬁlter. EmQL-ﬁlter uses the same model as used in ReifKB [4], but still improves over ReifKB signiﬁcantly, showing the value of coupling learning with a QE system rather than a localist KB. EmQL-sketch disables sketches throughout (rather than only in the submodels for the R’s), and works consistently worse than the full model for all datasets. Thus it underscores the value of faithful QE for KBQA tasks. (Notice that errors in computing entailed answers will appear to the KBQA system as noise in the end-to-end training process.) Finally, Figure 2 (right) shows that performance of EmQL-sketch is improved only slightly with much larger embeddings, also underscoring the value of the sketches.
+12Here A − B is a non-compositional set difference operator, see Supplementary Materials for details. 13An important difference is that in ReifKB R1 and R2 are k-hot representations of sets of relation ids, not centroids in embedding space. 14The relational ﬁltering operation is not deﬁned for ReifKB, although it could be implemented with sequences of simpler operations.
+
+8
+
+KV-Mem GRAFT-Net PullNet EmbedKGQA ReifKB EmQL (ours)
+− ﬁlter − sketch
+
+MetaQA2 82.7 94.8 99.9 98.8 81.1 98.6 – 70.3
+
+MetaQA3 48.9 77.7 91.4 94.8 72.3 99.1 – 60.9
+
+WebQSP 46.7 70.3 69.7 66.6 52.7 75.5 65.2 53.2
+
+Table 4: Hits@1 of WebQuestionsSP, MetaQA2, and Figure 2: Hits@1 on MetaQA3. Left: Jointly train-
+
+MetaQA3. GRAFT-Net and PullNet were re-run on Web- ing (joint) or ﬁxed QE (ﬁx-kbe) varying k for top k
+
+QuestionsSP with oracle sets of question entities Xq.
+
+retrieval. Right: Varying d for EmQL-sketch.
+
+As noted above, the QE component was ﬁrst pre-trained on synthetic queries (as in § 4.1), and then the QA models were trained with ﬁxed entity embeddings. We also jointly trained the KB embeddings and the QA model for MetaQA3, using just the QA data. In this experiment, we also varied k, the top-k entities retrieved at each step. Figure 2 (left) shows pre-training the KB embeddings (ﬁx-kge) consistently outperforms jointly training KB embeddings for the QA model (joint), and demonstrates that pre-training QE on simple KB queries can be useful for downstream tasks.
+5 Concluding Discussion
+EmQL is a new query embedding (QE) method, which combines a novel centroid-sketch representation for entity sets with neural retrieval over embedded KB triples. In this paper we showed that EmQL generalizes well, is differentiable, compact, scalable, and faithful with respect to deductive reasoning. However, there are areas for improvement. Compared to the reiﬁed KB method [4], EmQL learns and generalizes better, and does not rely on expensive sparse-matrix computations; however, unlike a reiﬁed KB, it requires KB-speciﬁc pretraining to ﬁnd entity embeddings suitable for reasoning. Like most previous KBE or QE methods, EmQL sets must correspond to neighborhoods in embedding space15; EmQL’s centroid-sketch representation additionally assumes that sets are of moderate cardinality. Finally, in common with prior QE methods [11, 18], EmQL does not support general logical negation, and has only very limited support for set difference.
+In spite of these limitations, we showed that EmQL substantially outperforms previous QE methods in the usual experimental settings, and massively outperforms them with respect to faithfulness. In addition to improving on the best-performing prior QE method, we demonstrated that it is possible to incorporate EmQL as a neural module in a KBQA system: to our knowledge this is the ﬁrst time that a QE system has been used to solve an downstream task (i.e., a task other than KB completion). Replacing a faithful localist representation of a KB with EmQL (but leaving rest of the QA system intact) leads to double-digit improvements in Hits@1 on three benchmark tasks, and leads to a new state-of-the-art on the two more difﬁcult tasks.
+
+15A notable exception is Query2Box which represents sets with unions of rectangles using a non-compositional set union operator. Although non-compositional set union could be added to EmQL it is currently not implemented.
+9
+
+Broader Impact
+Overview. This work addresses a general scientiﬁc question, query embedding (QE) for knowledge bases, and evaluates a new method, especially on a KB question-answering (KBQA) task. A key notion in the work the faithfulness of QE methods, that is, their agreement with deductive inference when the relevant premises are explicitly available. The main technical contribution of the paper is to show that massive improvements in faithfulness are possible, and that faithful QE systems can lead to substantial improvements in KBQA. In the following, we discuss how these advances may affect risks and beneﬁts of knowledge representation and question answering technology. Query embedding. QE, and more generally KBE, is a way of generalizing the contents of a KB by building a probabilistic model of the statements in, or entailed by, a KB. This probabilistic model ﬁnds statements that could plausibly true, but are not explicitly stored: in essence it is a noisy classiﬁer for possible facts. Two risks need to be considered in any deployment of such technology: ﬁrst, the underlying KB may contain (mis)information that would improperly affect decisions; second, learned generalizations may be wrong or biased in a variety of ways that would lead to improperly justiﬁed decisions. In particular, training data might reﬂect societal biases that will be therebly incorporated into model predictions. Uses of these technologies should provide audit trails and recourse so that their predictions can be explained to and critiqued by affected parties. KB question-answering. General improvements to KBQA do not have a speciﬁc ethical burden, but like any other such technologies, their uses need to be subject to speciﬁc scrutiny. The general technology does require particular attention to accuracy-related risks. In particular, we propose a substantial “softening” of the typical KBQA architecture (which generally parses a question to produce a single hard KB query, rather than a soft mixture of embedded queries). In doing this we have replaced traditional KB, a mature and well-understood technology, with QE, a new and less well-understood technology. Although our approach makes learning end-to-end from denotations more convenient, and helps us reach a new state-of-the-art on some benchmarks, it is possible that replacing a hard queries to a KB with soft queries could lead to confusion as to whether answers arise from highly reliable KB facts, reliable reasoning over these facts, or are noise introduced by the soft QE system. As in KBE/QE, this has consequences for downstream tasks is uncertain predictions are misinterpreted by users. Faithful QE. By introducting the notion of faithfullness in studies of approximate knowledge representation in QE, we provided a conceptual yardstick for examining the accuracy and predictability of such systems. In particular, the centroid-sketch formalism we advocate often allows one to approximately distinguish entailed answers vs generalization-based answers by checking sketch membership. In addition to quantitatively improving faithfulness, EmQL’s set representation thus may qualitatively improve the interpretability of answers. We leave further validation of this conjecture to future work.
+10
+
+References
+[1] B. H. Bloom. Space/time trade-offs in hash coding with allowable errors. Communications of the ACM, 13(7):422–426, 1970.
+[2] A. Bordes, N. Usunier, A. Garcia-Duran, J. Weston, and O. Yakhnenko. Translating embeddings for modeling multi-relational data. In Advances in neural information processing systems, pages 2787–2795, 2013.
+[3] W. W. Cohen, M. Siegler, and R. A. Hofer. Neural query language: A knowledge base query language for tensorﬂow. CoRR, abs/1905.06209, 2019. URL http://arxiv.org/abs/1905. 06209.
+[4] W. W. Cohen, H. Sun, R. A. Hofer, and M. Siegler. Scalable neural methods for reasoning with a symbolic knowledge base. arXiv preprint arXiv:2002.06115, 2020. Appeared in ICLR-2020.
+[5] G. Cormode and S. Muthukrishnan. An improved data stream summary: the count-min sketch and its applications. Journal of Algorithms, 55(1):58–75, 2005.
+[6] A. Daniely, N. Lazic, Y. Singer, and K. Talwar. Sketching and neural networks. arXiv preprint arXiv:1604.05753, 2016.
+[7] R. Das, A. Neelakantan, D. Belanger, and A. McCallum. Chains of reasoning over entities, relations, and text using recurrent neural networks. arXiv preprint arXiv:1607.01426, 2016.
+[8] T. Demeester, T. Rocktäschel, and S. Riedel. Lifted rule injection for relation embeddings. arXiv preprint arXiv:1606.08359, 2016.
+[9] J. Devlin, M.-W. Chang, K. Lee, and K. Toutanova. Bert: Pre-training of deep bidirectional transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+[10] K. Guu, J. Miller, and P. Liang. Traversing knowledge graphs in vector space. arXiv preprint arXiv:1506.01094, 2015.
+[11] W. Hamilton, P. Bajaj, M. Zitnik, D. Jurafsky, and J. Leskovec. Embedding logical queries on knowledge graphs. In Advances in Neural Information Processing Systems, pages 2026–2037, 2018.
+[12] Y. Lin, Z. Liu, H. Luan, M. Sun, S. Rao, and S. Liu. Modeling relation paths for representation learning of knowledge bases. arXiv preprint arXiv:1506.00379, 2015.
+[13] H. Liu, Y. Wu, and Y. Yang. Analogical inference for multi-relational embeddings. In Proceedings of the 34th International Conference on Machine Learning-Volume 70, pages 2168–2178. JMLR. org, 2017.
+[14] A. Miller, A. Fisch, J. Dodge, A.-H. Karimi, A. Bordes, and J. Weston. Key-value memory networks for directly reading documents. EMNLP, 2016.
+[15] A. H. Miller, A. Fisch, J. Dodge, A. Karimi, A. Bordes, and J. Weston. Key-value memory networks for directly reading documents. CoRR, abs/1606.03126, 2016. URL http://arxiv. org/abs/1606.03126.
+[16] S. Mussmann and S. Ermon. Learning and inference via maximum inner product search. In International Conference on Machine Learning, pages 2587–2596, 2016.
+[17] P. Rastogi, A. Poliak, and B. Van Durme. Training relation embeddings under logical constraints. In KG4IR@ SIGIR, pages 25–31, 2017.
+[18] H. Ren, W. Hu, and J. Leskovec. Query2box: Reasoning over knowledge graphs in vector space using box embeddings. arXiv preprint arXiv:2002.05969, 2020. Appeared in ICLR-2020.
+[19] A. Saxena, A. Tripathi, and P. Talukdar. Improving multi-hop question answering over knowledge graphs using knowledge base embeddings. ACL, 2020.
+[20] H. Sun, B. Dhingra, M. Zaheer, K. Mazaitis, R. Salakhutdinov, and W. W. Cohen. Open domain question answering using early fusion of knowledge bases and text. EMNLP, 2018.
+11
+
+[21] H. Sun, T. Bedrax-Weiss, and W. W. Cohen. Pullnet: Open domain question answering with iterative retrieval on knowledge bases and text. arXiv preprint arXiv:1904.09537, 2019.
+[22] K. Svozil. Quantum logic. Springer Science & Business Media, 1998. [23] T. Trouillon, J. Welbl, S. Riedel, É. Gaussier, and G. Bouchard. Complex embeddings for
+simple link prediction. In International Conference on Machine Learning, pages 2071–2080, 2016. [24] L. Vilnis and A. McCallum. Word representations via gaussian embedding. arXiv preprint arXiv:1412.6623, 2014. [25] L. Vilnis, X. Li, S. Murty, and A. McCallum. Probabilistic embedding of knowledge graphs with box lattice measures. arXiv preprint arXiv:1805.06627, 2018. [26] M. Wang, R. Wang, J. Liu, Y. Chen, L. Zhang, and G. Qi. Towards empty answers in sparql: Approximating querying with rdf embedding. In D. Vrandecˇic´, K. Bontcheva, M. C. SuárezFigueroa, V. Presutti, I. Celino, M. Sabou, L.-A. Kaffee, and E. Simperl, editors, The Semantic Web – ISWC 2018, pages 513–529, Cham, 2018. Springer International Publishing. ISBN 978-3-030-00671-6. [27] Q. Wang, Z. Mao, B. Wang, and L. Guo. Knowledge graph embedding: A survey of approaches and applications. IEEE Transactions on Knowledge and Data Engineering, 29(12):2724–2743, 2017. [28] W.-t. Yih, M.-W. Chang, X. He, and J. Gao. Semantic parsing via staged query graph generation: Question answering with knowledge base. In Proceedings of the 53rd Annual Meeting of the Association for Computational Linguistics and the 7th International Joint Conference on Natural Language Processing (Volume 1: Long Papers), pages 1321–1331, Beijing, China, July 2015. Association for Computational Linguistics. URL http://www.aclweb.org/anthology/ P15-1128. [29] M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. R. Salakhutdinov, and A. J. Smola. Deep sets. In Advances in neural information processing systems, pages 3391–3401, 2017. [30] Y. Zhang, H. Dai, Z. Kozareva, A. J. Smola, and L. Song. Variational reasoning for question answering with knowledge graph. In AAAI, 2018.
+12
+
+A Notation
+
+The notation used in this paper is summarized in Table 5.
+
+W, X, Y R r x, y xi
+
+sets of entities set of relations a single relation entities entity with index i
+
+A, B
+
+set of anything (entities or relations)
+
+U
+
+universal set
+
+vA
+
+a k-hot vector for a set A
+
+r(x, y)
+E ex, er ei KB
+
+asserts this triple is in the KB matrix of entity embeddings embedding of entity x, relation r embedding of entity with index i, i.e. ei = E[i, :] matrix of triple embeddings, i.e., row for r(x, y) is [er; ex; ey]
+
+(aX , bX ) CM(i, b) X.follow(R) X.ﬁlter(R, Y )
+
+area and sketch that represent set X score for entity i in the count-min sketch b soft version of {y | ∃r ∈ R, x ∈ X : r(x, y)} soft version of {x ∈ X | ∃r ∈ R, y ∈ Y : r(x, y)}
+
+Table 5: Notation used in the paper, excluding notation used only in § B
+
+B Background on count-min sketches
+
+B.1 Deﬁnitions
+
+Count-min sketches [5] are a widely used randomized data structure. We include this discussion for completeness, and our analysis largely follows [6].
+
+A count-min sketch, as used here, is an approximation of a vector representation of a weighted set. Assume a universe U which is a set of integer “object ids” from {1, . . . , N }. A set A ⊆ U can be encoded as a vector vA ∈ IRn such that vA[i] = 0 if i ∈ S, and otherwise vA[i] is a real-numbered weight for entity i in set S. The purpose of the count-min sketch is to approximate vA with limited storage.
+
+Let h be a hash function mapping {1, . . . , N } to a smaller range of integers {1, . . . , NW }, where NW N . The primitive sketch of vA under h, written sh(vA), is a vector such that
+
+sh(vA)[j] =
+
+vA[i]
+
+i:h(i)=j
+
+Algorithmically, this vector could be formed by starting with an all-zero’s vector of length NW , then looping over every pair (i, wi) where wi = vA[i] and incrementing each sh[j] by wi. A primitive sketch sh contains some information about vA: to look up the value vA[i], we could look up sh[h(i)], and this will have the correct value if no other set element i hashed to the same location. We can
+improve this by using multiple hash functions.
+
+Speciﬁcally, let H = {h1, . . . , hND } be a list of ND hash functions mapping {1, . . . , N } to the smaller range of integers {1, . . . , NW }. The count-min sketch SH (vA) for a vA under H is a matrix such that each row j is the primitive sketch of vA under hj. This sketch is an NW × ND matrix: NW is called the sketch width and ND is called the sketch depth.
+
+Let S be the count-min sketch for A. To “look up” (approximately recover) the value of vA[i], we compute this quantity
+ND
+CM(i, S) ≡ min S[j, hj(i)]
+j=1
+
+13
+
+In other words, we look up the hashed value associated with i in each of the ND primitive sketches, and take the minimum value.
+
+B.2 Linearity and implementation nodes
+Count-min sketches also have a useful “linearity” property, inherited from primitive sketches. It is easy to show that for any two sets A and B represented by vectors vA and vB
+SH (vA + vB) = SH (vA) + SH (vB) SH (vA vB) = SH (vA) SH (vB)
+Here, as elsewhere in this paper, is Hadamard product.
+In general, although it is mathematically convenient to deﬁne the behavior of sketches in reference to k-hot vectors, it is not necessary to construct a vector vA to construct a sketch: all that is needed is the non-zero weights of the elements of A. Alternatively, if one precomputes and stores the sketch for each singleton set, it is possible to create sketches for an arbitrary set by gathering and sum-pooling the sketches for each element.
+
+B.3 Probabilistic bounds on accuracy
+
+We assume the hash functions are random mappings from {1, . . . , N } to {1, . . . , NW }. More precisely, we assume that for all i ∈ {1, . . . , N }, and all j ∈ {1, . . . , NW }, Pr(hi(x) = a) = N1W .
+
+We will also assume that the ND hash functions are are all drawn independently at random. More
+
+precisely, for all i = i , i, i ∈ {1, . . . , N }, all j, j ∈ {1, . . . , ND} and all k, k ∈ {1, . . . , NW },
+
+Pr(hj(i) = k ∧ hj
+
+(i ) = k
+
+)=
+
+1 N2
+
+.
+
+W
+
+Under this assumption, the probability of errors can be easily bounded. Suppose the sketch width is at least twice the cardinality of A, i.e., |A| < m and NW > 2m. Then one can show for all primitive sketches j:
+1 Pr(S[j, hj(i)] = vA[i]) ≤ 2
+
+From this one can show that the probability of any error in a count-min sketch decreases exponentially in sketch depth. (This result is a slight variant of one in [6].)
+
+Theorem 2 Assuming hash functions are random and independent as deﬁned above, then if S is a count-min sketch for A of depth ND, and NW > 2|A|, then
+1 Pr(CM(S, i) = vA[i]) ≤ 2ND
+
+This bound applies to a single CM operation. However, by using a union bound it is easy to assess the probability of making an error in any of a series of CM operations. In particular, we consider the case that there is some set of candidates C including all entities in A, i.e., A ⊆ C ⊆ U , and consider recovering the set A by performing a CM lookup for every i ∈ C. Speciﬁcally, we say that A can be recovered from S using C if A ⊆ C and
+∀i ∈ C, CM(i , S) = vA[i ]
+Note that this implies the sketch must correctly score every i ∈ C − A as zero. Applying the union bound to Theorem 2 leads to this result.
+
+Theorem 3 Let S be a count-min sketch for A of depth ND and with NW > 2|A|, and let C ⊇ A. If
+
+ND
+
+>
+
+log2
+
+|C| δ
+
+then
+
+with
+
+probability
+
+at
+
+least
+
+1-δ,
+
+A
+
+can
+
+be
+
+recovered
+
+from
+
+S
+
+using
+
+C.
+
+Many other bounds are known for count-min sketches: perhaps the best-known result is that for NW > 2 and ND > log 1δ , the probability that CM(i, S) > vA[i] + is no more than δ [5]. Because there are many reasonable formal bounds that might or might not apply in an experimental setting,
+typically the sketch shape is treated as a hyperparameter to be optimized in experimental settings.
+
+14
+
+C Set difference
+Another operation we use is set difference: e.g. “movie directors but not writers” requires one to compute a set difference Adirectors − Bwriters. In computing a set difference, the soft-type of the output A − B is the same as that of A, and we exclude the necessary elements from the count-min sketch to produce (aA−B, bA−B), where
+aA−B = aA bA−B = bA (b = 0) This is exact when B is unweighted (the case we consider here), but only approximates set difference for general weighted sets.
+
+D More experiment details
+
+D.1 Learn to reason over a KB
+
+The statistics of the Query2Box datasets are shown in Table 6.
+
+FB15k FB15k-237 NELL995
+
+Entities 14,951 14,505 63,361
+
+Relations 1,345 237 200
+
+Training Triples 533,142 289,641 128,537
+
+Test Triples 59,071 20,438 14,267
+
+Total Triples 592,213 310,079 142,804
+
+(a) Size of splits into train and test for all the Query2Box KBs.
+
+task FB15k FB15k-237 NELL995
+
+Basic sets 11,611 11,243 19,112
+
+Train Follow (1p)
+96,750 50,711 36,469
+
+Intersection 355,966 191,934 108,958
+
+Test Follow (1p)
+67,016 22,812 17,034
+
+Others 8,000 5,000 4,000
+
+(b) Number of training and testing examples of the Query2Box datasets. Training data for EmQL are derived from the same training KB as Query2Box. EmQL is directly evaluated on the same test data without further ﬁne-tuning.
+
+Table 6: Statistics for the Query2Box datasets.
+
+We also measure the MRR on the Query2Box datasets. The results are presented in Table 7 and 8.
+
+D.2 Question answering
+D.2.1 Datasets
+The statistics of MetaQA and WebQuestionsSP datasets are listed in Table 9. For WebQuestionsSP, we used a subset of Freebase obtained by gathering triples that are within 2-hops of the topic entities in Freebase. We exclude a few extremely common entities and restrict our KB subset so there are at most 100 tail entities for each subject/relation pair (reﬂecting the limitation of our model to sets of cardinality less than 100).
+
+D.2.2 MetaQA
+MetaQA makes use of the set difference operation. For example, to answer the question “What are other movies that have the same director as Inception?”, we need to ﬁrst ﬁnd the director of Inception, Christopher Nolan, and all movies directed by him. Since the question above asks about other movies, the model should also remove the movie Inception from this set to obtain the ﬁnal answer set Y . Thus in the ﬁrst line of our model, we write
+Yˆ = Xq.f ollow(R1).f ollow(R2) − Xq
+For MetaQA, the entity embedding is just a learned lookup table. The question representation encode(q) is computed with a bag-of-word approach, i.e., an average pooling on the word embeddings
+
+15
+
+generalization
+
+1p 2p 3p 2i 3i ip pi 2u up Avg
+
+FB15k GQE
+
+63.6 34.6 25.0 51.5 62.4 15.1 31.0 37.6 27.3 38.7
+
+Q2B
+
+78.6 41.3 30.3 59.3 71.2 21.1 39.7 60.8 33.0 48.4
+
++d=2000 54.3 32.0 27.0 35.5 50.7 13.7 27.0 44.1 26.3 34.5
+
+EmQL(ours) 42.4 50.2 45.9 63.7 70.0 60.7 61.4 9.0 42.6 49.5
+
+- sketch
+
+50.6 46.7 41.6 61.8 67.3 54.2 53.5 21.6 40.0 48.6
+
+FB15k-237 GQE
+
+40.5 21.3 15.5 29.8 41.1 8.5 18.2 16.9 16.3 23.1
+
+Q2B
+
+46.7 24 18.6 32.4 45.3 10.8 20.5 23.9 19.3 26.8
+
++d=2000 37.2 20.7 19.4 22.6 37.1 9.7 16.8 20.0 17.8 22.4
+
+EmQL(ours) 37.7 34.9 34.3 44.3 49.4 40.8 42.3 8.7 28.2 35.8
+
+- sketch
+
+43.1 34.6 33.7 41.0 45.5 36.7 37.2 15.3 32.5 35.5
+
+NELL995 GQE
+
+41.8 23.1 20.5 31.8 45.4 8.1 18.8 20.0 13.9 24.8
+
+Q2B
+
+55.5 26.6 23.3 34.3 48.0 13.2 21.2 36.9 16.3 30.6
+
++d=2000 49.1 22.1 17.5 21.4 39.9 8.9 17.2 26.4 8.1 23.4
+
+EmQL(ours) 41.5 40.4 38.6 62.9 74.5 49.8 64.8 12.6 35.8 46.8
+
+- sketch
+
+48.3 39.5 35.2 57.2 69.0 48.0 59.9 25.9 38.2 46.8
+
+entailment
+
+FB15k Q2B
+
+68.0 39.4 32.7 48.5 65.3 16.2 32.9 61.4 28.9 43.7
+
++d=2000 59.0 36.8 30.2 40.4 57.1 14.8 28.9 49.2 28.7 38.3
+
+EmQL(ours) 98.5 96.3 91.1 91.4 88.1 87.8 89.2 88.7 91.3 91.4
+
+- sketch
+
+85.1 50.8 42.4 64.4 66.1 50.4 53.8 43.2 42.7 55.5
+
+FB15k-237 Q2B
+
+58.5 34.3 28.1 44.7 62.1 11.7 23.9 40.5 22.0 36.2
+
++d=2000 50.7 30.1 26.1 34.8 55.2 11.4 20.6 32.8 21.5 31.5
+
+EmQL(ours) 100.0 99.5 94.7 92.2 88.8 91.5 93.0 94.7 93.7 94.2
+
+- sketch
+
+89.3 55.7 39.9 62.9 63.9 51.9 54.7 53.8 44.7 57.4
+
+NELL995 Q2B
+
+83.9 57.7 47.8 49.9 66.3 19.9 29.6 73.7 31.0 51.1
+
++d=2000 75.7 49.9 36.9 40.5 60.1 17.1 25.6 63.5 24.4 43.7
+
+EmQL(ours) 99.0 99.0 97.1 99.7 99.6 98.7 98.9 98.8 98.5 98.8
+
+- sketch
+
+94.5 77.4 52.9 97.4 97.5 88.1 90.8 70.4 73.5 82.5
+
+Table 7: Detailed Hits@3 results for all the Query2Box datasets.
+
+of question q. The embedding size is 64, and scaling parameter for relation λ is 1.0. Our count-min sketch has depth ND = 20 and width NW = 500. We set k = 100 to be the number of entities we retrieve at each step, and we pre-train KB embeddings and ﬁx the embeddings when training our QA model.
+
+D.2.3 WebQuestionsSP
+
+We use pre-trained BERT to encode our question q, i.e., encode(q) is the BERT embedding of the [CLS] token. The relation sets R1, R2, R3 are linear projections of the question embedding encode(q) paired with a vacuous all-ones sketch bI. Relation centroids are stacked with one extra dimension that encodes the hard-type of entities: here the hard-type is a binary value that indicates if the entity is a cvt node or not.
+
+For this dataset, to make the entities and relations easier to predict from language, the embedding of
+
+each entity was adapted to include a transformation of the BERT encoding of the surface form of
+
+the entity names. Let e0x be the embedding of the [CLS] token from a BERT [? ] encoding of the
+
+canonical name for entity x, and let e1x be a vector unique to x. Our pre-trained embedding for x is
+
+then ex =
+
+W
+
+T
+
+e0x
+
+;
+
+e
+
+1 x
+
+p, where W is a learned projection matrix. The embedding of relation r is
+
+set to the BERT encoding ([CLS] token) of the canonical name of relation r. In this experiments
+
+the BERT embeddings are transformed to 128 dimensions and the entity-speciﬁc portion e1x has a dimension of 32. The scaling parameter for relation λ is 0.1.
+
+The KB embedding is ﬁxed after pre-training. We use a count-min sketch with depth ND = 20 and width NW = 2000, and we retrieve k = 1000 intermediate results at each step.
+
+In the ablation study, we did two more experiments on the WebQuestionsSP dataset. First, we remove the BERT pre-trained embedding, and instead randomly initialize the KB entity and relation embeddings, and train the set operations. The performance of EmQL (no-bert) on the downstream QA task is 1.3% lower than our full model. Second, we replace the exact MIPS with a fast maximal
+
+16
+
+generalization
+FB15k GQE Q2B +d=2000 EmQL(ours) - sketch
+FB15k-237 GQE Q2B +d=2000 EmQL(ours) - sketch
+NELL995 GQE Q2B +d=2000 EmQL(ours) - sketch
+entailment
+FB15k Q2B +d=2000
+EmQL(ours) - sketch
+FB15k-237 Q2B +d=2000
+EmQL(ours) - sketch
+NELL995 Q2B +d=2000
+EmQL(ours) - sketch
+
+1p 0.505 0.654 0.461 0.368 0.453 0.346 0.400 0.322 0.334 0.370 0.311 0.413 0.308 0.372 0.431
+0.559 0.498 0.983 0.819 0.476 0.432 0.998 0.861 0.652 0.545 0.990 0.939
+
+2p 0.320 0.373 0.289 0.452 0.418 0.193 0.225 0.196 0.305 0.297 0.193 0.227 0.174 0.351 0.349
+0.347 0.327 0.961 0.448 0.301 0.262 0.988 0.504 0.465 0.409 0.990 0.750
+
+3p 0.222 0.274 0.242 0.409 0.362 0.145 0.173 0.185 0.304 0.306 0.175 0.208 0.151 0.349 0.300
+0.288 0.274 0.908 0.368 0.249 0.233 0.949 0.352 0.412 0.331 0.971 0.462
+
+2i 0.439 0.488 0.292 0.574 0.556 0.250 0.275 0.193 0.378 0.345 0.275 0.288 0.171 0.539 0.493
+0.389 0.336 0.908 0.564 0.364 0.292 0.902 0.554 0.420 0.357 0.996 0.952
+
+3i 0.536 0.602 0.421 0.609 0.592 0.355 0.378 0.318 0.436 0.400 0.408 0.414 0.350 0.654 0.588
+0.553 0.492 0.872 0.580 0.638 0.466 0.867 0.581 0.562 0.526 0.996 0.954
+
+ip 0.142 0.194 0.130 0.556 0.503 0.086 0.105 0.095 0.351 0.311 0.080 0.125 0.083 0.441 0.423
+0.145 0.139 0.881 0.420 0.113 0.109 0.892 0.451 0.186 0.155 0.987 0.851
+
+pi 0.280 0.339 0.236 0.538 0.482 0.156 0.18 0.149 0.358 0.306 0.170 0.193 0.150 0.561 0.527
+0.280 0.251 0.883 0.466 0.207 0.183 0.909 0.475 0.257 0.217 0.987 0.871
+
+2u 0.300 0.468 0.342 0.074 0.182 0.145 0.198 0.174 0.075 0.129 0.159 0.266 0.183 0.105 0.22
+0.444 0.386 0.887 0.385 0.311 0.255 0.947 0.499 0.516 0.399 0.988 0.653
+
+up 0.242 0.301 0.235 0.375 0.351 0.151 0.178 0.166 0.241 0.272 0.130 0.155 0.087 0.311 0.324
+0.257 0.257 0.910 0.383 0.203 0.198 0.934 0.400 0.269 0.253 0.985 0.702
+
+Avg 0.332 0.410 0.294 0.439 0.433 0.203 0.235 0.200 0.309 0.304 0.211 0.254 0.184 0.409 0.406
+0.362 0.329 0.910 0.492 0.318 0.270 0.932 0.520 0.415 0.355 0.988 0.793
+
+Table 8: MRR results on the Query2Box datasets.
+
+MetaQA 2-hop MetaQA 3-hop WebQuestionsSP
+
+Train 118,980 114,196 2,848
+
+Dev 14,872 14,274
+250
+
+(a) Number of train/dev/test data
+
+Triples Entities
+
+MetaQA
+
+392,906 43,230
+
+WebQuestionsSP 1,352,735 904,938
+
+(b) Size of KB
+
+Test 14,872 14,274 1,639
+Relations 18 695
+
+Table 9: Statistics for the MetaQA and WebQuestionsSP datasets.
+
+inner-product search [16]. This fast MIPS is an approximation of MIPS that eventually causes 2.1% drop in performance (Table 10).
+
+EmQL EmQL (no-sketch) EmQL (no-ﬁlter) EmQL (approx. MIPS) EmQL (no-bert)
+
+WebQuestionsSP 75.5 53.2 65.2 73.4 74.2
+
+Table 10: Ablation study on WebQuestionsSP
+
+17
+
+

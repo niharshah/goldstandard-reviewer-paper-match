@@ -1,0 +1,753 @@
+On The Ingredients of an Effective Zero-shot Semantic Parser
+Pengcheng Yin♠ John Wieting♣ Avi Sil♦ Graham Neubig♠ ♠Carnegie Mellon University ♣Google Research ♦IBM Research {pcyin,gneubig}@cs.cmu.edu jwieting@google.com avi@us.ibm.com
+
+arXiv:2110.08381v1 [cs.CL] 15 Oct 2021
+
+Abstract
+Semantic parsers map natural language utterances into meaning representations (e.g. programs). Such models are typically bottlenecked by the paucity of training data due to the required laborious annotation efforts. Recent studies have performed zero-shot learning by synthesizing training examples of canonical utterances and programs from a grammar, and further paraphrasing these utterances to improve linguistic diversity. However, such synthetic examples cannot fully capture patterns in real data. In this paper we analyze zero-shot parsers through the lenses of the language and logical gaps (Herzig and Berant, 2019), which quantify the discrepancy of language and programmatic patterns between the synthetic canonical examples and real-world user-issued ones. We propose bridging these gaps using improved grammars, stronger paraphrasers, and efﬁcient learning methods using canonical examples that most likely reﬂect real user intents. Our model achieves strong performance on two semantic parsing benchmarks (SCHOLAR, GEO) with zero labeled data.
+1 Introduction
+Semantic parsers translate natural language (NL) utterances into formal meaning representations. In particular, task-oriented semantic parsers map user-issued utterances (e.g. Find papers in ACL) into machine-executable programs (e.g. a database query), play a key role in providing natural language interfaces to applications like conversational virtual assistants (Gupta et al., 2018; Andreas et al., 2020), robot instruction following (Artzi and Zettlemoyer, 2013; Fried et al., 2018), as well as querying databases (Li and Jagadish, 2014; Yu et al., 2018) or generating Python code (Yin and Neubig, 2017).
+Learning semantic parsers typically requires parallel data of utterances annotated with programs, which requires signiﬁcant expertise and cost (Berant et al., 2013). Thus, the ﬁeld has
+
+explored alternative approaches using supervisions cheaper to acquire, such as the execution results (Clarke et al., 2010) or unlabeled utterances (Poon, 2013). In particular, the seminal OVERNIGHT approach (Wang et al., 2015) synthesizes parallel data by using a synchronous grammar to align programs and their canonical NL expressions (e.g. Filter(paper,venue= ? ) ↔ papers in ? and acl↔ACL), then generating examples of compositional utterances (e.g. Papers in ACL) with programs (e.g. Filter(paper,venue=acl)). The synthesized utterances are paraphrased by annotators, a much easier task than writing programs.
+Recently, Xu et al. (2020b) build upon OVERNIGHT and develop a zero-shot semantic parser replacing the manual paraphrasing process with an automatic paraphrase generator (§2). While promising, there are still several open challenges. First, such systems are not truly zero-shot — they still require labeled validation data (e.g. to select the best checkpoint at training). Next, to ensure the quality and broad-coverage of synthetic canonical examples, those models rely on heavily curated grammars (e.g. with 800 production rules), which are cumbersome to maintain. More importantly, as suggested by Herzig and Berant (2019) who study OVERNIGHT models using manual paraphrases, such systems trained on synthetic samples suffer from fundamental mismatches between the distributions of the automatically generated examples and the natural ones issued by real users. Speciﬁcally, there are two types of gaps. First, there is a logical gap between the synthetic and real programs, as real utterances (e.g. Paper coauthored by Peter and Jane) may exhibit logic patterns outside of the domain of those covered by the grammar (e.g. Paper by Jane). The second is the language gap between the synthetic and real utterances, as paraphrased utterances (e.g. u1 in Fig. 1) still follow similar linguistic patterns as the canonical ones they are paraphrased from (e.g. u1), while user-issued utter-
+
+ances are more linguistically diverse (e.g. u2). In this paper we analyze zero-shot parsers
+through the lenses of language and logical gaps, and propose methods to close those gaps (§3). Speciﬁcally, we attempt to bridge the language gap using stronger paraphrasers and more expressive grammars tailored to the domain-speciﬁc idiomatic language patterns. We replace the large grammars of previous work with a highly compact grammar with only 46 domain-general production rules, plus a small set of domain-speciﬁc productions to capture idiomatic language patterns (e.g. u2 in Fig. 1, §3.1.1). We demonstrate that models equipped with such a smaller but more expressive grammar catered to the domain could generate utterances with more idiomatic and diverse language styles.
+On the other hand, closing the logical gap is non-trivial, since canonical examples are generated by exhaustively enumerating all possible programs from the grammar up to a certain depth, and increasing the threshold to cover more complex real-world examples will lead to exponentially more canonical samples, the usage of which is computationally intractable. To tackle the exponentially exploding sample space, we propose an efﬁcient sampling approach by retaining canonical samples that most likely appear in real data (§3.1.2). Speciﬁcally, we approximate the likelihood of canonical examples using the probabilities of their utterances measured by pre-trained language models (LMs). This enables us to improve logical coverage of programs while maintaining a tractable number of highlyprobable examples as training data.
+In experiments, we show that by bridging the language and logical gaps, our system achieves strong results on two datasets featuring realistic utterances (SCHOLAR and GEO). Despite the fact that our model uses zero annotated data for training and validation, it outperforms other supervised methods like OVERNIGHT and GRANNO (Herzig and Berant, 2019) that require manual annotation. Analysis shows that current models are far from perfect, suggesting logical gap still remains an issue, while stronger paraphrasers are needed to further close the language gap.
+2 Zero-shot Semantic Parsing via Data Synthesis
+Problem Deﬁnition Semantic parsers translate a user-issued NL utterance u into a machineexecutable program z (Fig. 1). We consider a zeroshot learning setting without access to parallel data
+
+in the target domain. Instead, the system is trained on a collection of machine-synthesized examples.
+Overview Our system is inspired by the existing zero-shot parser by Xu et al. (2020b). Fig. 1 illustrates our framework. Intuitively, we automatically create training examples with canonical utterances from a grammar, which are then paraphrased to increase diversity in language style. Speciﬁcally, there are two stages. First, a set of seed canonical examples (Fig. 1b) are generated from a synchronous grammar, which deﬁnes compositional rules of NL expressions to form utterances (Fig. 1a). Next, in the iterative training stage, a paraphrase generation model rewrites the canonical utterances to more natural and linguistically diverse alternatives (Fig. 1c). The paraphrased examples are then used to train a semantic parser. To mitigate noisy paraphrases, a ﬁltering model, which is the parser trained on previous iterations, rejects paraphrases that are potentially incorrect. This step of paraphrasing and training could proceed for multiple iterations, with the parser trained on a dataset with growing diversity of language styles.
+Synchronous Grammar Seed canonical examples are generated from a synchronous context free grammar (SCFG). Fig. 1a lists simpliﬁed production rules in the grammar. Intuitively, productions specify how utterances are composed from lowerlevel language constructs and domain lexicons. For instance, given a database entity allan_turing with a property citations, u3 in Fig. 1 could be generated using r1. Productions could be applied recursively to derive more compositional utterances (e.g. u2 using r2, r4 and r6). Our SCFG is based on Herzig and Berant (2019), consisting of domain-general rules of generic logical operations (e.g. superlative, r3) and domain-speciﬁc lexicons of entity types and relations. Different from Xu et al. (2020b) which uses a complex grammar with 800 rules, we use a compact grammar with only 46 generic rules plus a handful of idiomatic productions (§3.1.1) to capture domain-speciﬁc language patterns (e.g. “most recent” in u2, c.f., u1). Given the grammar, examples are enumerated exhaustively up to a threshold of number of rule applications, yielding a large set of seed canonical examples Dcan (Fig. 1b) for paraphrasing.1
+1SCFGs could not generate utterances with contextdependent rhetorical patterns such as anaphora. Our model could still handle simple domain-speciﬁc context-dependent patterns (e.g. Paper by A and B, where A and B are different
+
+𝑟&: Get property of an entity
+
+$EntSet
+
+7!< l a t e x i t s h a 1 _ b a s e 6 4 = " Y i m T O k 6 p o s d I r s B D I b l / q a J L v 3 o = " > A A A B / X i c b V D L S g N B E J z 1 G e M r 6 t H L Y B A 8 h d 0 g 6 j H o x W M E 8 4 B k C b O T 2 W T I P J a Z X i E s w W / w q m d v 4 t V v 8 e i f O E n 2 Y B I L G o q q b r q 7 o k R w C 7 7 / 7 a 2 t b 2 x u b R d 2 i r t 7 + w e H p a P j p t W p o a x B t d C m H R H L B F e s A R w E a y e G E R k J 1 o p G d 1 O / 9 c S M 5 V o 9 w j h h o S Q D x W N O C T i p 1 Z U k s a B 7 p b J f 8 W f A q y T I S R n l q P d K P 9 2 + p q l k C q g g 1 n Y C P 4 E w I w Y 4 F W x S 7 K a W J Y S O y I B 1 H F V E M h t m s 3 M n + N w p f R x r 4 0 o B n q l / J z I i r R 3 L y H V K A k O 7 7 E 3 F / 7 x O C v F N m H G V p M A U n S + K U 4 F B 4 + n v u M 8 N o y D G j h B q u L s V 0 y E x h I J L a G F L J C c u k 2 A 5 g V X S r F a C q 0 r 1 4 b J c u 8 3 T K a B T d I Y u U I C u U Q 3 d o z p q I I p G 6 A W 9 o j f v 2 X v 3 P r z P e e u a l 8 + c o A V 4 X 7 9 X D Z Z N < / l a t e x i t >
+
+$property
+
+of
+
+$Entity
+
+𝑟!: Prepositional Phrase
+
+$PrepNP
+
+7!< l a t e x i t s h a 1 _ b a s e 6 4 = " Y i m T O k 6 p o s d I r s B D I b l / q a J L v 3 o = " > A A A B / X i c b V D L S g N B E J z 1 G e M r 6 t H L Y B A 8 h d 0 g 6 j H o x W M E 8 4 B k C b O T 2 W T I P J a Z X i E s w W / w q m d v 4 t V v 8 e i f O E n 2 Y B I L G o q q b r q 7 o k R w C 7 7 / 7 a 2 t b 2 x u b R d 2 i r t 7 + w e H p a P j p t W p o a x B t d C m H R H L B F e s A R w E a y e G E R k J 1 o p G d 1 O / 9 c S M 5 V o 9 w j h h o S Q D x W N O C T i p 1 Z U k s a B 7 p b J f 8 W f A q y T I S R n l q P d K P 9 2 + p q l k C q g g 1 n Y C P 4 E w I w Y 4 F W x S 7 K a W J Y S O y I B 1 H F V E M h t m s 3 M n + N w p f R x r 4 0 o B n q l / J z I i r R 3 L y H V K A k O 7 7 E 3 F / 7 x O C v F N m H G V p M A U n S + K U 4 F B 4 + n v u M 8 N o y D G j h B q u L s V 0 y E x h I J L a G F L J C c u k 2 A 5 g V X S r F a C q 0 r 1 4 b J c u 8 3 T K a B T d I Y u U I C u U Q 3 d o z p q I I p G 6 A W 9 o j f v 2 X v 3 P r z P e e u a l 8 + c o A V 4 X 7 9 X D Z Z N < / l a t e x i t >
+
+$prep
+
+(e.g., in deep $Entity
+
+learning)
+
+𝑟": Complementary
+
+$Compl.
+
+7!< l a t e x i t s h a 1 _ b a s e 6 4 = " Y i m T O k 6 p o s d I r s B D I b l / q a J L v 3 o = " > A A A B / X i c b V D L S g N B E J z 1 G e M r 6 t H L Y B A 8 h d 0 g 6 j H o x W M E 8 4 B k C b O T 2 W T I P J a Z X i E s w W / w q m d v 4 t V v 8 e i f O E n 2 Y B I L G o q q b r q 7 o k R w C 7 7 / 7 a 2 t b 2 x u b R d 2 i r t 7 + w e H p a P j p t W p o a x B t d C m H R H L B F e s A R w E a y e G E R k J 1 o p G d 1 O / 9 c S M 5 V o 9 w j h h o S Q D x W N O C T i p 1 Z U k s a B 7 p b J f 8 W f A q y T I S R n l q P d K P 9 2 + p q l k C q g g 1 n Y C P 4 E w I w Y 4 F W x S 7 K a W J Y S O y I B 1 H F V E M h t m s 3 M n + N w p f R x r 4 0 o B n q l / J z I i r R 3 L y H V K A k O 7 7 E 3 F / 7 x O C v F N m H G V p M A U n S + K U 4 F B 4 + n v u M 8 N o y D G j h B q u L s V 0 y E x h I J L a G F L J C c u k 2 A 5 g V X S r F a C q 0 r 1 4 b J c u 8 3 T K a B T d I Y u U I C u U Q 3 d o z p q I I p G 6 A W 9 o j f v 2 X v 3 P r z P e e u a l 8 + c o A V 4 X 7 9 X D Z Z N < / l a t e x i t >
+
+that
+
+(e.g., that has the largest citation has the largest $property
+
+count)
+
+𝑟#: Entity type (e.g., paper) and relative clause
+
+$EntSet
+
+7!< l a t e x i t s h a 1 _ b a s e 6 4 = " Y i m T O k 6 p o s d I r s B D I b l / q a J L v 3 o = " > A A A B / X i c b V D L S g N B E J z 1 G e M r 6 t H L Y B A 8 h d 0 g 6 j H o x W M E 8 4 B k C b O T 2 W T I P J a Z X i E s w W / w q m d v 4 t V v 8 e i f O E n 2 Y B I L G o q q b r q 7 o k R w C 7 7 / 7 a 2 t b 2 x u b R d 2 i r t 7 + w e H p a P j p t W p o a x B t d C m H R H L B F e s A R w E a y e G E R k J 1 o p G d 1 O / 9 c S M 5 V o 9 w j h h o S Q D x W N O C T i p 1 Z U k s a B 7 p b J f 8 W f A q y T I S R n l q P d K P 9 2 + p q l k C q g g 1 n Y C P 4 E w I w Y 4 F W x S 7 K a W J Y S O y I B 1 H F V E M h t m s 3 M n + N w p f R x r 4 0 o B n q l / J z I i r R 3 L y H V K A k O 7 7 E 3 F / 7 x O C v F N m H G V p M A U n S + K U 4 F B 4 + n v u M 8 N o y D G j h B q u L s V 0 y E x h I J L a G F L J C c u k 2 A 5 g V X S r F a C q 0 r 1 4 b J c u 8 3 T K a B T d I Y u U I C u U Q 3 d o z p q I I p G 6 A W 9 o j f v 2 X v 3 P r z P e e u a l 8 + c o A V 4 X 7 9 X D Z Z N < / l a t e x i t >
+
+$EntType (
+
+$PrepNP
+
+| $Compl.
+
+𝑟$: Conjunctives
+
+$EntSet
+
+7!< l a t e x i t s h a 1 _ b a s e 6 4 = " Y i m T O k 6 p o s d I r s B D I b l / q a J L v 3 o = " > A A A B / X i c b V D L S g N B E J z 1 G e M r 6 t H L Y B A 8 h d 0 g 6 j H o x W M E 8 4 B k C b O T 2 W T I P J a Z X i E s w W / w q m d v 4 t V v 8 e i f O E n 2 Y B I L G o q q b r q 7 o k R w C 7 7 / 7 a 2 t b 2 x u b R d 2 i r t 7 + w e H p a P j p t W p o a x B t d C m H R H L B F e s A R w E a y e G E R k J 1 o p G d 1 O / 9 c S M 5 V o 9 w j h h o S Q D x W N O C T i p 1 Z U k s a B 7 p b J f 8 W f A q y T I S R n l q P d K P 9 2 + p q l k C q g g 1 n Y C P 4 E w I w Y 4 F W x S 7 K a W J Y S O y I B 1 H F V E M h t m s 3 M n + N w p f R x r 4 0 o B n q l / J z I i r R 3 L y H V K A k O 7 7 E 3 F / 7 x O C v F N m H G V p M A U n S + K U 4 F B 4 + n v u M 8 N o y D G j h B q u L s V 0 y E x h I J L a G F L J C c u k 2 A 5 g V X S r F a C q 0 r 1 4 b J c u 8 3 T K a B T d I Y u U I C u U Q 3 d o z p q I I p G 6 A W 9 o j f v 2 X v 3 P r z P e e u a l 8 + c o A V 4 X 7 9 X D Z Z N < / l a t e x i t >
+
+$EntSet
+
+and $PrepNP
+
+)
+
+𝑟%: Idiomatic superlative expressions
+
+$EntSet
+
+7!< l a t e x i t s h a 1 _ b a s e 6 4 = " Y i m T O k 6 p o s d I r s B D I b l / q a J L v 3 o = " > A A A B / X i c b V D L S g N B E J z 1 G e M r 6 t H L Y B A 8 h d 0 g 6 j H o x W M E 8 4 B k C b O T 2 W T I P J a Z X i E s w W / w q m d v 4 t V v 8 e i f O E n 2 Y B I L G o q q b r q 7 o k R w C 7 7 / 7 a 2 t b 2 x u b R d 2 i r t 7 + w e H p a P j p t W p o a x B t d C m H R H L B F e s A R w E a y e G E R k J 1 o p G d 1 O / 9 c S M 5 V o 9 w j h h o S Q D x W N O C T i p 1 Z U k s a B 7 p b J f 8 W f A q y T I S R n l q P d K P 9 2 + p q l k C q g g 1 n Y C P 4 E w I w Y 4 F W x S 7 K a W J Y S O y I B 1 H F V E M h t m s 3 M n + N w p f R x r 4 0 o B n q l / J z I i r R 3 L y H V K A k O 7 7 E 3 F / 7 x O C v F N m H G V p M A U n S + K U 4 F B 4 + n v u M 8 N o y D G j h B q u L s V 0 y E x h I J L a G F L J C c u k 2 A 5 g V X S r F a C q 0 r 1 4 b J c u 8 3 T K a B T d I Y u U I C u U Q 3 d o z p q I I p G 6 A W 9 o j f v 2 X v 3 P r z P e e u a l 8 + c o A V 4 X 7 9 X D Z Z N < / l a t e x i t >
+
+$SuperlativeAdj
+
+$EntSet
+
+(a) Grammar
+
+u< l a t e x i t s h a 1 _ b a s e 6 4 = " j 6 v D H f m d l V H I C s a n q 3 i i w 1 j h W d I = " > A A A B / n i c b V A 9 S w N B E J 2 L X z F + R S 1 t F o N g F e 6 C R M u g j W U E 8 w H J E f Y 2 e 8 m S 3 b 1 j d 0 8 I x 4 G / w V Z r O 7 H 1 r 1 j 6 T 9 w k V 5 j E B w O P 9 2 a Y m R f E n G n j u t 9 O Y W N z a 3 u n u F v a 2 z 8 4 P C o f n 7 R 1 l C h C W y T i k e o G W F P O J G 0 Z Z j j t x o p i E X D a C S Z 3 M 7 / z R J V m k X w 0 0 5 j 6 A o 8 k C x n B x k r d f i D S J B t 4 g 3 L F r b p z o H X i 5 a Q C O Z q D 8 k 9 / G J F E U G k I x 1 r 3 P D c 2 f o q V Y Y T T r N R P N I 0 x m e A R 7 V k q s a D a T + f 3 Z u j C K k M U R s q W N G i u / p 1 I s d B 6 K g L b K b A Z 6 1 V v J v 7 n 9 R I T 3 v g p k 3 F i q C S L R W H C k Y n Q 7 H k 0 Z I o S w 6 e W Y K K Y v R W R M V a Y G B v R 0 p Z A Z D Y T b z W B d d K u V b 1 6 t f Z w V W n c 5 u k U 4 Q z O 4 R I 8 u I Y G 3 E M T W k C A w w u 8 w p v z 7 L w 7 H 8 7 n o r X g 5 D O n s A T n 6 x f X U p a P < / l a t e x i t > 1
+
+Paper that has the largest
+
+publication year and in deep learning
+
+u< l a t e x i t s h a 1 _ b a s e 6 4 = " f W z j 9 e N a U R L V 0 t n S / A 0 Z a u P 6 K 5 w = " > A A A B / n i c b V A 9 S w N B E J 2 L X z F + R S 1 t F o N g F e 6 C R M u g j W U E 8 w H J E f Y 2 e 8 m S 3 b 1 j d 0 8 I x 4 G / w V Z r O 7 H 1 r 1 j 6 T 9 w k V 5 j E B w O P 9 2 a Y m R f E n G n j u t 9 O Y W N z a 3 u n u F v a 2 z 8 4 P C o f n 7 R 1 l C h C W y T i k e o G W F P O J G 0 Z Z j j t x o p i E X D a C S Z 3 M 7 / z R J V m k X w 0 0 5 j 6 A o 8 k C x n B x k r d f i D S J B v U B u W K W 3 X n Q O v E y 0 k F c j Q H 5 Z / + M C K J o N I Q j r X u e W 5 s / B Q r w w i n W a m f a B p j M s E j 2 r N U Y k G 1 n 8 7 v z d C F V Y Y o j J Q t a d B c / T u R Y q H 1 V A S 2 U 2 A z 1 q v e T P z P 6 y U m v P F T J u P E U E k W i 8 K E I x O h 2 f N o y B Q l h k 8 t w U Q x e y s i Y 6 w w M T a i p S 2 B y G w m 3 m o C 6 6 R d q 3 r 1 a u 3 h q t K 4 z d M p w h m c w y V 4 c A 0 N u I c m t I A A h x d 4 h T f n 2 X l 3 P p z P R W v B y W d O Y Q n O 1 y / Y 5 Z a Q < / l a t e x i t > 2
+
+Most recent paper in deep learning
+
+z< l a t e x i t s h a 1 _ b a s e 6 4 = " Z R a 3 L B 1 O 3 Q f 9 3 O B o e 4 + U m Z p b K P A = " > A A A B / n i c b V A 9 S w N B E J 2 L X z F + R S 1 t F o N g F e 6 C q G X Q x j K C + Y D k C H u b v W T J 7 t 6 x u y f E 4 8 D f Y K u 1 n d j 6 V y z 9 J 2 6 S K 0 z i g 4 H H e z P M z A t i z r R x 3 W + n s L a + s b l V 3 C 7 t 7 O 7 t H 5 Q P j 1 o 6 S h S h T R L x S H U C r C l n k j Y N M 5 x 2 Y k W x C D h t B + P b q d 9 + p E q z S D 6 Y S U x 9 g Y e S h Y x g Y 6 V O L x D p U 9 a v 9 c s V t + r O g F a J l 5 M K 5 G j 0 y z + 9 Q U Q S Q a U h H G v d 9 d z Y + C l W h h F O s 1 I v 0 T T G Z I y H t G u p x I J q P 5 3 d m 6 E z q w x Q G C l b 0 q C Z + n c i x U L r i Q h s p 8 B m p J e 9 q f i f 1 0 1 M e O 2 n T M a J o Z L M F 4 U J R y Z C 0 + f R g C l K D J 9 Y g o l i 9 l Z E R l h h Y m x E C 1 s C k d l M v O U E V k m r V v U u q 7 X 7 i 0 r 9 J k + n C C d w C u f g w R X U 4 Q 4 a 0 A Q C H F 7 g F d 6 c Z + f d + X A + 5 6 0 F J 5 8 5 h g U 4 X 7 / g 0 5 a V < / l a t e x i t > 2
+
+superlative( filter(paper, key=year)
+
+topic=DL),
+
+u< l a t e x i t s h a 1 _ b a s e 6 4 = " B N m l m V F Q g f t J F 3 K q F Q J Z b O L Y J 4 o = " > A A A B / n i c b V A 9 S w N B E J 2 L X z F + R S 1 t F o N g F e 6 i q G X Q x j K C + Y D k C H u b v W T J 7 t 6 x u y e E 4 8 D f Y K u 1 n d j 6 V y z 9 J 2 6 S K 0 z i g 4 H H e z P M z A t i z r R x 3 W + n s L a + s b l V 3 C 7 t 7 O 7 t H 5 Q P j 1 o 6 S h S h T R L x S H U C r C l n k j Y N M 5 x 2 Y k W x C D h t B + O 7 q d 9 + o k q z S D 6 a S U x 9 g Y e S h Y x g Y 6 V O L x B p k v U v + u W K W 3 V n Q K v E y 0 k F c j T 6 5 Z / e I C K J o N I Q j r X u e m 5 s / B Q r w w i n W a m X a B p j M s Z D 2 r V U Y k G 1 n 8 7 u z d C Z V Q Y o j J Q t a d B M / T u R Y q H 1 R A S 2 U 2 A z 0 s v e V P z P 6 y Y m v P F T J u P E U E n m i 8 K E I x O h 6 f N o w B Q l h k 8 s w U Q x e y s i I 6 w w M T a i h S 2 B y G w m 3 n I C q 6 R V q 3 p X 1 d r D Z a V + m 6 d T h B M 4 h X P w 4 B r q c A 8 N a A I B D i / w C m / O s / P u f D i f 8 9 a C k 8 8 c w w K c r 1 / a e J a R < / l a t e x i t > 3
+
+Citation count of Allan Turing
+
+(b) Canonical Data Generation
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " 3 R Z 9 n T N N c K 3 h 0 P u M b 7 k Y j n A T B 1 M = " > A A A B / 3 i c b V A 9 S w N B E J 3 z M 8 a v q K X N Y h C t w l 0 Q t Q z a W E Y w H 5 I c Y W + z l y z Z 3 T t 2 9 4 R w X O F v s N X a T m z 9 K Z b + E z f J F S b x w c D j v R l m 5 g U x Z 9 q 4 7 r e z s r q 2 v r F Z 2 C p u 7 + z u 7 Z c O D p s 6 S h S h D R L x S L U D r C l n k j Y M M 5 y 2 Y 0 W x C D h t B a P b i d 9 6 o k q z S D 6 Y c U x 9 g Q e S h Y x g Y 6 X H b i D S J D v r e b 1 S 2 a 2 4 U 6 B l 4 u W k D D n q v d J P t x + R R F B p C M d a d z w 3 N n 6 K l W G E 0 6 z Y T T S N M R n h A e 1 Y K r G g 2 k + n B 2 f o 1 C p 9 F E b K l j R o q v 6 d S L H Q e i w C 2 y m w G e p F b y L + 5 3 U S E 1 7 7 K Z N x Y q g k s 0 V h w p G J 0 O R 7 1 G e K E s P H l m C i m L 0 V k S F W m B i b 0 d y W Q G Q 2 E 2 8 x g W X S r F a 8 y 0 r 1 / q J c u 8 n T K c A x n M A 5 e H A F N b i D O j S A g I A X e I U 3 5 9 l 5 d z 6 c z 1 n r i p P P H M E c n K 9 f P K 2 W w A = = < / l a t e x i t >
+u
+
+0 1
+
+Paper in deep learning and the biggest year of publication
+
+What is the biggest year for publishing deep learning?
+
+< l a t e x i t s h a 1 _ b a s e 6 4 = " b / I p e l Z H Y O E s A 4 P 0 S / V Z 7 G W 2 Z s Y = " > A A A B / 3 i c b V A 9 S w N B E J 3 z M 8 a v q K X N Y h C t w l 0 Q t Q z a W E Y w H 5 I c Y W + z l y z Z 3 T t 2 9 4 R w X O F v s N X a T m z 9 K Z b + E z f J F S b x w c D j v R l m 5 g U x Z 9 q 4 7 r e z s r q 2 v r F Z 2 C p u 7 + z u 7 Z c O D p s 6 S h S h D R L x S L U D r C l n k j Y M M 5 y 2 Y 0 W x C D h t B a P b i d 9 6 o k q z S D 6 Y c U x 9 g Q e S h Y x g Y 6 X H b i D S J O t V z 3 q l s l t x p 0 D L x M t J G X L U e 6 W f b j 8 i i a D S E I 6 1 7 n h u b P w U K 8 M I p 1 m x m 2 g a Y z L C A 9 q x V G J B t Z 9 O D 8 7 Q q V X 6 K I y U L W n Q V P 0 7 k W K h 9 V g E t l N g M 9 S L 3 k T 8 z + s k J r z 2 U y b j x F B J Z o v C h C M T o c n 3 q M 8 U J Y a P L c F E M X s r I k O s M D E 2 o 7 k t g c h s J t 5 i A s u k W a 1 4 l 5 X q / U W 5 d p O n U 4 B j O I F z 8 O A K a n A H d W g A A Q E v 8 A p v z r P z 7 n w 4 n 7 P W F S e f O Y I 5 O F + / P o O W w Q = = < / l a t e x i t >
+u
+
+0 2
+
+Most
+
+recent
+
+research
+
+in
+
+deep
+
+learning
+
+What is the latest deep learning study? What’s new in deep learning?
+
+Recent research on deep learning
+
+u020 < l a t e x i t s h a 1 _ b a s e 6 4 = " I L 7 v / r s Q u S Y P h p Z d 2 B 4 f j w f 5 0 G Q = " > A A A C A H i c b V A 9 T w J B E J 3 D L 8 Q v 1 N J m I z F Y k T t i 1 J J o Y 4 m J f E S 4 k L 1 l D z b s 7 l 1 2 9 0 z I h c b f Y K u 1 n b H 1 n 1 j 6 T 1 z g C g F f M s n L e z O Z m R f E n G n j u t 9 O b m 1 9 Y 3 M r v 1 3 Y 2 d 3 b P y g e H j V 1 l C h C G y T i k W o H W F P O J G 0 Y Z j h t x 4 p i E X D a C k a 3 U 7 / 1 R J V m k X w w 4 5 j 6 A g 8 k C x n B x k q P 3 U C k y a R X L Z d 7 x Z J b c W d A q 8 T L S A k y 1 H v F n 2 4 / I o m g 0 h C O t e 5 4 b m z 8 F C v D C K e T Q j f R N M Z k h A e 0 Y 6 n E g m o / n V 0 8 Q W d W 6 a M w U r a k Q T P 1 7 0 S K h d Z j E d h O g c 1 Q L 3 t T 8 T + v k 5 j w 2 k + Z j B N D J Z k v C h O O T I S m 7 6 M + U 5 Q Y P r Y E E 8 X s r Y g M s c L E 2 J A W t g R i Y j P x l h N Y J c 1 q x b u s V O 8 v S r W b L J 0 8 n M A p n I M H V 1 C D O 6 h D A w h I e I F X e H O e n X f n w / m c t + a c b O Y Y F u B 8 / Q K k O 5 b y < / l a t e x i t >
+
+What’s
+
+the
+
+research?
+
+latest
+
+deep
+
+learning
+
+What’s the latest study on deep learning?
+
+Allan Turing’s citations
+
+The citations of Allan Turing How many citations did Allan Turing get?
+
+How many citations does Allan Turing have?
+
+(c) Iterative Paraphrasing and Training
+
+Figure 1: Illustration of the learning process of our zero-shot semantic parser with real model outputs. (a) Synchronous grammar with production rules. (b) Canonical examples of utterances with programs (only z2 is shown) are generated from the grammar (colored spans show productions used). Unnatural utterances like u1 can be discarded, as in §3.1.2 (c) At each iteration, canonical examples are paraphrased to increase diversity in language style, and a semantic parser is trained on the paraphrased examples. Potentially noisy or vague paraphrases are ﬁltered (marked as ) using the parser trained on previous iterations.
+
+Paraphrase Generation and Filtering The paraphrase generation model rewrites a canonical utterance u to more natural and diverse alternatives u . u is then paired with u’s program to create a new example. We ﬁnetune a BART model on the dataset by Krishna et al. (2020), a subset of the PARANMT corpus (Wieting and Gimpel, 2018) that contain lexically and syntactically diverse paraphrases. The model therefore learns to produce paraphrases with a variety of linguistic patterns, which is essential for closing the language gap when paraphrasing from canonical utterances (§4). Still, some paraphrases are noisy or potentially vague ( in Fig. 1c). We follow Xu et al. (2020b) and use the parser trained on previous iterations as the ﬁltering model, and reject paraphrases for which the parser cannot predict their programs.
+3 Bridging the Gaps between Canonical and Natural Data
+Language and Logical Gaps The synthesis approach in §2 will generate a large set of paraphrased canonical data (denoted as Dpar). However, as noted by Herzig and Berant (2019) (hereafter HB19), the synthetic examples cannot capture all the language and programmatic patterns of
+authors) by ﬁrst generating all the canonical samples and then ﬁltering those that violate the constraints.
+
+real-world natural examples from users (denoted as Dnat). There are two mismatches between Dpar and Dnat. First, there is a logical gap between the programs in Dnat capturing real user intents, and the synthetic ones in Dpar. Notably, since programs are exhaustively enumerated from the grammar up to a certain compositional depth, Dpar will not cover more complex programs in Dnat beyond the threshold. Ideally we could improve the coverage using a higher threshold. However, the space of possible programs will grow exponentially, and combinatorial explosion happens even with small thresholds.
+Next, there is a language gap between paraphrased canonical utterances and real-world userissued ones. Real utterances (e.g. the u2 in Fig. 1, modeled later in §3.1.1) enjoy more lexical and syntactical diversity, while the auto-paraphrased ones (e.g. u1) are typically biased towards the monotonous and verbose language style of their canonical source (e.g. u1). While we could increase diversity via iterative rounds of paraphrasing (e.g. u2 → u2 → u2), the paraphraser could still fail on canonical utterances that are not natural English sentences at all, like u1.
+3.1 Bridging Language and Logical Gaps
+We introduce improvements to the system to close the language (§3.1.1) and logical (§3.1.2) gaps.
+
+3.1.1 Idiomatic Productions To close language gaps, we augment the grammar with productions capturing domain-speciﬁc idiomatic language styles. Such productions compress the clunky canonical expressions (e.g. u1 in Fig. 1) to more succinct and natural alternatives (e.g. u2). We focus on two language patterns:
+Non-compositional expressions for multi-hop relations Compositional canonical utterances typically feature chained multi-hop relations that are joined together (e.g. Author that writes paper whose topic is NLP), which can be compressed using more succinct phrases to denote the relation chain, where the intermediary pivoting entities (e.g. paper) are omitted (e.g. Author that works on NLP). The pattern is referred to as sub-lexical compositionality in Wang et al. (2015) and used by annotators to compress verbose canonical utterances, while we model them using grammar rules. Refer to Appendix B for more details.
+Idiomatic Comparatives and Superlatives The general grammar in Fig. 1a uses canonical constructs for comparative (e.g. smaller than) and superlative (e.g. largest) utterances (e.g. u1), which is not ideal for entity types with special units (e.g. time, length). We therefore create productions specifying idiomatic comparative and superlative expressions (e.g. paper published before 2014, and u2 in Fig. 1). Sometimes, answering a superlative utterance also requires reasoning with other pivoting entities. For instance, the relation in “venue that X publish mostly in” between authors and venues implicitly involves counting the papers that X publishes. For such cases, we create “macro” productions, with the NL phrase mapped to a program that captures the computation involving the pivoting entity (Appendix B).
+Discussion In line with Su and Yan (2017) and Marzoev et al. (2020), we remark that such functionality-driven grammar engineering to cover representative patterns in real data using a small set of curated production rules is more efﬁcient and costeffective than example-driven annotation, which requires labeling a sufﬁcient number of parallel samples to effectively train a data-hungry neural model over a variety of underlying meanings and surface language styles. In contrast, our approach follows Xu et al. (2020b) to automatically synthesize complex compositional samples from the user-speciﬁed productions, which are further paraphrased to signiﬁcantly increase their linguistic diversity.
+
+3.1.2 Naturalness-driven Data Selection
+
+To cover real programs in Dnat with complex struc-
+
+tures while tackling the exponential sample space,
+
+we propose an efﬁcient approach to sub-sample
+
+a small set of examples from this space as seed
+
+canonical data Dcan (Fig. 1b) for paraphrasing. Our
+
+core idea is to only retain a set of examples u, z
+
+that most likely reﬂect the intents of real users. We
+
+use the probability pLM(u) measured by a language
+
+model to approximate the “naturalness” of canoni-
+
+cal examples.2 Speciﬁcally, given all canonical ex-
+
+amples allowed by the grammar, we form buckets
+
+based on their derivation depth d. For each bucket D(cdan), we compute pLM(u) for its examples, and
+
+group the examples using program templates as the
+
+key (e.g. u1 and u2 in Fig. 1 are grouped together). For each group, we ﬁnd the example u∗, z
+with the highest pLM(u∗), and discard other examples u, z if log pLM(u∗) − log pLM(u) > δ
+
+(δ = 5.0), removing unlikely utterances from the
+
+group (e.g. u1).3 Finally, we rank all groups in
+
+(d)
+Dcan
+
+based
+
+on
+
+pLM(u∗),
+
+and
+
+retain
+
+examples
+
+in
+
+the
+
+top-K groups. This method offers trade-off be-
+
+tween program coverage and efﬁciency and, more
+
+surprisingly, we show that using only 0.2%∼1%
+
+top-ranked examples also results in signiﬁcantly
+
+better ﬁnal accuracy (§4).
+
+3.2 Generating Validation Data
+Zero-shot learning is non-trivial without a highquality validation set, as the model might overﬁt on the (paraphrased) canonical data, which is subject to language and logical mismatch. While existing methods (Xu et al., 2020b) circumvent the issue using real validation data, in this work we create validation sets from paraphrased examples, making our method truly labeled data-free. Speciﬁcally, we consider a two-stage procedure. First, we run the iterative paraphrasing algorithm (§2) without validation, and then sample u, z from its output with a probability p(u, z) ∝ pLM(u)α (α = 0.4), ensuring the resulting sampled set Dvpaalr is representative. Second, we restart training using Dvpaalr for validation to ﬁnd the best checkpoint. The paraphrase ﬁltering model is also initialized with the parser trained in the ﬁrst stage, which has higher precision and accepts more valid paraphrases. This is similar to iterative training of weakly-supervised semantic parsers (Dasigi et al., 2019), where the
+
+2We use the GPT-2 XL model (Radford et al., 2019). 3δ chosen in pilot studies, similar to Zhang et al. (2019).
+
+model searches for candidate programs for unlabeled utterances in multiple stages of learning.
+4 Experiments
+We evaluate our zero-shot parser on two datasets. SCHOLAR (Iyer et al., 2017) is a collection of utterances querying an academic database (Fig. 1). Examples are collected from users interacting with a parser, which are later augmented with Turker paraphrases. We use the version from HB19 with programs represented in λ-calculus logical forms. The sizes of the train/test splits are 579/211. Entities in utterances and programs (e.g. semantic parsing paper in ACL) are canonicalized to typed slots (e.g. keyphrase0, venue0) as in Dong and Lapata (2016), and are recovered when programs are executed during evaluation. We found in the original dataset by HB19, slots are paired with with random entities for execution (e.g. keyphrase0→optics). Therefore reference programs are likely to execute to empty results, making metrics like answer accuracy more prone to false-positives. We manually ﬁx all such examples in the dataset, as well as those with execution errors. GEO (Zelle and Mooney, 1996) is a classical dataset with queries about U.S. geography (e.g. Which rivers run through states bordering California?). Its database contains basic geographical entities like cities, states, and rivers. We also use the release from HB19, of size 537/237.
+Models and Conﬁguration Our semantic parser is a sequence-to-sequence model with a pre-trained BERTBase encoder (Devlin et al., 2019) and an LSTM decoder augmented with a copy mechanism. The paraphraser is a BARTLarge model (Lewis et al., 2020). We use the same set of hyper-parameters for both datasets. Speciﬁcally, we synthesize canonical examples from the SCFG with a maximal program depth of 6, and collect the top-K (K = 2, 000) GPT-scored sample groups for each depth as the seed canonical data Dcan (§3.1.2). We perform the iterative paraphrasing and training procedure (§2) for two iterations. We create validation sets of size 2, 000 in the ﬁrst stage of learning (§3.2), and perform validation using perplexity in the second stage. Refer to Appendix C for more details. Note that our model only uses the natural examples in both datasets for evaluation purposes, and the training and validation splits are not used during learning.
+Measuring Language and Logical Gaps We measure the language mismatch between utterances
+
+System
+
+Supervision
+
+SCHOLAR GEO
+
+Supervised† OVERNIGHT† GRANNO†
+Our System
+
+Labeled Examples
+Manual Paraphrases Real Utterances, Manual Paraphrase Detection −
+
+79.7 ±2.2 41.0 ±3.8 68.3 ±1.6
+75.5 ±1.6
+
+81.9 ±5.3 55.8 ±6.4 69.4 ±1.9
+74.1 ±2.3
+
+Table 1: Averaged denotation accuracy and standard deviation on TEST sets. Results are averaged with ﬁve random restarts. †Models originally from Herzig and Berant (2019) and run with ﬁve random restarts. Results from our model are tested v.s. GRANNO using paired permutation test with p < 0.05.
+in the paraphrased canonical (Dpar) and natural (Dnat) data using perplexities of natural utterances in Dnat given by a GPT-2 LM ﬁne-tuned on Dpar. For logical gap, we follow HB19 and compute the coverage of natural programs z ∈ Dnat in Dpar.
+Metric We use denotation accuracy on the execution results of model-predicted programs. We report the mean and standard deviation with ﬁve random restarts.
+4.1 Results We ﬁrst compare our model with existing approaches using labeled data. Next, we analyze how our proposed methods close the language and logical gaps. Tab. 1 reports accuracies of various systems on the test sets, as well as their form of supervision. Speciﬁcally, the supervised parser uses a standard parallel corpus Dnat of real utterances annotated with programs. OVERNIGHT uses paraphrased synthetic examples Dpar like our model, but with manually written paraphrases. GRANNO uses unlabeled real utterances unat ∈ Dnat, and manual paraphrase detection to pair unat with the canonical examples Dcan. Our model outperforms existing approaches on the two benchmarks without using any annotated data, while GRANNO, the currently most cost-effective approach, still spends $155 in manual annotation (besides collecting real utterances) to create training data for the two datasets (Herzig and Berant (2019), HB19). Overall, the results demonstrate that zero-shot parser based on idiomatic synchronous grammars and automatic paraphrasing using pre-trained LMs is a data-efﬁcient and cost-effective paradigm to train semantic parsers for emerging domains.
+Still, our system falls behind fully supervised models trained on natural datasets Dnat, due to language and logical gaps between Dpar and Dnat. In following experiments, we explore whether our proposed methods are effective at narrowing the gaps and improving accuracy. Since the validation splits of the two datasets are small (e.g. only 99 samples
+
+Grammar
+
+ACC.
+
+PPL Logical Coverage
+
+Dcan
+
+Dpar
+
+Base
+
+66.3 ±3.7 23.0 80.6
+
+75.8
+
++Multihop Rel. 67.0 ±1.1 22.0 87.7
+
+81.2
+
++Comparison
+
+67.3 ±2.4 21.7 86.5
+
+80.2
+
++Superlative
+
+77.8 ±2.2 20.9 90.6
+
+86.1
+
+−Multihop Rel. 75.8 ±3.4 20.8 83.9
+
+81.1
+
+Table 2: Ablation of grammar categories on SCHOLAR.
+
+Grammar
+
+ACC.
+
+PPL Logical Coverage
+
+Dcan
+
+Dpar
+
+Base
+
+64.5 ±4.6 8.2 84.4
+
+79.7
+
++Multihop Rel. 67.9 ±4.0 8.1 83.6
+
+79.7
+
++Superlative
+
+72.8 ±2.8 8.0 84.1
+
+79.4
+
+−Multihop Rel. 66.5 ±3.7 8.2 84.1
+
+80.0
+
+Table 3: Ablation study of grammar categories on GEO.
+
+for SCHOLAR), we use the full training/validation splits for evaluation to get more reliable results.
+More expressive grammars narrow language and logical gaps We capture domain-speciﬁc language patterns using idiomatic productions to close language mismatch (§3.1.1). Tables 2 and 3 list the results when we gradually improve the expressiveness of the grammar by adding different types of idiomatic productions. We observe more expressive grammars help close the language gap, as indicated by the decreasing perplexities. This is especially important for SCHOLAR, which features diverse idiomatic NL expressions hard to infer from plain canonical utterances. For instance, it could be non-trivial to paraphrase canonical utterances with multi-hop (e.g. Author that cites paper by X) or superlative relations (e.g. Topic of the most number of ACL paper) to more idiomatic alternatives (e.g. “Author that cites X”, and “The most popular topic for ACL paper”), while directly including such patterns in the grammar (+Multihop Rel. and +Superlative) is helpful.
+Additionally, we observe that more expressive grammars also improve logical coverage. The last columns (Logical Coverage) of Tables 2 and 3 report the percentage of real programs that are covered by the seed canonical data before (Dcan) and after (Dpar) iterative paraphrasing. Intuitively, idiomatic grammar rules could capture compositional program patterns like multi-hop relations and complex superlative queries (e.g. Author that publish mostly in ACL, §3.1.1) within a single production, enabling the grammar to generate more compositional programs under the same threshold on the derivation depth. Notably, when adding all the idiomatic productions on SCHOLAR, the
+
+number of exhaustively generated examples with a program depth of 6 is tripled (530K → 1, 700K).
+Moreover, recall that the seed canonical dataset Dcan contains examples with highly-likely utterances under the LM (§3.1.2). Therefore, examples created by idiomatic productions are more likely to be included in Dcan, as their more natural and wellformed utterances often have higher LM scores. However, note that this could also be counterproductive, as examples created with idiomatic productions could dominate the LM-ﬁltered Dcan, “crowding out” other useful examples with lower LM scores. This likely explains the slightly decreased logical coverage on GEO (Tab. 3), as more than 30% samples in the ﬁltered Dcan include idiomatic multi-hop relations directly connecting geographic entities with their countries (e.g. “City in US”, c.f. “City in state in US”), while such examples only account for ∼ 8% of real data. While the over-representation issue might not negatively impact accuracy, we leave generating more balanced synthetic data as important future work.
+Finally, we note that the logical coverage drops after paraphrasing (Dcan v.s. Dpar in Tables 2 and 3). This is because for some samples in Dcan, the paraphrase ﬁltering model rejects all their paraphrases. We provide further analysis later in a case study.
+Do smaller logical gaps entail better performance? As in §3.1.2, the seed canonical data Dcan consists of top-K highest-scoring examples under GPT-2 for each program depth. This data selection method makes it possible to train the model efﬁciently in the iterative paraphrasing stage using a small set of canonical samples that most likely appear in natural data out of the exponentially large sample space. However, using a smaller cutoff threshold K might sacriﬁce logical coverage, as fewer examples are in Dcan. To investigate this trade-off, we report results with varying K in Tab. 4. Notably, with K = 1, 000 and around 3K seed canonical data Dcan (before iterative paraphrasing), Dcan already covers 88% and 80% natural programs on SCHOLAR and GEO, resp. This small portion of samples only account for 0.2% (1%) of the full set of 1.7M + (0.27M ) canonical examples exhaustively generated from the grammar on SCHOLAR (GEO). This demonstrates our data selection approach is effective in maintaining learning efﬁciency while closing the logical gap. In contrast, the baseline data selection strategy of randomly choosing canonical examples from each
+
+SCHOLAR
+
+K
+
+Train Data Size
+
+ACC PPL Logical Coverage In Coverage Out of Coverage
+
+|Dcan|
+
+|Dpar|
+
+Dcan
+
+Dpar
+
+ACC PPL ACC PPL
+
+500 1,554 45,269 74.0 ±3.7 22.0 79.4 76.0 (14.5) 82.3 23.4 47.6 18.2 1,000 3,129 80,481 75.9 ±1.7 21.4 88.0 82.0 (9.4) 81.4 21.3 50.6 21.7 2,000 5,486 129,955 77.8 ±2.2 20.9 90.6 86.1 (7.5) 82.2 20.7 50.2 22.7 4,000 9,239 202,429 78.4 ±1.7 20.7 91.9 87.4 (4.9) 83.2 20.5 45.3 22.0 8,000 17,077 330,548 75.5 ±2.1 21.5 92.0 88.2 (2.9) 79.8 21.4 43.4 22.4
+
+500
+
+1,351 29,835 61.6 ±5.4 8.4 70.3 64.4 (14.2) 79.2 7.6 29.8
+
+9.9
+
+1,000 2,586 55,117 68.5 ±7.7 8.2 80.5 74.9 (9.0) 81.4 7.4 28.8 11.3
+
+2,000 5,413 112,530 72.8 ±2.8 8.0 84.1 79.4 (5.2) 82.0 7.4 37.6 10.8
+
+4,000 11,085 182,469 67.5 ±6.3 8.2 84.9 78.3 (3.1) 75.5 7.6 38.8 11.2
+
+8,000 16,312 243,343 67.9 ±4.5 8.2 85.4 78.0 (2.1) 75.5 7.5 41.3 11.2
+
+GEO
+
+Table 4: Results on SCHOLAR and GEO with varying amount of canonical examples in the seed training data.
+
+level of program depth instead of using the top-K highest scored samples is less effective. As an example, this baseline strategy achieves an accuracy of 69.7% and 65.5% on SCHOLAR and GEO respectively when K = 2, 000, which is around 7% lower than the accuracy achieved by our approach (77.8% and 72.8%, Tab. 4).
+More interestingly, while larger K yields higher logical form coverage, the accuracy might not improve. This is possibly because while the recall of real programs improves, the percentage of such programs in paraphrased canonical data Dpar (numbers in parentheses) actually drops. Out of the remaining 90%+ samples in Dpar whose programs are not in Dnat, many have unnatural intents that real users are unlikely to issue (e.g. “Number of titles of papers with the smallest citations”, or “Mountain whose elevation is the length of Colorado River”). Such unlikely samples are potentially harmful to the model, causing worse language mismatch, as suggested by the increasing perplexity when K = 8, 000. Similar to HB19, empirically we observe around one-third of samples in Dcan and Dpar are unlikely. As later in the case study, such unlikely utterances have noisier paraphrases, which hurts the quality of Dpar.
+Does the model generalize to out-of-distribution samples? Next, to investigate whether the model could generalize to utterances with out-ofdistribution program patterns not seen in the training data Dpar, we report accuracies on the splits whose program templates are covered (In Coverage) and not covered (Out of Coverage) by Dpar. Not surprisingly, the model performs signiﬁcantly better on the in-coverage sets with less language mismatch.4 Our results are also in line with recent
+4An exception is K =500 on SCHOLAR, where the perplexity on out-of-coverage samples is slightly lower. This is because utterances in SCHOLAR tend to use compound nouns
+
+research in compositional generalization of semantic parsers (Lake and Baroni, 2018; Finegan-Dollak et al., 2018), which suggests that existing models generalize poorly to utterances with novel compositional patterns (e.g. conjunctive objects like Most cited paper by X and Y) not seen during training. Still surprisingly, our model generalizes reasonably to compositionally novel (out-of-coverage) splits, registering 30% ∼ 50% accuracies, in contrast to HB19 reporting accuracies smaller than 10% on similar benchmarks for OVERNIGHT. We hypothesize that synthesizing compositional samples increases the number of unique program templates in training, which could be helpful for compositional generalization (Akyürek et al., 2021). As an example, the number of unique program templates in Dpar when K = 2, 000 on SCHOLAR and GEO is 1.9K and 1.7K, resp, compared to only 125 and 187 in Dnat. This ﬁnding is reminiscent of data augmentation strategies for supervised parsers using synthetic samples induced from (annotated) parallel data (Jia and Liang, 2016; Wang et al., 2021b).
+Impact of Validation Data Our system generates validation data from samples of the paraphrased data in an initial run (§3.2). Tab Tab. 5 compares this strategy of generating validation data with a baseline approach, which randomly splits the seed canonical examples in Dcan into training and validation sets, and runs the iterative paraphrasing and training algorithm on the two sets in parallel. In each iteration, the checkpoint that achieves the best perplexity on the paraphrased validation exam-
+to specify compositional constraints (e.g. ACL 2021 parsing papers), a language style common for in-coverage samples but not captured by the grammar. With smaller K and Dcan, it is less likely for the paraphrased data Dpar to capture similar syntactic patterns. Anther factor that makes the out-of-coverage PPL smaller when K = 500 is that there are more (simpler) examples in the set compared to K > 500, and the relatively simple utterances will also bring down the PPL.
+
+Validation Method
+Our Approach (§3.2) Random Split of Dcan
+
+SCHOLAR
+77.8 ±2.2 74.1 ±1.5
+
+GEO
+72.8 ±2.8 69.7 ±3.3
+
+Table 5: Denotation accuracies of different strategies to generate validation data.
+
+Paraphraser
+
+SCHOLAR
+
+GEO
+
+Tok. F1↓ τ ↓ ACC.↑ Tok. F1↓ τ ↓ ACC.↑
+
+Ours
+
+70.3 0.71 77.8
+
+Xu et al. (2020b) 72.4 0.94 69.9
+
+69.2 0.78 72.8 74.5 0.95 62.3
+
+Table 6: Systems with different paraphrasers. We report endto-end denotation accuracy, as well as F1 and Kendall’s τ rank coefﬁcient between utterances and their paraphrases.
+ples is saved. We use the paraphrase ﬁltering model learned on the training set to ﬁlter the paraphrases of validation examples. This baseline approach performs reasonably well. Still, empirically we ﬁnd this strategy creates larger logical gaps, as some canonical samples whose program patterns appear in the natural data Dnat could be partitioned into the validation data, and not used for training.
+Impact of Paraphrasers Our system relies on strong paraphrasers to generate diverse utterances in order to close the language gap. Tab. 6 compares the performance of the system trained with our paraphraser and the one used in Xu et al. (2020b). Both models are based on BART, while our paraphraser is ﬁne-tuned to encourage lexically and syntactically diverse outputs (Appendix A). We measure lexical diversity using token-level F1 between the original and paraphrased utterances u, u (Rajpurkar et al., 2016; Krishna et al., 2020). For syntactic divergence, we use Kendall’s τ (Lapata, 2006) to compute the ordinal correlation between u and u , which intuitively measures the number of times to swap tokens in u to get u using bubble sort. Our paraphraser generates more diverse paraphrases (e.g. What is the biggest state in US?) from the source (e.g. State in US and that has the largest area), as indicated by lower token-level overlaps and ordinal coefﬁcients, comparing to the existing paraphraser (e.g. The state in US with the largest surface area). Nevertheless, our paraphraser is still not perfect, as discussed next.
+5 Limitations and Discussion
+Our parser still lags behind the fully supervised model (Tab. 1). To understand the remaining bottlenecks, we show representative examples in Tab. 7.
+Low Recall of Filter Model First, the recall of the paraphrase ﬁltering model is low. The ﬁltering model uses the parser trained on the paraphrased
+
+Example 1 (Uncommon Concept)
+
+u1 Venue of paper by author0 and published in year0
+
+u1,1 author0’s paper, published in year0
+
+u1,2 Where the paper was published by author0 in year0?
+
+u1,3 Where the paper was published in year0 by author0? u∗nat Where did author0 publish in year0? (Wrong Answer)
+
+Example 2 (Novel Language Pattern)
+
+u2 Author of paper published in venue0 and in year0
+
+u2,1 Author of papers published in venue0 in year0
+
+u2,2 Who wrote a paper for venue0 in year0
+
+u2,3 Who wrote the venue0 paper in year0 u∗nat venue0 year0 authors
+
+(Correct)
+
+Example 3 (Unnatural Utterance)
+
+u3 Author of paper by author0
+
+u3,1 Author of the paper written by author0
+
+u3,2 Author of author0’s paper
+
+u3,3 Who wrote the paper author0 wrote? u∗nat Co-authors of author0
+
+(Wrong Answer)
+
+Example 4 (Unlikely Example)
+
+u4 Paper in year0 and whose author is not the most cited author
+
+u4,1 A paper published in year0 that isn’t the most cited author
+
+u4,2 What’s not the most cited author in year0
+
+u4,3 In year0, he was not the most cited author
+
+Table 7: Case Study on SCHOLAR. We show the seed canonical utterance ui, the paraphrases ui,j, and the relevant natural examples u∗nat. and denote the correctness of paraphrases. denotes false negatives of the ﬁltering model (correct paraphrases that are ﬁltered), denotes false positives (incorrect paraphrases that are accepted). Entities are canonicalized with indexed
+data generated in previous iterations. Since this model is less accurate, it can incorrectly reject valid paraphrases u ( in Tab. 7), especially when u uses a different sentence type (e.g. questions) than the source (e.g. statements). Empirically, we found the recall of the ﬁltering model at the ﬁrst iteration of the second-stage training (§3.2) is only around 60%. This creates logical gaps, as paraphrases of examples in the seed canonical data Dcan could be rejected by the conservative ﬁltering model, leaving no samples with the same programs in Dpar.
+Imperfect Paraphraser The imperfect paraphraser could generate semantically incorrect predictions (e.g. u1,1), especially when the source canonical utterance contains uncommon or polysemic concepts (e.g. venue in u1), which tend to be ignored or interpreted as other entities (e.g. sites). Besides rare concepts, the paraphraser could also fail on utterances that follow special compositionality patterns. For instance, u∗nat in Example 2 uses compound nouns to denote the occurrence of a conference, which is difﬁcult to automatically paraphrase from u2 (that uses prepositional phrases) without any domain knowledge. While the model could still correctly answer u∗nat in this case, u∗nat’s perplexity is high, suggesting language mismatch.
+Unnatural Utterances While we have attempted to close the language gap by generating canonical utterances that are more idiomatic in lan-
+
+guage style, some of those synthetic utterances are still not natural enough for the paraphraser to rewrite. This is especially problematic for relations not covered by our idiomatic productions. For instance, our SCFG does not cover the co-authorship relation in Example 3. Therefore the generated synthetic utterance u3 uses a clumsy multi-hop query to express this intent, which is non-trivial for the model to paraphrase to an idiomatic expression such as u∗nat. While this issue could be potentially mitigated using additional production rules, grammar engineering could still remain challenging, as elaborated later in this section.
+Unlikely Examples Related to the issue of unnatural canonical utterances, another challenge is the presence of unlikely examples with convoluted logical forms that rarely appear in real data. As discussed earlier in §4, Dcan contains around 30% such unlikely canonical examples (e.g. u4). Similar to the case of unnatural utterances, paraphrases of those logically unlikely examples are also much noisier (e.g. u4,∗). Empirically, we observe the paraphraser’s accuracy is only around 30% for utterances of such unlikely samples, compared to 70% for the likely ones. The ﬁltering model is also less effective on unlikely examples (false positives ). These noisy samples will eventually hurt performance of the parser. We leave modeling utterance naturalness as important future work.
+Cost of Grammar Engineering Our approach relies on an expressive SCFG to bridge the language and logical gaps between synthetic and real data. While in §3.1.1 we have identiﬁed a set of representative categories of grammar patterns necessary to capture domain-speciﬁc language style, and attempted to standardize the process of grammar construction by designing idiomatic productions following those categories, grammar engineering still remains a non-trivial task. One need to have a good sense of the idiomatic language patterns that would frequently appear in real-world data, which requires performing user study or access to sampled data. Additionally, encoding those language patterns as production rules assumes that the user understands the grammar formalism (λ-calculus) used by our system, which could limit the applicability of the approach to general users. Still, as discussed in §3.1.1, we remark that for users proﬁcient in the grammar formalism, curating a handful of idiomatic production rules is still more efﬁcient than labeling parallel samples to exhaustively
+
+cover compositional logical patterns and diverse language style, and the size of annotated samples required could be orders-of-magnitude larger compared to the size of the grammar. Meanwhile, the process of creating production rules could potentially be simpliﬁed by allowing users to deﬁne them using natural language instead of λ-calculus logical rules, similar in the spirit of the studies on naturalizing programs using canonical language (Wang et al., 2017; Shin et al., 2021; Herzig et al., 2021).
+6 Related Work
+To mitigate the paucity of labeled data, the ﬁeld has explored various supervision signals. Speciﬁcally, weakly-supervised methods leverage the denotations of utterances as indirect supervision (Clarke et al., 2010; Krishnamurthy and Mitchell, 2012), with programs modeled as latent variables (Berant et al., 2013; Pasupat and Liang, 2015). Optimization is challenging due to the noisy binary reward of execution correctness (Agarwal et al., 2019), calling for better learning objectives (Guu et al., 2017; Wang et al., 2021a) or efﬁcient search algorithms for latent programs (Krishnamurthy et al., 2017; Liang et al., 2017, 2018; Muhlgay et al., 2019). Next, semi-supervised models leverage extra unlabeled utterances, using techniques like self-training (Konstas et al., 2017) or generative models (Kociský et al., 2016; Yin et al., 2018). As a step further, unsupervised methods only use unlabeled utterances (Cao et al., 2019), and leverage linguistic scaffolds (e.g. dependency trees) to infer programs with similar structures (Poon, 2013). Like our model, such methods use lexicons to capture alignments between NL phrases and logical predicates (Goldwasser et al., 2011), while our method does not require real utterances. Finally, methods based on OVERNIGHT (Wang et al., 2015) synthesize parallel corpora from SCFGs (Cheng et al., 2019; Xu et al., 2020a) or neural sequence models (Guo et al., 2018), and attempt to bridge the gaps between canonical and real utterances via paraphrase detection (Herzig and Berant, 2019) and generation (Su and Yan, 2017; Shin et al., 2021), or representation learning (Marzoev et al., 2020).
+7 Conclusion
+In this paper, we propose a zero-shot semantic parser that closes the language and logical gaps between synthetic and real data. on SCHOLAR and GEO, our system outperforms other annotationefﬁcient approaches with zero labeled data.
+
+References
+Rishabh Agarwal, Chen Liang, Dale Schuurmans, and Mohammad Norouzi. 2019. Learning to generalize from sparse and underspeciﬁed rewards. In ICML.
+Ekin Akyürek, Afra Feyza Akyurek, and Jacob Andreas. 2021. Learning to recombine and resample data for compositional generalization. In Proceedings of ICLR.
+Jacob Andreas, John Bufe, David Burkett, Charles Chen, Josh Clausman, Jean Crawford, Kate Crim, Jordan DeLoach, Leah Dorner, Jason Eisner, Hao Fang, Alan Guo, David Hall, Kristin Hayes, Kellie Hill, Diana Ho, Wendy Iwaszuk, Smriti Jha, Dan Klein, Jayant Krishnamurthy, Theo Lanman, Percy Liang, Christopher H Lin, Ilya Lintsbakh, Andy McGovern, Aleksandr Nisnevich, Adam Pauls, Dmitrij Petters, Brent Read, Dan Roth, Subhro Roy, Jesse Rusak, Beth Short, Div Slomin, Ben Snyder, Stephon Striplin, Yu Su, Zachary Tellman, Sam Thomson, Andrei Vorobev, Izabela Witoszko, Jason Wolfe, Abby Wray, Yuchen Zhang, and Alexander Zotov. 2020. Task-oriented dialogue as dataﬂow synthesis. Transactions of the Association for Computational Linguistics, 8.
+Yoav Artzi and Luke Zettlemoyer. 2013. Weakly supervised learning of semantic parsers for mapping instructions to actions. Transaction of ACL.
+Jonathan Berant, Andrew Chou, Roy Frostig, and Percy Liang. 2013. Semantic parsing on freebase from question-answer pairs. In Proceedings of EMNLP.
+Ruisheng Cao, Su Zhu, Chen Liu, Jieyu Li, and Kai Yu. 2019. Semantic parsing with dual learning. In Proceedings of ACL.
+Jianpeng Cheng, Siva Reddy, V. Saraswat, and Mirella Lapata. 2019. Learning an executable neural semantic parser. Computational Linguistics, 45:59–94.
+James Clarke, Dan Goldwasser, Ming-Wei Chang, and Dan Roth. 2010. Driving semantic parsing from the world’s response. In Proceedings of CoNLL.
+Pradeep Dasigi, Matt Gardner, Shikhar Murty, Luke S. Zettlemoyer, and Eduard H. Hovy. 2019. Iterative search for weakly supervised semantic parsing. In Proceedings of NAACL-HLT.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. Bert: Pre-training of deep bidirectional transformers for language understanding. In Proceedings of NAACL-HLT.
+Li Dong and Mirella Lapata. 2016. Language to logical form with neural attention. In Proceedings of ACL.
+Catherine Finegan-Dollak, Jonathan K. Kummerfeld, Li Zhang, Karthik Ramanathan, Sesh Sadasivam, Rui Zhang, and Dragomir Radev. 2018. Improving text-to-SQL evaluation methodology. In Proceedings of ACL.
+
+Daniel Fried, Ronghang Hu, Volkan Cirik, Anna Rohrbach, Jacob Andreas, Louis-Philippe Morency, Taylor Berg-Kirkpatrick, Kate Saenko, Dan Klein, and Trevor Darrell. 2018. Speaker-follower models for vision-and-language navigation. In Proceedings of NeurIPS.
+Dan Goldwasser, Roi Reichart, J. Clarke, and D. Roth. 2011. Conﬁdence driven unsupervised semantic parsing. In Proceedings of ACL.
+Daya Guo, Yibo Sun, Duyu Tang, Nan Duan, Jian Yin, Hong Chi, James Cao, Peng Chen, and M. Zhou. 2018. Question generation from sql queries improves neural semantic parsing. In Proceedings of EMNLP.
+Sonal Gupta, Rushin Shah, Mrinal Mohit, Anuj Kumar, and Mike Lewis. 2018. Semantic parsing for task oriented dialog using hierarchical representations. In Proceedings of EMNLP.
+Kelvin Guu, Panupong Pasupat, Evan Zheran Liu, and Percy Liang. 2017. From language to programs: Bridging reinforcement learning and maximum marginal likelihood. In Proceedings of ACL.
+Jonathan Herzig and Jonathan Berant. 2019. Don’t paraphrase, detect! rapid and effective data collection for semantic parsing. In Proceedings of EMNLP.
+Jonathan Herzig, Peter Shaw, Ming-Wei Chang, Kelvin Guu, Panupong Pasupat, and Yuan Zhang. 2021. Unlocking compositional generalization in pre-trained models using intermediate representations. ArXiv, abs/2104.07478.
+Srinivasan Iyer, Ioannis Konstas, Alvin Cheung, Jayant Krishnamurthy, and Luke Zettlemoyer. 2017. Learning a neural semantic parser from user feedback. In Proceedings of ACL.
+Robin Jia and Percy Liang. 2016. Data recombination for neural semantic parsing. In Proceedings of ACL.
+Tomás Kociský, Gábor Melis, Edward Grefenstette, Chris Dyer, Wang Ling, Phil Blunsom, and Karl Moritz Hermann. 2016. Semantic parsing with semi-supervised sequential autoencoders. In Proceedings of EMNLP.
+Ioannis Konstas, Srinivasan Iyer, Mark Yatskar, Yejin Choi, and Luke Zettlemoyer. 2017. Neural amr: Sequence-to-sequence models for parsing and generation. In Proceedings of ACL.
+Kalpesh Krishna, John Wieting, and Mohit Iyyer. 2020. Reformulating unsupervised style transfer as paraphrase generation. In Proceedings of EMNLP.
+Jayant Krishnamurthy, Pradeep Dasigi, and Matt Gardner. 2017. Neural semantic parsing with type constraints for semi-structured tables. In Proceedings of EMNLP.
+
+Jayant Krishnamurthy and Tom Mitchell. 2012. Weakly supervised training of semantic parsers. In Proceedings of EMNLP.
+Brenden Lake and Marco Baroni. 2018. Generalization without systematicity: On the compositional skills of sequence-to-sequence recurrent networks. In Proceedings of ICML.
+Mirella Lapata. 2006. Automatic evaluation of information ordering: Kendall’s tau. Computational Linguistics, 32(4):471–484.
+M. Lewis, Yinhan Liu, Naman Goyal, Marjan Ghazvininejad, A. Mohamed, Omer Levy, Ves Stoyanov, and Luke Zettlemoyer. 2020. BART: Denoising sequence-to-sequence pre-training for natural language generation, translation, and comprehension. In Proceedings of ACL.
+Fei Li and H. Jagadish. 2014. Constructing an interactive natural language interface for relational databases. Proc. VLDB Endow., 8:73–84.
+Chen Liang, Jonathan Berant, Quoc Le, Kenneth D. Forbus, and Ni Lao. 2017. Neural symbolic machines: Learning semantic parsers on freebase with weak supervision. In Proceedings of ACL.
+Chen Liang, Mohammad Norouzi, Jonathan Berant, Quoc V Le, and Ni Lao. 2018. Memory augmented policy optimization for program synthesis and semantic parsing. In Proceedings of NIPS.
+Thang Luong, Hieu Pham, and Christopher D. Manning. 2015. Effective approaches to attention-based neural machine translation. In Proceedings of EMNLP.
+Alana Marzoev, S. Madden, M. Kaashoek, Michael J. Cafarella, and Jacob Andreas. 2020. Unnatural language processing: Bridging the gap between synthetic and natural language data. ArXiv, abs/2004.13645.
+Dor Muhlgay, Jonathan Herzig, and Jonathan Berant. 2019. Value-based search in execution space for mapping instructions to programs. In Proceedings of NAACL.
+Panupong Pasupat and Percy Liang. 2015. Compositional semantic parsing on semi-structured tables. In Proceedings of ACL.
+Hoifung Poon. 2013. Grounded unsupervised semantic parsing. In Proceedings of ACL.
+Alec Radford, Jeff Wu, R. Child, David Luan, Dario Amodei, and Ilya Sutskever. 2019. Language models are unsupervised multitask learners.
+Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. 2016. Squad: 100, 000+ questions for machine comprehension of text. In Proceedings of EMNLP.
+
+Peter Shaw, Philip Massey, Angelica Chen, Francesco Piccinno, and Y. Altun. 2019. Generating logical forms from graph representations of text and entities. In Proceedings of ACL.
+Richard Shin, C. H. Lin, Sam Thomson, Charles Chen, Subhro Roy, Emmanouil Antonios Platanios, Adam Pauls, D. Klein, J. Eisner, and Benjamin Van Durme. 2021. Constrained language models yield few-shot semantic parsers. ArXiv, abs/2104.08768.
+Yu Su and Xifeng Yan. 2017. Cross-domain semantic parsing via paraphrasing. In Proceedings of EMNLP.
+Bailin Wang, Mirella Lapata, and Ivan Titov. 2021a. Learning from executions for semantic parsing. In Proceedings of NAACL.
+Bailin Wang, Wenpeng Yin, Xi Victoria Lin, and Caiming Xiong. 2021b. Learning to synthesize data for semantic parsing. In Proceedings of NAACL.
+Sida I. Wang, Samuel Ginn, Percy Liang, and Christopher D. Manning. 2017. Naturalizing a programming language via interactive learning. In ACL.
+Yushi Wang, Jonathan Berant, and Percy Liang. 2015. Building a semantic parser overnight. In Proceedings of ACL.
+J. Wieting and Kevin Gimpel. 2018. Paranmt-50m: Pushing the limits of paraphrastic sentence embeddings with millions of machine translations. In Proceedings of ACL.
+Silei Xu, Giovanni Campagna, Jian Li, and Monica S Lam. 2020a. Schema2qa: High-quality and lowcost q&a agents for the structured web. In Proceedings of CIKM.
+Silei Xu, Sina J. Semnani, Giovanni Campagna, and M. Lam. 2020b. Autoqa: From databases to qa semantic parsers with only synthetic training data. In Proceedings of EMNLP.
+Pengcheng Yin and Graham Neubig. 2017. A syntactic neural model for general-purpose code generation. In Proceedings of ACL.
+Pengcheng Yin, Chunting Zhou, Junxian He, and Graham Neubig. 2018. StructVAE: Tree-structured latent variable models for semi-supervised semantic parsing. In Proceedings of ACL.
+Tao Yu, Rui Zhang, Kai Yang, Michihiro Yasunaga, Dongxu Wang, Zifan Li, James Ma, Irene Li, Qingning Yao, Shanelle Roman, Zilin Zhang, and Dragomir R. Radev. 2018. Spider: A largescale human-labeled dataset for complex and crossdomain semantic parsing and text-to-sql task. In Proceedings of EMNLP.
+John M. Zelle and Raymond J. Mooney. 1996. Learning to parse database queries using inductive logic programming. In Proceedings of AAAI.
+
+Yuan Zhang, Jason Baldridge, and Luheng He. 2019. PAWS: Paraphrase Adversaries from Word Scrambling. In NAACL.
+
+On The Ingredients of an Effective Zero-shot Semantic Parser Supplementary Materials
+A Paraphraser
+Central to our approach is a paraphrase generation model p(u → u ), which paraphrases a canonical utterance u to an alternative sentence u that is possibly more natural and linguistically diverse. To improve the diversity of generated paraphrases, we paraphrase u to multiple candidate rewrites {u } using beam search. We tested multiple strategies (e.g. nucleus sampling) to improve diversity of paraphrases via ensuring quality, and found beam search yields the best end-to-end performance.
+To generate high-quality paraphrases for open-domain utterances, we parameterize p(u → u ) using generative pre-trained LMs (BARTLarge).5 The LM is ﬁne-tuned on a corpus of 70K high-quality paraphrases sub-sampled from PARANMT (Wieting and Gimpel, 2018) released by Krishna et al. (2020), where samples are carefully constructed to ensure the lexical and syntactical diversity of target paraphrases. To further improve the syntactic diversity of paraphrases from statement-style inputs (e.g. u2, Fig. 1), we apply force decoding with WH-preﬁxes (e.g. What, When, How many, based on the answer type) to half hypotheses in the beam to generate question paraphrases (e.g. paraphrases preﬁxed with “How many” for u3 in Fig. 1). Filtering Paraphrases While our paraphraser is strong, it is still far from perfect, especially when tasked with paraphrasing utterances found in arbitrary down-stream domains. For example, two ambiguous utterances “Author that cites A” and “Author cited by A” could get the same paraphrase “Who cites A?”. Such noisy paraphrases will bring noise to learning and hurt performance. To ﬁlter potentially incorrect outputs, we follow Xu et al. (2020b) and use the parser trained on the paraphrased data generated in the preceding iteration (or the seed canonical data at the beginning of training) to parse each paraphrased utterance, and only retain those for which the parser could successfully predict its program. Admittedly such a stringent criterion will sacriﬁce recall, but empirically we found it works well. We present more analysis in the case study in §4.
+B Synchronous Grammar
+Our synchronous grammar is adapted from Herzig and Berant (2019) and Wang et al. (2015), which speciﬁes alignments between NL expressions and logical form constituents in λ-calculus s-expressions.6 The grammar consists of a set of domain-general production rules, plus domain-speciﬁc rules specifying lexicons and idiomatic productions. Speciﬁcally, domain-general productions deﬁne (1) generic logical operations like count and superlative (e.g. r3, Fig. 1), and (2) compositional rules to construct utterances following English syntax (e.g. r1, Fig. 1). Domain-speciﬁc rules, on the other hand, are typically used to deﬁne task-dependent lexicons like types (e.g. author), entities (e.g. allen_turing), and relations (e.g. citations) in the database. This work also introduces idiomatic productions to speciﬁc common NL expression catered to a domain, as detailed later.
+Tab. 8 lists example domain-general productions in our SCFG. Fig. 2 shows the derivation that applies those productions to generate an example utterance and program. Each production has a syntactic body, specifying how lower-level syntactic constructs are composed to form more compositional utterances, as well as a semantic function, which deﬁnes how programs of child nodes are composed to generate a new program. For instance, the production r3 in Tab. 8 generates a noun phrase from a unary noun phrase UnaryNP (e.g. paper) and a complementary phrase CP (e.g. in deep learning) by concatenating the child nodes UnaryNP and CP (e.g. paper in deep learning). On the program side, the programs of two child nodes on Fig. 2 are:
+5We use the ofﬁcial implementation in fairseq, https://github.com/pytorch/fairseq. 6We use the implementation in Sempre, https://github.com/percyliang/sempre
+
+Id Productions (Syntactic Body and Semantic Function)
+
+Description
+
+r1 NP→SuperlativeAdj NP
+
+e.g. most recent ?
+
+lambda rel, sub ( call superlative (var sub) (string max) (var rel))
+r2 NP→NP+CP
+
+lambda function to get the subject sub with the largest relation rel A noun phrase head NP and a complementary phrase body CP (e.g. paper in deep learning)
+
+IdentityFn r3 NP+CP→UnaryNP CP
+Lambda Beta Reduction: f(var x)
+r4 UnaryNP→TypeNP CP IdentityFn
+r5 CP→FilterCP IdentityFn
+r6 FilterCP→Prep NP
+
+An identity function returning child program e.g. paper in deep learning Perform beta reduction, applying the function from CP (e.g. in deep learning) to the value of UnaryNP (e.g. paper) Entity types, e.g. paper
+—
+e.g. in deep learning
+
+lambda rel, obj, sub ( call filter (var sub) (var rel) (string =) (var obj))
+
+Create a lambda function, which ﬁlters entities in a list sub such that its relation rel
+
+(e.g. topic) equals obj (e.g. deep learning)
+
+r5 NP→Entity
+
+Entity noun phrases e.g. deep learning
+
+IdentityFn
+
+Table 8: Example domain-general productions rules in the SCFG
+
+# Get all entities whose type is paper $UnaryNP: call getProperty (call singleton fb:en.paper) (string !type) # A lambda function that returns entities in x whose relation paper.keyphrase is deep_learning $CP: lambda x (call
+filter (x) (string paper.keyphrase) (string =) (fb:en.keyphrase.deep_learning) )
+
+Where the program of UnaryNP is an entity set of papers, and the program of NP is a lambda function with a variable x, which ﬁlters the entity set. The semantic function of r3 speciﬁes how these two programs should be composed to form the program of their parent node NP+CP, which performs β reduction, assigning the entity set returned by UnaryNP to the variable x:
+
+# Get all papers whose keyphrase is deep learning $NP+CP: (call
+filter ( call getProperty (call singleton fb:en.paper)
+) (string paper.keyphrase) (string =) (fb:en.keyphrase.deep_learning) )
+
+(string
+
+!type)
+
+B.1 Idiomatic Productions
+Multi-hop Relations We create idiomatic productions for non-compositional NL phrases of multi-hop relations (e.g. Author that writes paper in ACL). We augment the database with entries for those multi-hop relations (e.g. X, author.publish_in, acl ), and then create productions in the grammar aligning those relations with their NL phrases (e.g. r1 in Tab. 9).
+Comparatives and Superlatives We also create productions for idiomatic comparatives and superlative expressions. Those productions specify the NL expressions for the comparative/superlative form of some relations. For example, for the relation paper.publication_year with objects of date time, its
+
+$NP
+
+$SuperlativeAdj
+
+$NP
+
+most recent
+
+$NP+CP
+
+$UnaryNP $TypeNP
+paper
+
+$CP $FilterCP
+
+$Prep
+
+$NP
+
+in
+
+$Entity
+
+deep learning Most recent paper in deep learning
+
+( call listValue ( call superlative ( call filter ( call getProperty (call singleton fb:en.paper) (string ! type) ) (string paper.keyphrase) (string =) fb:en.keyphrase.deep_learning ) (string max) (string paper.publication_year) )
+)
+
+Figure 2: (a) The derivation tree (production rule applications) to generate the example utterance and its program. (b) The program deﬁned in s-expression.
+
+Id Production Body (Child Nodes and Semantic Function)
+
+Description
+
+r1 RelVP→publish in
+
+Verb phrase for multi-hop relation
+
+ConstantFn (string author.publish_in)
+
+author that writes paper in ACL
+
+r2 SuperlativeAdj→most recent
+
+Superlative adjectives to describe
+
+ConstantFn (string paper.publication_year)
+
+publication dates
+
+r3 SuperlativeMinAdj→ﬁrst
+
+Superlative adjectives to describe the
+
+ConstantFn (string paper.publication_year)
+
+earliest publication dates
+
+r4 SuperlativeAdj→published before
+
+Comparative prepositions to describe
+
+ConstantFn (string paper.publication_year)
+
+publication dates
+
+r5 CountSuperlativeNP→the most popular topic for
+
+Superlative form to refer to the most
+
+ConstantFn (string keyphrase.paper)
+
+frequent keyphrase for papers
+
+r6 MacroVP→publish mostly in
+
+Superlative form of verb relational
+
+lambda author, venue ( call countSuperlative (var venue) (string max) (string venue.paper) (call getProperty (var
+
+author)
+
+(string
+
+author.paper))
+
+phrases with complex computation. countSuperlative returns the entity x in venue for which the papers in x (via relation venue.paper) has the largest intersection with papers by author (via realtion author.paper)
+
+)
+
+Table 9: Example idiomatic productions used in SCHOLAR
+
+superlative form would be most recent (r2 in Tab. 9) and ﬁrst (r3), while its comparative form could be prepositional phrases like published before (r4) and published after. Those productions deﬁne the lexicons for comparative/superlative expressions, and could be used by the domain-general rules like r1 in Tab. 8 to compose utterances (e.g. Fig. 2).
+Besides superlative expressions for relations whose objects are measurable, we also create idiomatic expressions for relations with countable subjects or objects. As an example, the utterance “The most popular topic for papers in ACL” involves grouping ACL papers by topic and return the most frequent one. Such computation is captured by the CountSuperlative operation in our SCFG based on Wang et al. (2015), and we create productions aligning those relations with the idiomatic noun phrases describing their superlative form (e.g. r5 in Tab. 9).
+Perhaps the most interesting form of superlative relations are those involving reasoning with additional entities. For instance, the relation in “venue that X publish mostly in” between the entity author and venue implicitly involves counting the papers that the author X publishes. For those relations, we create “macro” productions (e.g. r6 in Tab. 9), which deﬁnes the lambda function that computes the answer (e.g. return the publication venue where X publishes the most number of papers) given the arguments
+
+(e.g. an author X).
+
+C Model Conﬁgurations
+Paraphraser We ﬁnetune the paraphraser using a batch size of 1, 024 tokens for 5, 000 iterations (500 for warm-up), with a learning rate of 3e − 5 using ADAM. We apply label smoothing with a probability of 0.1.
+Semantic Parser Our semantic parser is a neural sequence-to-sequence model with dot-product attention (Luong et al., 2015), using a BERTBase encoder and an LSTM decoder, augmented with copying mechanism. The size of the LSTM hidden state is 256. We decode programs using beam search with a beam size of 5. Following Herzig and Berant (2019), we remove hypotheses from the beam that leads to error executions.
+Iterative Training As described in §3.1.1, we ﬁrst run the iterative paraphrasing and training algorithm for one pass to generate the validation set. In the ﬁrst iteration of this stage, we train a semantic parser on the (unparaphrased) seed canonical data (Dcan) as the initial paraphrase ﬁltering model. In the second stage, we restart the learning process using the generated validation set, and initialize the paraphrase ﬁltering model using the previously trained semantic parser. For each stage, we run the iterative learning algorithm (§2) for two iterations. We generate 10 paraphrases for each example. In each iteration, we train the semantic parser for 30 epochs with a batch size of 64. We use separate learning rates for the BERT encoder (3e − 5) and other parameters (0.001) in the model (Shaw et al., 2019). For each iteration in the second stage, we perform validation by ﬁnding the model checkpoint that achieves the lowest perplexity on the validation set. We perform validation using perplexity for efﬁciency reasons, as evaluating denotation accuracy requires performing beam search decoding and querying the database, which could be slow.
+Evaluation Metric For the perplexity metric to evaluate language gaps, we ﬁne-tune a GPT-2 language model on the paraphrased canonical data Dpar for 1, 500 steps (150 steps for warm-up) with a batch size of 64 and a learning rate of 1e − 5. We use the following equation to compute perplexity
+
+1
+
+− log p(u)
+
+PPL(Dnat) = exp |Dnat| |u| (1)
+
+u,z ∈Dnat
+
+This is slightly different from the standard corpus-level perplexity. We use this metric because it is more sensitive (larger ∆) on our small (< 1K) evaluation sets, and always correlates with the corpus-level perplexity. For reference, here is the sequence of perplexities using Eq. (1) in the upper half of Tab. 4 compared to the corpus-level ones:
+
+Eq. (1)
+
+22.0 21.4 20.9 20.7 21.5
+
+Corpus-PPL 19.3 18.8 18.4 18.2 18.8
+
+

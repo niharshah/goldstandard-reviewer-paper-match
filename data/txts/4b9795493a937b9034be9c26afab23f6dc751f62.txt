@@ -1,0 +1,761 @@
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+arXiv:2201.12431v1 [cs.CL] 28 Jan 2022
+
+Uri Alon 1 Frank F. Xu 1 Junxian He 1 Sudipta Sengupta 2 Dan Roth 3 Graham Neubig 1 1Language Technologies Institute, Carnegie Mellon University 2Amazon AWS 3AWS AI Labs
+{ualon,fangzhex,junxianh,gneubig}@cs.cmu.edu {sudipta,drot}@amazon.com
+
+Abstract
+Retrieval-based language models (R-LM) model the probability of natural language text by combining a standard language model (LM) with examples retrieved from an external datastore at test time. While effective, a major bottleneck of using these models in practice is the computationally costly datastore search, which can be performed as frequently as every time step. In this paper, we present RETOMATON – retrieval automaton – which approximates the datastore search, based on (1) clustering of entries into “states”, and (2) state transitions from previous entries. This effectively results in a weighted ﬁnite automaton built on top of the datastore, instead of representing the datastore as a ﬂat list. The creation of the automaton is unsupervised, and a RETOMATON can be constructed from any text collection: either the original training corpus or from another domain. Traversing this automaton at inference time, in parallel to the LM inference, reduces its perplexity, or alternatively saves up to 83% of the nearest neighbor searches over kNN-LM (Khandelwal et al., 2020), without hurting perplexity.
+1. Introduction
+Retrieval-based language models (R-LMs) have recently been shown to improve over standard neural models in a variety of tasks such as unconditional language modeling (Guu et al., 2018; He et al., 2020), machine translation (Zhang et al., 2018; Gu et al., 2018; Khandelwal et al., 2021), question answering (Karpukhin et al., 2020; Ram et al., 2021), and code generation (Hayati et al., 2018; Hashimoto et al., 2018). The key ingredient of R-LMs is their ability to utilize training examples at test time without having to rely on the information encoded in the model’s weights only.
+In these models, the retrieval component ﬁrst searches for nearest neighbor examples in an external datastore; then, the base model references these examples during the prediction. This fusion of language models (LMs) and retrieval
+
+improves the base language model from several perspectives, including higher accuracy (Xu et al., 2021), domain adaptability (Jiang et al., 2021), and reduced size (Borgeaud et al., 2021). Further, the retrieved examples provide information regarding the provenance of the model’s predictions and allow for modifying the dataset without retraining the model. Nevertheless, the most critical bottleneck of these models is their frequent search over the datastore, which hinders the use of R-LMs in practical settings.
+k-Nearest Neighbors Language Model One prominent example of such a retrieval-based model is kNN-LM (Khandelwal et al., 2020), which predicts a token by linearly interpolating the base LM’s output with a non-parametric nearest neighbor distribution. This distribution is constructed by searching for the k-nearest neighbors (kNN) in the datastore and weighting them according to their distance to the current test context. Notably, this k-nearest neighbor search is performed for every generated test token, introducing severe inference overhead, since this search is signiﬁcantly slower than the LM’s standard “forward pass”.
+Our Approach: RETOMATON Our main insight is that retrieved neighbors at the current time step also hint at the neighbors that will be retrieved at future time steps, and can thus save repetitive searches later. Speciﬁcally, we construct a weighted ﬁnite automaton (WFA) on top of an existing datastore, by keeping pointers between datastore entries and clustering similar entries, in a completely unsupervised way. This automaton allows sporadic, infrequent, exact kNN searches, and a much cheaper traversal of the automaton at other time steps. We call our model RETOMATON – retrieval automaton. RETOMATON is illustrated in Figure 1.
+Concretely, applying RETOMATON to a strong WIKITEXT103 LM using only the original training set allows for reducing the perplexity, or alternatively, saving 81% of the kNN searches of Khandelwal et al. (2020) without hurting perplexity and without additional training other than clustering. If we do not allow clustering, we can still save 60% of the kNN searches. We also show that RETOMATON allows for effective domain adaptation, by simply constructing a RETOMATON for a different domain. When we construct RETOMATON on top of a ﬁne-tuned LM, we decrease the
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+B 0.9 iden
+
+𝑘𝑒𝑦, 𝑣𝑎𝑙𝑢𝑒, 𝑝𝑜𝑖𝑛𝑡𝑒𝑟
+3
+𝑘NN search
+2
+
+0.1 president
+0.2 vice
+0.2 president
+
+0.3 is 0.2 is
+0.1 signed
+
+0.2 Joe J 0.1 osep
+h
+
+0.9 Biden 0.1
+R
+0.4 Robinette
+
+Context: The U.S.
+1
+Target:
+4
+
+0.01 president
+
+0.1 is
+
+0.5 George
+
+0.9 Washington
+
+president
+
+is
+
+Joe
+
+Biden ...
+
+Figure 1: An illustration of RETOMATON. Given a context 1 (“The U.S.”), a k-nearest neighbor search 2 returns the nearest datastore entries. Every datastore entry ( in the ﬁgure) is a 3-tuple of (key, value, pointer) 3 , where the key is the LM’s hidden state and the value is the target token as in Khandelwal et al. (2020); the pointer points to the datastore entry that appears next in the corpus. Close datastore entries are clustered together, and form an automaton state ( , , ). The pointers of the clustered entries form the state’s possible transitions. At inference time, the model decodes 4 while performing multiple parallel traversals ( , , ) on the automaton to ﬁnd useful datastore entries, instead of performing a full kNN search. Dashed arrows ( ) denote allowed automaton transitions that were not taken during the current decoding.
+
+perplexity by more than 15% compared to just ﬁne-tuning. Finally, we perform a thorough ablation study, showing the contribution of the different components and analyzing the tradeoff between coarse- vs. ﬁne-grained clustering.
+
+2. Background: the kNN-LM Model
+kNN-LM (Khandelwal et al., 2020) is a language model that estimates the probability of the next token by interpolating an already-trained base LM with a kNN distribution. The kNN distribution is provided by searching for the knearest neighbors in an external datastore and weighting them according to their negative distance.
+Datastore Creation Given a context sequence of tokens c(t) = w(1), ..., w(t−1) , the base LM estimates pLM w | c(t) , the distribution over the target token w. Let f be the function that maps a context c to a ﬁxed-length vector using an already-trained LM. For example, f (c) can be the output of a Transformer LM’s last self-attention layer. kNN-LM constructs the datastore using a single forward pass over a text collection, which can include the training set that the base LM was trained on, or not. Given the ith example (ci, wi) in the text collection D, the key-value pair (f (ci) , wi) is deﬁned such that f (ci) is the key, and wi is the value. The datastore (K, V) is the set of all pairs constructed from the examples in the text collection D:
+
+(K, V) = { (f (ci) , wi) | (ci, wi) ∈ D }
+
+(1)
+
+Inference At test time, given a test context c, the model
+queries the datastore (K, V) to retrieve the k-nearest neighbors N of f (c), according to a distance function dist be-
+
+tween f (c) and every f (ci) in the datastore. dist is typically the squared 2 distance. These nearest neighbor pairs form a distribution over the target token w, where the probability of every vocabulary item is computed proportionally to the exponent of its negative distance, while summing over all its occurrences in retrieved values of N :
+pkNN (w | c) ∝
+1w=wi exp (−dist (f (c) , f (ci))) (2)
+(f (ci),wi)∈N
+The kNN-LM’s next token probability is then the interpolation of pLM and pkNN, using a scalar hyperparameter λ:
+p (w | c) = λpkNN (w | c) + (1 − λ) pLM (w | c) (3)
+Notice that the k-nearest neighbor search is performed for every target token. This introduces severe overhead, since the search is signiﬁcantly slower than the LM’s standard forward pass. In the next section, we show how we can avoid the search in the majority of the time steps.
+3. Building Automata from Datastores
+To save kNN searches, we build a WFA on top of the kNNLM datastore. Then, we traverse the automaton to estimate the next nearest neighbors. We will demonstrate the automaton creation process using Figure 2 as a running example.
+3.1. Deﬁnitions
+Given a ﬁnite vocabulary Σ and the set Σ∗ of ﬁnite sequences over Σ, a trained autoregressive LM deﬁnes a distribution pLM over Σ for any context c ∈ Σ∗. Given such
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+The U.S. president is Joe Biden
+
+…
+
+,president
+
+,is
+
+,Joe
+
+,Biden
+
+…
+
+,U.S.
+
+,is
+
+,Joseph
+
+1
+
+2
+
+,Robinette
+
+The 46th president of the U.S. is Joseph Robinette Biden
+
+Figure 2: An illustration of our automaton creation process. The text D contains two sentences: (i) “The U.S. president
+
+is Joe Biden”; and (ii) “The 46th president of the U.S. is Joseph Robinette Biden” . Each datastore entry is a pair of a key
+
+vector encoding the preﬁx and a value representing the next token, such as
+
+,president . We save a pointer from every
+
+entry to its successor in the text, and we cluster close key vectors to form automaton states ( 1 and 2 ) that share pointers.
+
+an LM having f : Σ∗ → Rd and a text collection D, we can create a datastore (K, V) as detailed in Section 2. As shown in Figure 2, this results in a set of key-value entries such as
+,president , where the key is the LM encoding of every preﬁx in D, and the value is the following token.
+Weighted Finite Automaton Our automaton is a tuple A = Q, Σ, q0, δ, φ such that Q is a ﬁnite set of states, Σ is the LM’s vocabulary, q0 ∈ Q is the initial state, δ : Q × Σ → P (Q) is a transition function where P (Q) denotes the power set of Q, and φ : Q × Rd × Σ → R is a transition weight function. Unlike standard WFAs, the transition weights are dynamic: notice that φ depends also on a vector, in addition to a previous state and an input token. Also, note that δ is deﬁned such that we transition into a set of states.
+3.2. Constructing the Automaton
+Pointers Our main insight is that during the creation of the datastore, we can keep a pointer from every datastore entry to the entry that appears next in the text D.
+Imagine that at time t, the test context is c(t) = w(1), ..., w(t−1) , and the model retrieves a datastore entry (f (ci) , wi). If after the interpolation with the base LM (Equation (3)), the model’s generated token w(t) (by sampling or argmax) is equal to wi, then the entry (f (ci+1) , wi+1) is likely to be a useful entry at time t + 1, because ci was a near neighbor of c(t), and both these contexts were followed by the same token wi = w(t). That is, our underlying assumption can be formulated as:
+f (ci) ≈ f c(t) =⇒ f (ci · w) ≈ f c(t) · w (4)
+where ≈ denotes vector similarity, and c(t) · w is the continuation of the context c(t) using the token w.
+Thus, given the i-th example (ci, wi) ∈ D, instead of keeping only the key-value pair (f (ci) , wi), every datastore entry is now (f (ci) , wi, pi) ∈ (K, V, P), where pi is a pointer to the next entry, or its index in the datastore. This
+
+is illustrated as arrows in Figure 2, where every entry has
+
+a pointer to the entry that followed it in the text D. For
+
+example, the entry
+
+,president points to
+
+,is .
+
+States If every entry had only a single outgoing pointer, the
+
+automaton would only capture n-grams that appeared in
+
+the text verbatim, and thus will not be able to generalize to
+
+unseen phrases. For example in Figure 2, the sequence “The
+
+46th president of the U.S. is Joe Biden” would not be cap-
+
+tured, because the preﬁx “The 46th president of the U.S.” ap-
+
+peared in one sentence, and the sufﬁx “Joe Biden” appeared
+
+in another sentence. Thus, to allow entries to share their
+
+pointers, we cluster entries having close keys into an automa-
+
+ton state. A state includes all entries in the cluster, and the
+
+entries’ pointers are the state’s allowed outgoing transitions.
+
+For example, in Figure 2, the entry
+
+,is is clustered
+
+with another entry having the same value,
+
+,is (sur-
+
+rounded by and marked as 1 ). Furthermore, we can
+
+also cluster similar contexts that do not have the same value,
+
+such as cluster 2 containing
+
+,Joe and
+
+,Joseph ,
+
+which allows capturing the phrase “Jospeh Biden”.
+
+This step can be performed using any clustering algorithm such as k-means. In this case, the choice of kclust determines the ﬁnal number of states |Q| = kclust (ignoring the initial state q0). We experiment with different values of kclust and clustering algorithms in Section 6.
+
+Transition States Given a source state q ∈ Q and an input token w ∈ Σ, we deﬁne the set of allowable next states as the clusters of entries that are pointed to by a datastore entry in q having the value w. Formally, let π : (K, V, P) → Q be a function that maps every datastore entry into its containing state, and the function π−1 : Q → P ((K, V, P)), which maps every state into the set of datastore entries contained in it. Let ρ : P → (K, V, P), be the “dereferencing” operator, which returns a datastore entry given a pointer that points to it. We can now deﬁne the allowed transitions as:
+
+δ (q, w) = { π (ρ (p)) | (k, w, p) ∈ π−1 (q) } (5)
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+This is illustrated in Figure 2 as the outgoing pointers of cluster 2 , which allow transitioning from 2 to different states given the input tokens w =“Joe” or w =“Joseph”. This results in a (currently non-weighted) ﬁnite-state automaton, whose nodes are clusters of datastore entries, and whose edges represent the successiveness of entries in D, where successiveness is shared by similar entries.
+
+3.3. Traversal of the Automaton
+At test time, given a test context c(t), we traverse the automaton while visiting multiple states at every time step, marked in Figure 1 as , , . A traversal begins with a full kNN search of the datastore to retrieve the k-nearest neighbors N (t) of f c(t) . The initial traversal states S(t) ⊆ Q are the union of the states to which these k-nearest neighbors belong: S(t) = e∈N (t) π (e). 1
+In the next time step t + 1, given a token w(t) ∈ Σ that was generated (by argmax or sampling) by the model at time t, we compute the union of all transitions from states q ∈ S(t). We deﬁne a function δˆ : P (Q) × Σ → P (Q) as follows:
+
+δˆ (S, w) = δ (q, w)
+
+(6)
+
+q∈S
+
+The decision of whether to continue traversing or start a new traversal can be made in several ways. We experimented with several alternatives, but found the most intuitive way to simply be whether the number of new states is greater than or equal to a threshold τ . That is, we continue traversing if |δˆ S(t), w(t) | ≥ τ , or start a new traversal otherwise.
+When we continue traversing, we take the new states as our states in the next step. When we start a new traversal, we perform a new kNN search resulting in N (t+1), but also include the remaining states we obtained so far:
+
+S(t+1) =
+δˆ S(t), w(t) δˆ S(t), w(t)
+
+
+∪ π (e)
+e∈N (t+1)
+
+(7) |δˆ S(t), w(t) | ≥ τ otherwise
+
+Varying τ allows us to control the trade-off between higher accuracy but frequent traversal restarts, and thus frequent kNN searches (high τ ), versus lower accuracy but with rare kNN searches, which saves time (low τ ). For additional intuition for τ , see Appendix A.
+
+Transition Weights Given a set of states S, a test context c, and an input token w ∈ Σ, we deﬁne the transition weight from every q ∈ S similarly to Equation (2), except that we sum exponents of negative distances between f (c) and all
+1Formally, we start every traversal from the initial state q0, perform a kNN search to retrieve N (t), and then make an -transition (transitioning without consuming an input token) into S(t).
+
+entries having value of w that are contained the state q; then, we normalize across all states in S(t):
+
+φ (q, v, w) =
+
+1w=wi exp (−dist (v, ki)) (8)
+
+(ki ,wi ,·)∈π −1 (q )
+
+pauto (w | c, S) ∝ q∈S φ (q, f (c) , w) (9) Finally, we interpolate pauto with pLM :
+
+p (w | c, S) = λpauto (w | c, S) + (1−λ) pLM (w | c) (10)
+
+4. Experimental Setup
+We evaluate RETOMATON in two different settings: (i) standard autoregressive language modeling, where the datastore is constructed from the same training corpus that the base LM was trained on (“in-training datastore”); and (ii) domain adaptation, where the datastore is constructed from a different domain than the base LM was trained on.
+
+Implementation We base our experiments on the original kNN-LM implementation that uses the FAISS (Johnson et al., 2019) library to perform kNN search. We also use FAISS for the one-time k-means clustering.
+
+Hyperparameters We used the same settings as the baseline implementations without any special tuning of our model, and always matched the settings to conduct a fair evaluation. We saved half precision (fp16) datastore keys as He et al. (2021). For WIKITEXT-103, which creates a datastore of 103M entries, we use k-means clustering with kclust=1M. For Law-MT, which creates a datastore of 19M entries, we use kclust=200K. We study the difference between clustering algorithms and the number of clusters in Section 6. Additional details are provided in Appendix B.
+
+Metrics The main metric that we focus on is perplexity with respect to the fraction of saved searches (FoSS). In our preliminary experiments, we found that measuring wall-clock time is difﬁcult to reproduce, is brittle to temporary hardware and system load, and affected by the speciﬁc kNN retrieval library. Contrarily, FoSS does not depend on hardware and engineering factors and is thus completely reproducible. In Appendix C, we empirically analyze FoSS with respect to the saved wall-clock time and we show that they are identical up to an additive constant that depends on the hardware and the speciﬁc settings. Thus, FoSS serves as a good proxy to the saved wall-clock time.
+We control FoSS in RETOMATON by running with different values of the τ ∈ [1, ∞) threshold, as detailed in Section 3.3. Higher τ results in frequent restarts and thus lower FoSS.
+
+4.1. In-Domain Datastore
+Data Following Khandelwal et al. (2020), we use WIKITEXT-103 (Merity et al., 2017), which is a stan-
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+dard benchmark for autoregressive language modeling, having 103M/250K/250K tokens from Wikipedia in its training/validation/test sets, respectively.
+Model We use a Transformer (Vaswani et al., 2017) as our base LM, trained by Khandelwal et al. (2020) following the architecture and settings of Baevski & Auli (2019) with adaptive inputs, adaptive softmax (Joulin et al., 2017), and a large 250K word-level vocabulary. This base LM consists of 16 layers, each with 16 self-attention heads, 1024dimensional hidden states, 4096-dimensional feedforward layers, amounting to 247M parameters.
+4.2. Domain Adaptation
+Data Following He et al. (2021), we use the English part of Law-MT, which is an English-German translation dataset for the law domain, released by Koehn & Knowles (2017) and resplit by Aharoni & Goldberg (2020). The training set consists of 19M tokens, which we use to build a datastore and an automaton (Section 5.2), or ﬁne-tune the base LM and then build a datastore and automaton (Section 5.3).
+Model Following He et al. (2021), as our base LM we use a 12-layer, 1536-dimensional transformer with a vocabulary of 42K subword units (Sennrich et al., 2016), amounting to 656M parameters and trained by Ng et al. (2019), on WMT News Crawl (Barrault et al., 2019).
+4.3. Baselines
+kNN-LM We compare RETOMATON to kNN-LM using the original code and hyperparameters of Khandelwal et al. (2020). The only difference in hyperparameters is that following He et al. (2021), we use the faster approximate kNN distances provided by FAISS, rather than recomputing them, in our model and in the baselines. We vary the FoSS in kNN-LM by uniformly selecting a certain fraction of time steps in which we skip the kNN search and use only the base LM (pLM ), as the “Random” baseline in He et al. (2021).
+ADAPTRET We also compare RETOMATON to a retrievalsaving approach that is orthogonal to ours. ADAPTRET is the Adaptive Retrieval approach of He et al. (2021), which trains a light MLP to predict whether to perform a kNN search or predict using only the base LM. The main conceptual difference between RETOMATON and ADAPTRET is that RETOMATON skips kNN searches but still computes the interpolation with the non-parametric distribution pauto for every token, using the automaton (Equation (10)). In contrast, when ADAPTRET skips a kNN search, it also skips the interpolation with the pkNN distribution of Equation (3) entirely, and backs-off to rely on the base LM solely. For a detailed discussion of the conceptual differences between RETOMATON and ADAPTRET, see Section 8.1.
+
+Perplexity
+
+18
+17 16.65 16.35 16.12 16.08
+16
+
+kNN-LM ADAPTRET RETOMATON (this work)
+w/o clustering
+17.60
+
+18.66 18.44
+18.02 17.59
+
+17.21
+
+16.99
+
+16.47 16.67
+
+16.65
+
+16.16 16.27 16.37 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1
+FoSS (fraction of saved searches)
+
+Figure 3: Experiments on WIKITEXT-103, where the datastore is created from the same training set that the base LM was trained on. RETOMATON reduces perplexity across all FoSS values, and even reduces perplexity when FoSS=0.
+
+5. Results
+5.1. In-Domain Datastore
+We ﬁrst experiment with creating the datastore and the automaton from the same data used to train the base LM.
+Figure 3 shows how RETOMATON reduces the perplexity on WIKITEXT-103 across different FoSS rates. Speciﬁcally, RETOMATON saves 81% of the kNN searches while matching the perplexity of kNN-LM. If we do not perform clustering (“w/o clustering”), we can still save more than 60% of the kNN searches while matching kNN-LM. Compared to ADAPTRET, RETOMATON saves 60% of the searches while matching the best perplexity of ADAPTRET.
+Surprisingly, even when we do not attempt to save any searches (FoSS=0), RETOMATON reduces perplexity from 16.65 (kNN-LM) and 16.35 (ADAPTRET) to 16.08. The explanation for this is that even when RETOMATON performs kNN search on every step as kNN-LM, it includes the pointers from the previous time step (Equation (7)), which are more likely to be correct than the general retrieved nearest neighbors. Some neighbors may be included twice – both as retrieved kNNs, and as pointers from the previous time step; this case is equivalent to increasing the weight of a subset of the retrieved kNNs, which are more likely to be correct.
+5.2. Domain Adaptation
+We also experiment with domain adaptation, where the base LM was trained on newspapers, and the models are tested on law documents, using datastore and automaton that were
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+kNN-LM
+
+100
+
+ADAPTRET
+
+106.56
+
+RETOMATON (this work)
+
+86.39
+
+80
+
+74.38
+
+60
+
+56.19
+
+Perplexity
+
+40 36.32 40.70
+
+23.83
+
+24.50
+
+20 12.34
+
+16.22
+
+11.25 11.98
+
+12.01
+
+10.49
+
+10.70 10.89
+
+0
+
+0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1
+
+FoSS (fraction of saved searches)
+
+Figure 4: Experiments for domain adaptation, where the datastore is constructed from Law-MT.
+
+constructed from law data as well, as detailed in Section 4.2.
+Figure 4 shows how RETOMATON reduces the perplexity on Law-MT from 12.34 (kNN-LM) and 12.01 (ADAPTRET) to 10.49 when search is performed every step (FoSS=0). As we increase the fraction of saved searches, RETOMATON shows a very gentle ascent in perplexity, while the perplexity of kNN-LM increases exponentially.
+The high perplexity of the ADAPTRET baseline is caused by the high perplexity of the base LM (106.56): in time steps where ADAPTRET does not perform search, its output is identical to the base LM’s probability. That is, in domain adaptation, where the base LM performs poorly, interpolating it with the pkNN distribution (Equation (3)) is crucial. Thus, approximating the pkNN distribution using an automaton is much more effective than pruning it using ADAPTRET, while kNN searches are saved in both cases.
+It is also interesting to notice the difference between datasets. In particular, we ﬁnd that RETOMATON provides a stronger effect in Law-MT, reﬂected in the very gentle ascent in Figure 4, over its effect in WIKITEXT-103. We believe that one major reason is n-gram repetitiveness between the training and the validation sets. As shown in Figures 11 and 12, there is much higher repetitiveness of n-grams in Law-MT over WIKITEXT-103. For example, 21% of the 5-grams in the validation set of WIKITEXT-103 were seen in the training data; in contrast, in Law-MT – 62% of the 5-grams in the validation set were seen during training.
+5.3. Improving Fine-Tuning
+In Section 5.2 we used RETOMATON to domain-adapt a base LM that was trained on a different domain; however,
+
+Table 1: Experiments using a base LM that was ﬁne-tuned on Law-MT. Numbers denote perplexity, and the relative reduction over the ﬁne-tuned LM is shown in parentheses.
+
+Model
+ﬁne-tuned LM kNN-LM ADAPTRET
+RETOMATON
+
+FoSS=0
+
+FoSS=0.5
+
+8.61 7.93 (↓7.9%) 8.25 (↓4.2%) 7.81 (↓9.2%) 7.91 (↓8.1%)
+
+7.27 (↓15.6%) 7.28 (↓15.4%)
+
+can RETOMATON improve a ﬁne-tuned base LM?
+We ﬁne-tuned the base LM of Section 5.2 on the Law-MT training set, and recreated a datastore and an automaton using the ﬁne-tuned model. As Table 1 shows, while kNNLM and ADAPTRET reduce the perplexity compared to the ﬁne-tuned model from 8.61 to 7.93 and 7.81, respectively, RETOMATON further reduces perplexity to 7.27, which is a relative reduction of more than 15%. This shows how RETOMATON can strengthen even ﬁne-tuned models.
+6. Ablation Study
+Pointers vs. clustering The main two contributions in RETOMATON are the use of pointers and the clustering. Here, we tease apart the contribution of each of these.
+The w/o clustering model is an ablation of RETOMATON, which spares the clustering preprocessing step, and uses only pointers. As shown in Figure 3, even the w/o clustering model achieves lower perplexity than the other baselines, with a lowest perplexity of 16.12 at FoSS=0. Up to FoSS=0.4, the base RETOMATON performs only slightly better then w/o clustering. Starting from FoSS=0.7, the w/o clustering model almost consolidates with ADAPTRET.
+From these experiments, we conjecture that RETOMATON’s performance in few saved searches (FoSS<0.4) stems mostly from keeping pointers, which provides the most signiﬁcant boost. Starting from FoSS=0.7, the gap between w/o clustering and the base RETOMATON shows the contribution of clustering, which allows longer sequences of consecutive steps without performing kNN search.
+Clustering Granularity The only hyperparameter that RETOMATON introduces is the choice of the number of clusters. A higher number of clusters results in smaller, ﬁne-grained clusters. A low number of clusters results in larger, coarsegrained clusters, where every cluster is possibly more noisy.
+Here, we vary the number of clusters and also experiment with the “greedy” clustering algorithms from He et al. (2021). The advantage of the greedy algorithm is that it is computationally cheaper: it requires searching for each
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+Perplexity Perplexity
+
+17 w/o clustering
+
+16.9
+
+k=1M means
+
+16.8
+
+k=500K means
+
+k=100K means
+
+16.7
+
+greedy, 21M
+
+16.6
+
+16.5
+
+16.4
+
+16.3
+
+16.2
+
+16.1 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 FoSS (fraction of saved searches)
+
+12 w/o clustering
+
+11.8
+
+k=100K means
+
+k=200K means
+
+11.6
+
+k=400K means
+
+11.4
+
+11.2
+
+11
+
+10.8
+
+10.6 0
+
+0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 FoSS (fraction of saved searches)
+
+Figure 5: Analysis of the number of clusters on the validation set of WIKITEXT-103. Additional clustering runs can be found in Appendix D (Figure 8).
+
+Figure 6: Analysis of the number of clusters on the validation set of Law-MT. A larger version of this ﬁgure can be found in Appendix D (Figure 9).
+
+length=3
+, and the , but the roughly bounded by in the ﬁrst a number of , when the
+
+length=6
+the Streets Have No Name " Department of Transportation ( MDOT )" In the United States , the end of the song , not occur until 27 May 1915 ﬁred the shots that caused the
+
+length=10
+. As a result , there was not a single and some were moved to new locations . Before its but it was not until the following day that a the end of the Second World War was completed in to lack of evidence ; however , the decision was the Streets Have No Name ’ is more like the
+
+Table 2: Some of the sequences from the WIKITEXT-103 validation set that our automaton captured without performing kNN search. We selected length=10 sequences that did not appear in the training data.
+
+datastore entry’s nearest neighbors, and then performing a single pass of merging, while k-means requires multiple iterations over the entire datastore.
+The results of these experiments are shown in Figure 5 for WIKITEXT-103 and Figure 6 for Law-MT. As shown in Figure 5, k=500K means and k=1M means achieve similar perplexities, while k=100K is too coarse-grained. The greedy algorithm presents an interesting tradeoff, as it achieves lower perplexity than the others at FoSS=0, but degrades as FoSS increases, since each cluster is smaller. Figure 6 shows a similar tradeoff in Law-MT: the most ﬁne-grained clustering using k=400K means performs best for FoSS=0, but achieves a higher perplexity than others at FoSS>0.7. Additional clustering runs are shown in Appendix D.
+7. Qualitative Analysis
+What are the sequences of tokens that RETOMATON captured and predicted consecutively, without kNN search?
+Table 2 shows examples of sequences among those that were
+
+given the highest probability (pauto in Equation (9)) from the validation set of WIKITEXT-103. Naturally, short sequences (length=3) are usually common 3-grams such as “, and the”. As length increases (to 6 and 10 tokens), the sequences become more speciﬁc; for example, two of them contain part of the name of the song “Where the Streets Have No Name” by the band U2. Nevertheless, we selected sequences into the list of length=10 such that none of them appeared as-is in the training set, to show that RETOMATON does not only memorize n-grams, but instead, clustering allows it to compose multiple small n-grams into longer n-grams.
+Figure 7 shows a 217-token long passage that appears in both training and validation sets, but with different endings. RETOMATON could predict this passage consecutively, without performing search. This shows how RETOMATON can retrieve single tokens from the datastore, as well as adaptively construct much longer chunks.
+Figure 10 (Appendix D) shows a histogram of the lengths of these sequences. The vast majority (98%) of the validation set tokens are included in n-grams having n>1.
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+Training Sequence from: https://en.wikipedia.org/wiki/Oh,_What_a_Knight! The writer of the scenario is unknown , but it was most likely Lloyd Lonergan . He was an experienced newspaperman employed by The New York Evening World while ... A surviving ﬁlm still gives the possibility of identifying three of the actors in the ﬁlm ... Validation Sequence from: https://en.wikipedia.org/wiki/Home_Made_Mince_Pie The writer of the scenario is unknown , but it was most likely Lloyd Lonergan . He was an experienced newspaperman employed by The New York Evening World while ... A surviving ﬁlm still gives the possibility of identifying eight actors ...
+Figure 7: An example for a 236-token long sequence that RETOMATON was able to capture from the WIKITEXT-103 training set and apply to the validation set. Although most of the paragraph appears as-is in both sets, they have different endings, as these are articles about different silent ﬁlms from 1910. This shows how RETOMATON allows to dynamically retrieve chunks of text from the training data using a single kNN search, rather than a single token at a time as kNN-LM.
+
+8. Related Work
+8.1. Comparison to ADAPTRET (He et al., 2021)
+The closest work to ours is ADAPTRET (He et al., 2021). ADAPTRET saves kNN searches as well, but it suffers from conceptual weaknesses compared to our work:
+When the model performs kNN search: ADAPTRET uses only the neighbors retrieved by the kNN search. In contrast, RETOMATON uses the set of retrieved nearest neighbors, but also includes the remaining pointers from the previous time step (Equation (7)). Apparently, these remaining pointers have a higher likelihood of predicting the correct token than the general set of retrieved nearest neighbors.
+When the model does not perform kNN search: ADAPTRET skips the interpolation of pkNN with pLM , and uses pLM solely. In contrast, RETOMATON uses pointers, and still computes the interpolation of pauto with pLM . As an interesting direction for future work, we expect that learning a dynamic interpolation factor λ, similarly to ADAPTRET, will even further improve RETOMATON’s results.
+Data Efﬁciency ADAPTRET requires training on a dataset that is disjoint from the corpus that the datastore was built from, to prevent overﬁtting. Thus, He et al. had to train their MLP on the validation set, which is less data-efﬁcient – spending 90% of the original validation set for additional training. In contrast, our approach is completely unsupervised, and thus does not require additional data.
+8.2. Retrieval and Neuro-Symbolic Methods
+Granularity of Retrieval While Khandelwal et al. (2020) and Yogatama et al. (2021) retrieve a token at a time step, other work retrieved a sentence (Hashimoto et al., 2018; Zhang et al., 2018; Gu et al., 2018), a prototype (Guu et al., 2018; He et al., 2020), or a chunk (Guu et al., 2020; Borgeaud et al., 2021). RETOMATON implicitly generalizes these approaches by dynamically constructing the retrieved sequence, essentially being able to retrieve individual tokens as well as constructing search-free longer passages.
+
+Hybrid Models Combining n-grams (Neubig & Dyer, 2016) and automata (Rijhwani et al., 2021) with neural language models has usually led to “static”, count-based, transitions weights. In contrast, states in our automaton contain hidden representations of the neural LM, which allows RETOMATON to dynamically weigh transitions. Other work scored automata with RNNs (Rastogi et al., 2016; Lin et al., 2019), or constructed RNNs from automata (Schwartz et al., 2018; Peng et al., 2018); RETOMATON differs from these approaches by providing with retrieved instances from a datastore, instead of enforcing structure on the neural LM.
+Automata Extraction The extraction of automata from neural networks goes back to Giles et al. (1992) and Omlin & Giles (1996), mainly for synthetic and simple regular languages. Later, Weiss et al. (2018; 2019) scaled up the extraction to larger GRU and LSTM architectures. In this work, we do not only extract an automaton, but also combine it to improve the accuracy of neural LMs.
+9. Conclusion
+We presented RETOMATON – retrieval automaton. RETOMATON approximates the kNN search of kNN-LM by clustering similar neighbors into automaton states, and keeping pointers from previously found neighbors, which form the transition between states. This results in a weighted ﬁnite automaton on top of the datastore, which allows approximating the nearest neighbors in most of the time steps, instead of performing a kNN search at every step.
+Empirically, traversing the automaton at inference time saves up to 83% of the kNN searches in both in-domain and domain adaptation settings, and reduces the perplexity of strong LMs, even after they were ﬁne-tuned.
+These results suggest a promising direction for the neurosymbolic synergy of neural models and symbolic automata. We believe that the principles and the methods presented in this paper are also applicable to other R-LMs, including phrase- and chunk-based retrieval models. To these ends, we make all our code, data, and models publicly available.
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+Acknowledgments
+We thank Lucio Dery and Vincent Hellendoorn for the helpful discussions and thorough feedback.
+References
+Aharoni, R. and Goldberg, Y. Unsupervised domain clusters in pretrained language models. In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, pp. 7747–7763, 2020.
+Baevski, A. and Auli, M. Adaptive input representations for neural language modeling. In International Conference on Learning Representations, 2019.
+Barrault, L., Bojar, O., Costa-jussà, M. R., Federmann, C., Fishel, M., Graham, Y., Haddow, B., Huck, M., Koehn, P., Malmasi, S., Monz, C., Müller, M., Pal, S., Post, M., and Zampieri, M. Findings of the 2019 conference on machine translation (WMT19). In Proceedings of the Fourth Conference on Machine Translation (Volume 2: Shared Task Papers, Day 1), pp. 1–61, Florence, Italy, August 2019. Association for Computational Linguistics. doi: 10.18653/v1/W19-5301. URL https://aclanthology.org/W19-5301.
+Borgeaud, S., Mensch, A., Hoffmann, J., Cai, T., Rutherford, E., Millican, K., Driessche, G. v. d., Lespiau, J.-B., Damoc, B., Clark, A., et al. Improving language models by retrieving from trillions of tokens. arXiv preprint arXiv:2112.04426, 2021.
+Chen, Q., Wang, H., Li, M., Ren, G., Li, S., Zhu, J., Li, J., Liu, C., Zhang, L., and Wang, J. SPTAG: A library for fast approximate nearest neighbor search, 2018. URL https://github.com/Microsoft/SPTAG.
+Giles, C. L., Miller, C. B., Chen, D., Chen, H.-H., Sun, G.-Z., and Lee, Y.-C. Learning and extracting ﬁnite state automata with second-order recurrent neural networks. Neural Computation, 4(3):393–405, 1992.
+Gu, J., Wang, Y., Cho, K., and Li, V. O. Search engine guided neural machine translation. In Proceedings of the AAAI Conference on Artiﬁcial Intelligence, volume 32, 2018.
+Guo, R., Sun, P., Lindgren, E., Geng, Q., Simcha, D., Chern, F., and Kumar, S. Accelerating large-scale inference with anisotropic vector quantization. In International Conference on Machine Learning, pp. 3887–3896. PMLR, 2020.
+Guu, K., Hashimoto, T. B., Oren, Y., and Liang, P. Generating sentences by editing prototypes. Transactions of the Association for Computational Linguistics, 6:437–450, 2018.
+
+Guu, K., Lee, K., Tung, Z., Pasupat, P., and Chang, M.W. REALM: Retrieval-augmented language model pretraining. arXiv preprint arXiv:2002.08909, 2020.
+Hashimoto, T. B., Guu, K., Oren, Y., and Liang, P. A retrieve-and-edit framework for predicting structured outputs. In Proceedings of the 32nd International Conference on Neural Information Processing Systems, pp. 10073–10083, 2018.
+Hayati, S. A., Olivier, R., Avvaru, P., Yin, P., Tomasic, A., and Neubig, G. Retrieval-based neural code generation. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing, pp. 925–930, 2018.
+He, J., Berg-Kirkpatrick, T., and Neubig, G. Learning sparse prototypes for text generation. Advances in Neural Information Processing Systems, 33, 2020.
+He, J., Neubig, G., and Berg-Kirkpatrick, T. Efﬁcient nearest neighbor language models. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, pp. 5703–5714, 2021.
+Jiang, Q., Wang, M., Cao, J., Cheng, S., Huang, S., and Li, L. Learning kernel-smoothed machine translation with retrieved examples. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, pp. 7280–7290, 2021.
+Johnson, J., Douze, M., and Jégou, H. Billion-scale similarity search with gpus. IEEE Transactions on Big Data, 2019.
+Joulin, A., Cissé, M., Grangier, D., Jégou, H., et al. Efﬁcient softmax approximation for gpus. In International conference on machine learning, pp. 1302–1310. PMLR, 2017.
+Karpukhin, V., Oguz, B., Min, S., Lewis, P., Wu, L., Edunov, S., Chen, D., and Yih, W.-t. Dense passage retrieval for open-domain question answering. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), pp. 6769–6781, 2020.
+Khandelwal, U., Levy, O., Jurafsky, D., Zettlemoyer, L., and Lewis, M. Generalization through memorization: Nearest neighbor language models. In International Conference on Learning Representations, 2020. URL https:// openreview.net/forum?id=HklBjCEKvH.
+Khandelwal, U., Fan, A., Jurafsky, D., Zettlemoyer, L., and Lewis, M. Nearest neighbor machine translation. In International Conference on Learning Representations, 2021. URL https://openreview.net/forum? id=7wCBOfJ8hJM.
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+Koehn, P. and Knowles, R. Six challenges for neural machine translation. In Proceedings of the First Workshop on Neural Machine Translation, pp. 28–39, 2017.
+Lin, C.-C., Zhu, H., Gormley, M. R., and Eisner, J. Neural ﬁnite-state transducers: Beyond rational relations. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), pp. 272–283, 2019.
+Merity, S., Xiong, C., Bradbury, J., and Socher, R. Pointer sentinel mixture models. In International Conference on Learning Representations, 2017.
+Neubig, G. and Dyer, C. Generalizing and hybridizing count-based and neural language models. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, pp. 1163–1172, 2016.
+Ng, N., Yee, K., Baevski, A., Ott, M., Auli, M., and Edunov, S. Facebook fair’s wmt19 news translation task submission. In Proceedings of the Fourth Conference on Machine Translation (Volume 2: Shared Task Papers, Day 1), pp. 314–319, 2019.
+Omlin, C. W. and Giles, C. L. Extraction of rules from discrete-time recurrent neural networks. Neural networks, 9(1):41–52, 1996.
+Peng, H., Schwartz, R., Thomson, S., and Smith, N. A. Rational recurrences. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing, pp. 1203–1214, 2018.
+Ram, O., Shachaf, G., Levy, O., Berant, J., and Globerson, A. Learning to retrieve passages without supervision. arXiv preprint arXiv:2112.07708, 2021.
+
+Sennrich, R., Haddow, B., and Birch, A. Neural machine translation of rare words with subword units. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp. 1715–1725, 2016.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Attention is all you need. In Advances in Neural Information Processing Systems, pp. 6000–6010, 2017.
+Weiss, G., Goldberg, Y., and Yahav, E. Extracting automata from recurrent neural networks using queries and counterexamples. In International Conference on Machine Learning, pp. 5247–5256. PMLR, 2018.
+Weiss, G., Goldberg, Y., and Yahav, E. Learning deterministic weighted automata with queries and counterexamples. Advances in Neural Information Processing Systems, 32: 8560–8571, 2019.
+Xu, F. F., He, J., Neubig, G., and Hellendoorn, V. J. Capturing structural locality in non-parametric language models. arXiv preprint arXiv:2110.02870, 2021.
+Yogatama, D., de Masson d’Autume, C., and Kong, L. Adaptive semiparametric language models. Transactions of the Association for Computational Linguistics, 9:362–373, 2021.
+Zhang, J., Utiyama, M., Sumita, E., Neubig, G., and Nakamura, S. Guiding neural machine translation with retrieved translation pieces. In Proceedings of the 2018 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long Papers), pp. 1325–1335, 2018.
+
+Rastogi, P., Cotterell, R., and Eisner, J. Weighting ﬁnitestate transductions with neural context. In Proceedings of the 2016 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, pp. 623–633, 2016.
+
+Rijhwani, S., Rosenblum, D., Anastasopoulos, A., and Neubig, G. Lexically-aware semi-supervised learning for ocr post-correction. Transactions of the Association for Computational Linguistics, 9:1285–1302, 2021.
+
+Schwartz, R., Thomson, S., and Smith, N. A. Bridging cnns, rnns, and weighted ﬁnite-state machines. In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp. 295–305, 2018.
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+A. Intuition for τ
+
+For brevity, we repeat Equation (7) here:
+
+δˆ S(t), w(t) S(t+1) = δˆ S(t), w(t)
+
+
+∪
+
+π (e)
+
+e∈N (t+1)
+
+|δˆ S(t), w(t) | ≥ τ otherwise
+
+Intuitively, the larger |δˆ S(t), w(t) | is, the more “correct entries” – entries whose values were equal to w(t) that we had at time t, and the more we can rely on their pointers at time t + 1. Thus, if |δˆ S(t), w(t) | ≥ τ , it means that we have more states to continue traversing to, and we can avoid the kNN search. If |δˆ S(t), w(t) | < τ , it means that many of the entries at time t were “incorrect” (their value was not equal to w(t)), and the set of new states δˆ S(t), w(t) is small (or even empty); in this case, we perform a new kNN search and restart an automaton traversal.
+The minimal value is τ = 1, which means that as long as we have at least one automaton state to continue traversing from, we use it without performing kNN search. The maximal value is τ = ∞, which means that |δˆ S(t), w(t) | will always be lower than τ , and thus we will perform kNN search at every step.
+
+B. Evaluation Details
+Implementation and Hyperparameters We used the exact hyperparameters of (Khandelwal et al., 2020) including kneigh = 1024 (the number of retrieved nearest neighbors when performing a full search) and the same FAISS (Johnson et al., 2019) kNN library. Following He et al. (2021), we loaded the index to the GPU, and used half precision (fp16) datastore keys.
+During the automaton traversal, when reaching automaton states – there might be too many datastore entries in it, which can make the computation slow. We thus always computed Equation (9) over at most max_knns = 1024 datastore entries (1024 datastore entries overall, in the union of all states q ∈ S(t)), preferring entries that were directly pointed by pointers from the previous state (ρ (p)), and otherwise choosing randomly. We chose 1024 to match the number of nearest neighbors retrieved when performing a full search kneigh = 1024, although they are not coupled to each other and denote different things.
+We used PyTorch Sparse2 to perform a GPU-based lookup of datastore entries belonging to a cluster.
+Hardware We ran all experiments on 32 CPU cores, and RTX 3090 or v100 GPUs. Since our main metric is the fraction of saved searches (FoSS), a different GPU will not change our results. The experiments in Appendix C (Figure 13) were performed on the same machine using a RTX 3090 GPU.
+
+C. Fraction of Saved Searches (FoSS) vs. Wall-clock Saved Time
+In our experiments in Section 5, we reported perplexity compared to FoSS (the fraction of saved searches). The other alternative of measuring wall-clock time is difﬁcult to reproduce, is brittle to temporary hardware and system load, and affected by the speciﬁc kNN retrieval library such as FAISS as used in Khandelwal et al. (2020), ScaNN (Guo et al., 2020) as used in Borgeaud et al. (2021), or SPTAG (Chen et al., 2018), etc. Further, it depends on factors that are orthogonal to our contribution, such as whether the RAM is large enough to store the datastore, and the random-access reading latency of the hard-drive.
+FoSS, in contrast, does not depend on hardware, engineering factors, or temporary system load. FoSS is also completely reproducible while wall-clock time is not. Thus, FoSS serves as a good proxy to wall-clock time that enables reproducible experiments. Here, we perform an empirical analysis of FoSS with respect to the saved wall-clock time.
+Figure 13 shows a comparison between the fraction of saved wall-clock time and FoSS. As shown, the saved wall-clock time and FoSS are identical up to an additive constant that depends on the hardware and the speciﬁc settings. Searching for k-nearest neighbors using a CPU FAISS index results in a curve that is very close to the optimal y = x, meaning that almost the entire reduction in searches is translated directly into saving of wall-clock time. Using a GPU index without clustering (only pointers) results in a penalty of 17%, but the curve is almost parallel to the optimal y = x. Using a GPU index with clustering results in a penalty of 24%, and begins to be beneﬁcial in terms of wall-clock time starting from FoSS=0.32.
+2http://github.com/rusty1s/pytorch_sparse
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+The experiments in Figure 13 were performed in the setting that we load the datastore to memory, to prevent the hard drive’s latency from being the bottleneck. Another option is to approximate the key vectors using the FAISS index, but currently FAISS’s reconstruct API is implemented only for a CPU index (rather than a GPU index),3 and for a single key ID at a time,4 and thus does not support batching.
+We expect that as the datastore size increases to the scales of Borgeaud et al. (2021), and as the number of neighbors retrieved increases (kneigh) – the more pressure that will be put on the kNN search, the more of a bottleneck that it will become, and the larger relative beneﬁt that saving kNN searches will provide to wall-clock time.
+D. Additional Results
+Comparison of Datasets Figure 11 and Figure 12 show the overlap of n-grams between the training and validation set of WIKITEXT-103 and Law-MT. As shown, for all values of n, more n-grams from the validation set were seen in the training set in Law-MT compared to WIKITEXT-103. We see this as the explanation for the better scaling of RETOMATON on Law-MT, where the perplexity only gently increases as we increase FoSS, compared WIKITEXT-103.
+Ablation Study Figure 8 and Figure 9 show results for different clustering algorithms and granularities, on WIKITEXT-103 and Law-MT, respectively. These ﬁgures are similar to Figure 5 and Figure 6, except that we include here more runs of k-means with more values of kclust and more runs of the greedy clustering of He et al. (2021).
+3https://github.com/facebookresearch/faiss/issues/314 4https://github.com/facebookresearch/faiss/issues/1163
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+Perplexity
+
+17 w/o clustering
+
+kclust =1M means
+
+kclust =500K means
+
+16.9
+
+kclust =100K means
+
+kclust =50K means
+
+greedy, 21M
+
+16.8
+
+greedy, 14M
+
+16.7
+
+16.6
+
+16.5
+
+16.4
+
+16.3
+
+16.2
+
+16.1
+
+0.1
+
+0.2
+
+0.3
+
+0.4
+
+0.5
+
+0.6
+
+0.7
+
+0.8
+
+0.9
+
+FoSS (fraction of saved searches)
+
+Figure 8: Analysis of the number of clusters on the validation set of WIKITEXT-103.
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+Perplexity
+
+12 w/o clustering kclust =100K means kclust =200K means kclust =400K means
+11.8
+
+11.6
+
+11.4
+
+11.2
+
+11
+
+10.8
+
+10.6 0
+
+0.1
+
+0.2
+
+0.3
+
+0.4
+
+0.5
+
+0.6
+
+0.7
+
+0.8
+
+0.9
+
+FoSS (fraction of saved searches)
+
+Figure 9: Analysis of the number of clusters on the validation set of Law-MT.
+
+Percentage
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+15% 10% 5%
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 Sequence length
+Figure 10: Histogram of the lengths of sequences that were predicted consecutively, without kNN search, in WIKITEXT-103.
+
+100% 80%
+
+WIKITEXT-103 Law-MT
+
+Percentage
+
+60%
+
+40%
+
+20%
+
+0% 1 2 3 4 5 6 7 8 9 10 n-gram
+Figure 11: The fraction of n-gram types in the validation set that appeared verbatim in the training set in each dataset, for different values of n.
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+100% 80%
+
+WIKITEXT-103 Law-MT
+
+Percentage
+
+60%
+
+40%
+
+20%
+
+0% 1 2 3 4 5 6 7 8 9 10 n-gram
+Figure 12: The fraction of n-gram occurrences in the validation set that appeared verbatim in the training set in each dataset, for different values of n.
+
+Neuro-Symbolic Language Modeling with Automaton-augmented Retrieval
+
+0.8 Optimal y = x
+
+RETOMATON with CPU index
+
+0.7
+
+RETOMATON with GPU index, w/o clustering
+
+RETOMATON with GPU index
+
+0.6
+
+0.5
+
+0.4
+
+0.3 Fraction of saved 0.2 wall-clock time
+0.1
+
+0
+
+−0.1
+
+−0.2
+
+−0.3
+
+−0.4
+
+0.1
+
+0.2
+
+0.3
+
+0.4
+
+0.5
+
+0.6
+
+0.7
+
+0.8
+
+FoSS (fraction of saved searches)
+
+Figure 13: A comparison between the fraction of saved wall-clock time vs. FoSS, the fraction of saved searches. The fraction of saved wall-clock time was computed relatively to the baseline kNN-LM.
+
+

@@ -1,0 +1,522 @@
+Mitigating Catastrophic Forgetting in Scheduled Sampling with Elastic Weight Consolidation in Neural Machine Translation
+
+Michalis Korakakis Department of Computer Science
+University of Cambridge mk2008@cam.ac.uk
+
+Andreas Vlachos Department of Computer Science
+University of Cambridge av308@cam.ac.uk
+
+arXiv:2109.06308v1 [cs.CL] 13 Sep 2021
+
+Abstract
+Despite strong performance in many sequenceto-sequence tasks, autoregressive models trained with maximum likelihood estimation suffer from exposure bias, i.e. a discrepancy between the ground-truth preﬁxes used during training and the model-generated preﬁxes used at inference time. Scheduled sampling is a simple and often empirically successful approach which addresses this issue by incorporating model-generated preﬁxes into the training process. However, it has been argued that it is an inconsistent training objective leading to models ignoring the preﬁxes altogether. In this paper, we conduct systematic experiments and ﬁnd that it ameliorates exposure bias by increasing model reliance on the input sequence. We also observe that as a side-effect, it worsens performance when the model-generated preﬁx is correct, a form of catastrophic forgetting. We propose using Elastic Weight Consolidation as trade-off between mitigating exposure bias and retaining output quality. Experiments on two IWSLT’14 translation tasks demonstrate that our approach alleviates catastrophic forgetting and signiﬁcantly improves BLEU compared to standard scheduled sampling.
+1 Introduction
+Autoregressive models trained with maximum likelihood estimation (MLE) constitute the dominant approach in several sequence-tosequence (seq2seq) tasks, such as machine translation (Bahdanau et al., 2015), text summarization (See et al., 2017), and conversational modeling (Vinyals and Le, 2015). However, this paradigm suffers from a discrepancy between training and inference. During training, the model generates tokens by conditioning on the ground-truth preﬁxes, while at inference time model-generated preﬁxes are used instead. This is known as the exposure bias problem (Bengio et al., 2015; Ranzato et al., 2016). Since the model
+
+is never exposed to its own errors, if a token is mistakenly generated during inference, the error will be propagated along the sequence (Ross et al., 2011). Prior work has attributed to exposure bias various forms of text degeneration, such as repetitiveness, incoherence, and tediousness (Holtzman et al., 2020), and hallucinations (Wang and Sennrich, 2020), i.e. ﬂuent outputs which contain information irrelevant and/or contradictory to the input sequence.
+Bengio et al. (2015) introduced scheduled sampling to address exposure bias in MLE-trained autoregressive models. Scheduled sampling uses a stochastic mixture of ground-truth and modelgenerated preﬁxes during training, thereby allowing the model to learn how to recover from its own errors. While various schemes have been proposed as alternatives to MLE training for the purpose of mitigating exposure bias (Ranzato et al. (2016); Wiseman and Rush (2016); Shen et al. (2016); Bahdanau et al. (2017), inter alia), scheduled sampling remains one of the most popular due to its simplicity and performance improvements in many conditional sequence generation tasks (Bengio et al., 2015; Du and Ji, 2019; Zhang et al., 2019).
+Conversely, other studies have reported that using scheduled sampling may hurt performance (Leblond et al., 2018; Mihaylova and Martins, 2019). The dominant hypothesis for these negative results is that it creates models that are more likely to recover from their own mistakes by training them to ignore the generated preﬁxes entirely (Huszar, 2015). However, no attempt has been made to empirically assess this hypothesis. Thus better understanding of how scheduled sampling affects training remains under-explored.
+In this paper, we provide insights into the working mechanisms of scheduled sampling. Following Voita et al. (2020), we apply Layerwise Relevance Propagation (LRP) (Bach et al., 2015) to quantify the contributions of the input sequence
+
+and the model-generated preﬁx on the output generation process, and empirically evaluate the hypothesis of Huszar (2015). We ﬁnd that models trained with scheduled sampling increase their reliance on the input sequence, and therefore mitigate exposure bias by depending less on the potentially incorrect generated preﬁx. However, we also observe that this leads to output degradation due to catastrophic forgetting (?) of how to predict when the model-generated preﬁx is correct. We propose using Elastic Weight Consolidation (EWC) (Kirkpatrick et al., 2016) to address catastrophic forgetting and allow improvements due to mitigating exposure bias, while also retaining output quality.
+Experiments on the commonly-used IWSLT’14 GermanEnglish and VietnameseEnglish translation tasks show that our scheduled sampling variant mitigates catastrophic forgetting and signiﬁcantly improves translation performance over standard scheduled sampling in long short-term memory (LSTM) (Hochreiter and Schmidhuber, 1997) and Transformer (Vaswani et al., 2017) models. In particular, on GermanEnglish, our approach yields a BLEU gain of +0.62 over scheduled sampling for the LSTM model and a gain of +0.73 BLEU for the Transformer. Similarly, on VietnameseEnglish, our approach outperforms scheduled sampling by +0.54 BLEU and by +0.59 BLEU. Importantly, performance gains occur across diﬀerent annealing schedules, making the scheduled sampling variant we introduce more robust and easier to tune.
+2 Scheduled Sampling
+Autoregressive models estimate the conditional probability of the output y given the input x one token at a time in a monotonic fashion:
+T
+P (y | x) = p(yt | y<t, x; θ), (1)
+t=1
+where yt is the t-th token in y, y<t denotes all previous tokens, and θ is a set of model parameters.
+Given a dataset D = {(x(i), y(i))}Ni=1 of input-output pairs, the standard approach to optimize the parameters θ of an autoregressive model entails maximizing the conditional loglikelihood:
+
+θˆMLE = argmax L(θ; D),
+
+(2)
+
+θ
+
+where
+
+N L(i)
+
+L(θ; D) =
+
+log p(yt(i) | y<(i)t, x(i); θ). (3)
+
+i=1 t=1
+
+Here i indicates the i-th output sequence in the dataset and L(i) is the length of the
+i-th output sequence. This training objec-
+tive is known as teacher-forcing (Williams and
+Zipser, 1989), since the model conditions on the ground-truth preﬁx y(<i)t to generate the token yt(i). However, at inference time, the model generates the token yˆt by conditioning using its own previous outputs, i.e. yˆ<t instead of y<t. This limitation creates a discrepancy between training and inference known as the ex-
+posure bias problem (Bengio et al., 2015; Ran-
+zato et al., 2016).
+Bengio et al. (2015) introduced scheduled
+sampling to bridge the above-mentioned gap
+between MLE training and inference. Sched-
+uled sampling uses the same training objective
+as teacher-forcing (Equation 3), the only diﬀerence being that the conditioning preﬁxes y˜(<i)t are a stochastic mixture of ground-truth y(ti) and model-generated preﬁxes yˆ(<i)t:
+
+N L(i)
+
+L(θ; D) =
+
+log p(yt(i) | y˜<(i)t, x(i); θ). (4)
+
+i=1 t=1
+
+Finally, an annealing schedule is used to
+gradually decrease the probability p of conditioning using the ground-truth y<(i)t during training. Typically, for each mini-batch b, p is
+decreased using the following annealing sched-
+ules:
+
+• Linear: p = max(p − kb, 0) • Exponential: p = kb
+
+• Inverse sigmoid: p = k/(k + exp(b/k))
+
+Here k is a hyperparameter which controls the speed of the decay of p in each schedule.
+
+2.1 Connections to DAGGER
+Scheduled sampling is an adaptation to recurrent neural networks (RNNs) and autoregressive models more broadly of DAgger (Ross et al., 2011), a well-known imitation learning (IL) technique for mitigating exposure bias. Like other IL algorithms (Daumé III et al., 2009), it relies on an oracle (or expert), who demonstrates the desired behaviour during training and also provides information about how to recover from errors. Thus the main idea behind DAgger is to iteratively construct a training dataset by using new data generated from a stochastic mixture of the oracle and the model, thereby allowing the latter to learn to recover from its own errors.
+However, there are several important diﬀerences between scheduled sampling and DAgger. First, scheduled sampling uses the ground-truth as an oracle by assuming that at each time step the ground-truth tokens are aligned with the model-generated tokens. Consequently, if the model-generated sequence deviates from the ground-truth this will cause repetitive loops. For example, if the groundtruth sequence is “I took a brief break,” and the model has generated “I took a break,” scheduled sampling will train the model to generate “break” twice (Daumé III, 2016; Ranzato et al., 2016). Second, scheduled sampling cannot penalize earlier mistakes in the sequence since the gradients are not back-propagated through the generated preﬁxes due to the discontinuation of the argmax operation (Ranzato et al., 2016; Goyal et al., 2017). Using the same example as above, if the model erroneously generates “I took a long nap,” scheduled sampling will only seek to increase the likelihood of “break” and will not attempt to address the initial error in the sequence, i.e. generating “long” instead of “brief.” Third, unlike Ross et al. (2011) who provide theoretical guarantees for the annealing schedule in DAgger, Bengio et al. (2015) do not oﬀer any justiﬁcations regarding the diﬀerences among the proposed annealing schedules for scheduled sampling. Finally, scheduled sampling assumes an online training algorithm (e.g. stochastic gradient descent), whereas DAgger trains on datasets aggregated across iterations.1
+1However, DAGGER has also been used in online settings
+
+3 Analysis of Scheduled Sampling
+In this section, we propose two systematic analyses to investigate how scheduled sampling works. First, we use Layerwise Relevance Propagation (LRP) (Bach et al., 2015) to examine the contribution of the input sequence and the model-generated preﬁx on the output generation process, and thus assess the hypothesis of Huszar (2015) regarding how scheduled sampling aﬀects training. Then we treat scheduled sampling as a domain adaptation task by assuming that the model’s predictions can be viewed as a small domain we adapt the model after it is trained only on ground-truth data. To this end, we apply teacher-forcing at inference time to quantify the impact of catastrophic forgetting on models trained with scheduled sampling.
+3.1 Preﬁxes under Scheduled Sampling
+Huszar (2015) argued that scheduled sampling is an inappropriate training objective since it learns models that ignore the generated preﬁxes. This limitation arises because the modelgenerated outputs correspond to a distribution that is diﬀerent from the ground-truth sequences the model is trained to generate. Therefore training might not converge to the correct model even as the dataset and the capacity of the model increase indeﬁnitely.
+To empirically verify this hypothesis, we apply LRP to quantify the inﬂuence of the input sequence and the preﬁx on the output generation process. The intuition behind this experiment is that if scheduled sampling creates models that ignore the preﬁxes, then the input sequence and the preﬁx contributions should remain relatively stable.
+Given an input sequence token xi and a preﬁx token yj, LRP computes the relevance scores rt(xi) and rt(yj) at every output generation step t by back-propagating from the output to the input. Importantly, the total relevance scores for each generated token are equal to 1:
+
+t−1
+
+rt(xi)+ rt(yj) = 1.
+
+(5)
+
+i
+
+j=1
+
+as well (Daumé III et al., 2014).
+
+In the general case, the relevance score rj(l) for the j-th neuron in layer l is computed as:2
+
+K
+rj(l) =
+k=1
+
+zj+k
+
+zj−k
+
+α z+ − β z−
+
+i ji
+
+i ji
+
+rk(l+1), (6)
+
+where zjk = xjwjk. Here K denotes the total number of neurons at each layer, j and k are neurons at two consecutive layers l and l+1, xj is the activation of neuron j at layer l, wjk is the weight connecting neurons j and k, r(l + 1) is the relevance score at layer (l + 1), + and − indicate positive and negative contributions to r(l + 1), and ﬁnally, α and β are hyperpameters that determine the importance of the positive (+) and negative (-) contributions.
+
+3.2 Scheduled Sampling as Fine-Tuning
+Our hypothesis is that scheduled sampling can be treated as a domain adaption task where a model trained on a large general-domain dataset, i.e. the ground-truth data, is then ﬁne-tuned on a small in-domain dataset, i.e. the model’s own predictions. A commonly occurring issue in such approaches is that typically after ﬁne-tuning, the model’s ability to produce general-domain outputs is negatively impacted due to catastrophic forgetting (?).
+To this end, inspired by Wu et al. (2018) who applied teacher-forcing during inference to investigate the inﬂuence of exposure bias in neural machine translation (NMT), we use the ground-truth preﬁx y<t instead of the modelgenerated preﬁx yˆ<t to generate the output token yˆt:
+
+yˆt = argmax p(y | y<t, x; θ).
+
+(7)
+
+y
+
+If there is no catastrophic forgetting, then the output quality is expected to improve when the model-generated preﬁxes are replaced with the ground-truth since the risk of exposure bias is mitigated.
+
+4 Experiments
+In this section, we apply the methods discussed in Section 3 to examine if models trained with
+2Since we use implementation of Voita et al. (2019), we adopt the LRP-αβ rule (Bach et al., 2015; Binder et al., 2016) for computing relevance scores.
+
+Method Schedule
+
+LSTM MLE SS SS SS SS
+
+linear exp sigmoid
+-
+
+Transformer
+
+MLE
+
+-
+
+SS
+
+linear
+
+SS
+
+exp
+
+SS
+
+sigmoid
+
+SS
+
+-
+
+deen
+26.72±0.21 26.54±0.25 26.61±0.17 27.35±0.32 21.06±0.28
+34.08±0.15 33.89±0.09 33.67±0.15 34.65±0.19 30.27±0.32
+
+vien
+22.64±0.16 22.59±0.18 22.45±0.13 23.58±0.33 22.21±0.18
+27.13±0.18 26.68±0.14 26.82±0.12 27.57±0.26 23.48±0.29
+
+Table 1: BLEU scores for models trained with maximum likelihood estimation (MLE) and scheduled sampling (SS). We train models using 5 different random initializations and report the mean and standard deviation.
+
+scheduled sampling ignore the generated preﬁxes and also determine whether scheduled sampling causes catastrophic forgetting.
+4.1 Experimental Setup
+Data Following prior work exploring scheduled sampling in NMT (Goyal et al., 2017; Xu et al., 2019; Mihaylova and Martins, 2019), we conduct experiments on two commonlyused IWSLT’14 translation tasks, the GermanEnglish (deen) and VietnameseEnglish (vien). The deen dataset consists of approximately 170K sentence pairs. For deen, we follow the same setup as in Ranzato et al. (2016). The vien dataset contains approximately 121K sentence pairs. We perform experiments on the vien following the setup of Luong and Manning (2015). We report cased, tokenized BLEU (Papineni et al., 2002) with multi-bleu.perl.3
+Models We use LSTM (Hochreiter and Schmidhuber, 1997) and Transformer (Vaswani et al., 2017) models trained with default architectures and hyperparameters from fairseq (Ott et al., 2019). We report the mean and standard deviation over 5 runs with diﬀerent random seeds.
+3https://github.com/moses-smt/ mosesdecoder/blob/master/scripts/ generic/multi-bleu.perl
+
+4.2 Results
+Impact of Annealing Schedule Before we proceed with our analyses, we ﬁrst attempt to assess the eﬀectiveness of scheduled sampling by examining the impact of the annealing schedule on performance, as there is no systematic study of it in any previous work, including Bengio et al. (2015). Table 1 shows that there is a considerable diﬀerence in performance between inverse sigmoid, and the linear and exponential annealing schedules. One potential factor for this is that when the annealing schedule starts decreasing the ground-truth probability too fast (as in the case of both the linear and exponential annealing schedules), the performance of the model deteriorates quickly. We also observe that all annealing baselines outperform scheduled sampling without annealing, i.e. using a ﬁxed probability for the ground-truth throughout training, thus showing that this particular training objective beneﬁts strongly from it. This is likely because the model is not capable of generating useful preﬁxes early on during training. Furthermore, the experimental results show that by using a carefully tuned annealing schedule, scheduled sampling leads to higher BLEU scores compared to MLE. In particular, on vien, it improves over the MLE baseline by +0.94 BLEU for the LSTM model and by +0.44 BLEU for the Transformer. Similarly, on deen, scheduled sampling yields a gain of +0.63 BLEU over the MLE-trained LSTM model and a gain of +0.57 BLEU over the MLE-trained Transformer. Given the superiority of inverse sigmoid, in the remainder of this paper we use this annealing schedule for all experiments unless otherwise stated.
+Preﬁxes under Scheduled Sampling Figure 1 shows the source contributions for modelgenerated preﬁxes. Following the experimental setup of Voita et al. (2020), we pick 100 randomly chosen source-target pairs from each test set with the same length in the source and target and average all results. We use the Transformer model to quantify contributions since the implementation of LRP by Voita et al. (2020) is tailored to this particular neural architecture. Figure 1 illustrates that at the beginning, MLE-trained models tend to use the source more, however, as the target preﬁx becomes longer, they rely less on the
+
+Source Contribution
+
+deen sourcepreﬁx
+0.9
+
+vien sourcepreﬁx
+0.9
+
+0.85
+
+0.85
+
+0.8 2 5 10 15 20 25 Target Token Position
+
+0.8 2 5 10 15 20 25 Target Token Position
+
+SS MLE
+
+Figure 1: Source contributions.
+
+Method MP
+
+LSTM MLE SS
+
+26.72 27.35
+
+Transformer MLE 34.08 SS 34.65
+
+deen TF
+28.67 23.59
+35.96 29.84
+
+∆
++1.95 -3.76
++1.88 -4.81
+
+vien MP TF ∆
+22.64 24.98 +2.34 23.58 18.92 -4.66
+27.13 29.14 +2.01 27.57 22.42 -5.15
+
+Table 2: BLEU scores by conducting inference with two approaches, namely, (i) by conditioning using model-generated preﬁxes (MP), and (ii) with teacher-forcing (TF), i.e. feeding the ground-truth as an input to generate the output token.
+
+source and more on the preﬁx, given that
+
+t−1
+
+rt(yj) = 1 − rt(xi) (Equation 5). This be-
+
+j=1
+
+i
+
+haviour is in agreement with prior work that
+
+has attributed the increasing reliance on the
+
+preﬁx to teacher-forcing (Wang and Sennrich,
+
+2020; Voita et al., 2020). Conversely, sched-
+
+uled sampling, which mitigates exposure bias,
+
+promotes the usage of source information to
+
+generate a target token, as the decrease in the
+
+inﬂuence of source contributions is less drastic
+
+compared to MLE-trained models. This sug-
+
+gests that scheduled sampling results in models
+
+that tend to ignore the generated preﬁx more
+
+than MLE-trained models, thus conﬁrming the
+
+hypothesis discussed in Section 3. However, in
+
+contrast to Huszar (2015), we argue that this is
+
+a positive outcome in the context of NMT: the
+
+model-generated preﬁx is often incorrect, but
+
+the source that is being translated does not
+
+change, therefore learning to rely on it more
+
+is a reasonable approach to alleviate exposure
+
+bias.
+
+Scheduled Sampling as Domain Adaptation Table 2 empirically conﬁrms the occurrence of catastrophic forgetting in models trained with scheduled sampling. We observe that when they condition using the ground-truth preﬁxes, the quality of generations drops heavily in terms of BLEU across both languages and neural architectures, suggesting that scheduled sampling results in forgetting how to predict when the preﬁx is correct. In particular, on deen, the BLEU score reduction is -3.76 for the LSTM model and -4.81 for the Transformer. Similarly, on vien, the BLEU score degrades by -4.66 and by -5.15. On the other hand, we see that in MLE-trained models, using teacherforcing at inference time leads to consistent BLEU score improvements over conditioning with model-generated preﬁxes. Speciﬁcally, on deen the BLEU score gain is +1.95 for the LSTM model and 1.88 for the Transformer, and on vi, the BLEU score increases by +2.34 and by +2.01.
+5 Elastic Weight Consolidation for Scheduled Sampling
+Section 4 shows that even though scheduled sampling addresses exposure bias by increasing model reliance on the input sequence, it also leads to output degradation due to catastrophic forgetting (?) when the generated preﬁx is correct at inference time. Elastic Weight Consolidation (EWC) (Kirkpatrick et al., 2016) is an eﬀective regularization-based approach for mitigating catastrophic forgetting during domain adaptation in NMT (Thompson et al., 2019; Saunders et al., 2019).
+EWC regularizes learning an in-domain task I without forgetting an already learned general-domain task G by retaining the parameters which are important for the latter, while adapting more on parameters that are less important:
+LEWC(θ; D) = L(θ; DI ) + λ Fj(θjI − θjG)2,
+j
+(8)
+where L(θ; DI) is the standard log-likelihood loss (Equation 3) over the in-domain data, λ is a hyperparameter which determines the importance of the general-domain task G, θjI are the in-domain model parameters, θjG are the
+
+deen
+
+Schedule SS + EWC ∆SS
+
+LSTM linear exp sigmoid
+
+26.72±0.22 26.83±0.19 27.97±0.24
+
++0.18 +0.22 +0.62
+
+Transformer
+
+linear 34.01±0.08
+
+exp
+
+33.86±0.13
+
+sigmoid 35.19±0.21
+
++0.12 +0.19 +0.54
+
+vien SS + EWC ∆SS
+
+22.80±0.21 22.73±0.20 24.31±0.27
+
++0.21 +0.28 +0.73
+
+26.85±0.15 26.98±0.17 28.16±0.26
+
++0.17 +0.16 +0.59
+
+Table 3: BLEU scores for models trained with our proposed scheduled sampling variant (SS + EWC). ∆SS indicates the difference in BLEU between our proposed variant and standard scheduled sampling.
+
+Method
+LSTM SS + EWC ∆SS
+Transformer SS + EWC ∆SS
+
+deen
+26.90 +2.69
+33.17 +2.79
+
+vien
+22.93 +3.28
+26.05 +3.04
+
+Table 4: BLEU scores for our proposed scheduled sampling variant (SS + EWC) by conducting inference with teacher-forcing. ∆SS indicates the difference in BLEU between our proposed variant and standard scheduled sampling (Table 2).
+
+general-domain model parameters, and Fj = E ∇2L(θjG) is an estimate of how important the parameter θjG is to the general-domain task G.
+6 Experiments with EWC
+In this section, we perform experiments with our proposed scheduled sampling variant following the setup described in Section 4.
+Automatic Evaluation Table 3 shows that by using scheduled sampling in conjunction with EWC we obtain better BLEU scores on all annealing schedules across both languages and neural architectures compared to standard scheduled sampling. Speciﬁcally, for the best performing annealing schedule, on vien, our proposed scheduled sampling variant improves over scheduled sampling by +0.62 BLEU for the LSTM model and by +0.73 BLEU for the Transformer. Similarly, on deen, it yields a gain of +0.54 BLEU and +0.59 BLEU. Im-
+
+provements are signiﬁcant with p < 0.01.4 Furthermore, we observe that EWC brings the performance of less eﬀective annealing schedules closer to that of MLE-trained models.
+Catastrophic Forgetting We investigate whether using EWC addresses the catastrophic forgetting problem in models trained with scheduled sampling. To this end, we repeat the teacher-forcing during inference experiment discussed in Section 3. Table 4 shows consistent improvements in terms of BLEU scores compared to the results obtained with standard scheduled sampling (Table 2). In particular, on deen, the BLEU score gain for scheduled sampling with EWC is +2.69 for the LSTM model and +3.28 for the Transformer. Similarly, on vien, the BLEU score increases by +2.79 and by +3.04.
+Performance at Different Output Lengths Figure 3 shows BLEU scores on the deen test set for diﬀerent output sequence lengths (by grouping them into bins of width 20). We observe that the output quality degrades as the sequence length increases across all training objectives. In particular, MLE-trained models suﬀer the most from this due to exposure bias. Conversely, our variant improves the BLEU score across all bins (compared to MLE and standard scheduled sampling), even for long sequences.
+Effect of λ Figure 2 shows the BLEU scores on the deen test set under diﬀerent values for k (for the annealing schedule) and λ (for EWC). We observe that scheduled sampling with EWC outperforms standard scheduled sampling (bottom row where λ = 0) across all hyperparameter pairs. Thus we conclude that the introduction of λ does not increase the complexity of hyperparameter tuning, as it improves the robustness of scheduled sampling across schedules and their parameterizations. Huszár (2018) pointed out that EWC is an approximation of the joint optimization of the loss on two datasets, via encapsulating the information from the dataset representing the initial general-domain task in the model parameters that are ﬁne-tuned. Scheduled sampling (without EWC) also aims at achiev-
+4We conduct statistical signiﬁcance testing following Collins et al. (2005).
+
+ing the same goal, i.e. optimizing the parameters for generating outputs using both groundtruth preﬁxes and model-generated ones. In principle, this should be possible to achieve via a well-tuned annealing schedule, however, as Figure 2 shows, it is substantially easier to tune the hyperparameter controlling the EWC regularizer. Finally, in the theoretical analysis of SEARN which also uses an annealing schedule in a similar manner, Daumé III et al. (2009) argued that the theoretically guaranteed annealing rate would be too slow to be applied in practice.
+
+7 Related Work
+Imitation Learning for NMT Since Bengio et al. (2015), a number of research works have adapted standard IL algorithms (Daumé III et al., 2009; Ross et al., 2011; Ross and Bagnell, 2014; Chang et al., 2015) to autoregressive models to address exposure bias. SEARNN (Leblond et al., 2018) is a neural adaptation of SEARN (Daumé III et al., 2009) that computes a local loss for each generated token. Goyal et al. (2017) proposed a differentiable scheduled sampling variant to mitigate the credit assignment problem, while Xu et al. (2019) aimed to ﬁx the time step alignment issue between the oracle and the modelgenerated tokens. Zhang et al. (2019) introduced a sequence-level scheduled sampling variant which conditions on model-generated preﬁxes with the highest BLEU score. A separate family of methods focus on using IL algorithms for non-autoregressive NMT (Wei et al., 2019; Gu et al., 2019; Welleck et al., 2019; Xu and Carpuat, 2020) and knowledge distillation (Liu et al., 2018; Lin et al., 2020).
+
+Non-MLE Training Methods The dis-
+
+crepancy between MLE training and in-
+
+ference has prompted the development
+
+of many alternatives training algorithms.
+
+Approaches based on reinforcement learn-
+
+ing (RL), such as Actor-Critic (Bahdanau
+
+et al., 2017) and MIXER (Ranzato et al.,
+
+2016), optimize the task-level loss di-
+
+rectly. GOLD (Pang and He, 2020) uses
+
+oﬀ-policy RL to learn from human demonstra-
+
+tions through importance weighting (Hastings,
+
+1970).
+
+Reward augmented maximum-
+
+likelihood (RAML) (Norouzi et al., 2016)
+
+BLEU
+λ
+
+LSTM sigmoid BLEU
+27.8 27.6 27.4 27.2 27
+k
+
+linear
+
+BLEU 26.7 26.6 26.5 26.4
+
+k
+
+sigmoid
+
+Transformer
+BLEU
+35.2
+
+linear
+
+35
+
+34.8
+
+34.6
+
+k
+
+k
+
+BLEU 34.1 34 33.9 33.8
+
+Figure 2: Hyperparameter analysis using heatmaps. Better performance is achieved with different hyperparameter pairs over standard scheduled sampling (bottom row where λ = 0), thus showing the robustness of our proposed variant.
+
+LSTM 40
+
+Transformer 40
+
+30
+
+30
+
+20
+
+20
+
+0 20 40 60 80 Sequence Length
+MLE SS
+
+0 20 40 60 80 Sequence Length
+SS + EWC
+
+Figure 3: BLEU scores versus output sequence length (bins of width 20) for various models and training objectives.
+
+maximizes the likelihood of sequences with respect to the exponentiated reward distribution. Minimum Risk Training (MRT) (Och, 2003; Smith and Eisner, 2006; Shen et al., 2016) optimizes model parameters by minimizing the expected loss directly with respect to the task-level loss. Other alternative nonMLE training methods include energy-based models (Deng et al., 2020), beam-search optimization (BSO) (Wiseman and Rush, 2016), and unlikelihood training (Welleck et al., 2020).
+Mitigating Catastrophic Forgetting Despite recent progress, various state-of-the-art neural architectures in NLP fail to retain previously learned knowledge due to catastrophic forgetting (Yogatama et al., 2019). To this end, many approaches have been proposed to overcome this limitation in a plethora of NLP tasks, such as NMT (Miceli Barone et al., 2017;
+
+Khayrallah et al., 2018; Saunders et al., 2019; Thompson et al., 2019), reading comprehension (Xu et al., 2020), fact veriﬁcation (Thorne and Vlachos, 2020), and visual question answering (Perez et al., 2018; Greco et al., 2019). Another line of research works investigates techniques which address catastrophic forgetting during the ﬁne-tuning stage of deep pretrained language models (Arora et al., 2019; Chronopoulou et al., 2019; Chen et al., 2019, 2020; Pilault et al., 2020).
+8 Conclusion
+In this work, we conduct systematic analyses to examine the strengths and weaknesses of scheduled sampling. By applying LRP to quantify the inﬂuence of the input sequence and the model-generated preﬁx on the output generation process, we show that models trained with scheduled sampling increase their reliance on the former to address exposure bias. However, we also demonstrate that as a side-eﬀect, this leads to output degradation due to catastrophic forgetting when the preﬁx generated by the model at inference time is correct. Accordingly, we propose using EWC to allow mitigating exposure bias while maintaining output quality. Our scheduled sampling variant alleviates catastrophic forgetting and signiﬁcantly improves BLEU scores over standard scheduled sampling on two IWSLT’14 translation tasks.
+In future work, we would like to assess the impact of using diﬀerent oracles on training, e.g. dynamic oracles (Goldberg and Nivre, 2012) that can help the model when it devi-
+
+ates from the ground-truth, and also investigate whether other domain-adaptation methods can be used to ameliorate catastrophic forgetting in scheduled sampling. Finally, we intend to examine whether the phenomenon of catastrophic forgetting occurs in IL-based training objectives apart from scheduled sampling.
+References
+Gaurav Arora, Afshin Rahimi, and Timothy Baldwin. 2019. Does an LSTM forget more than a CNN? an empirical study of catastrophic forgetting in NLP. In Proceedings of the The 17th Annual Workshop of the Australasian Language Technology Association, pages 77–86, Sydney, Australia. Australasian Language Technology Association.
+Sebastian Bach, Alexander Binder, Grégoire Montavon, Frederick Klauschen, Klaus-Robert Müller, and Wojciech Samek. 2015. On pixel-wise explanations for non-linear classiﬁer decisions by layer-wise relevance propagation. PLOS ONE, 10(7):1–46.
+Dzmitry Bahdanau, Philemon Brakel, Kelvin Xu, Anirudh Goyal, Ryan Lowe, Joelle Pineau, Aaron C. Courville, and Yoshua Bengio. 2017. An actor-critic algorithm for sequence prediction. In 5th International Conference on Learning Representations, ICLR 2017, Toulon, France, April 24-26, 2017, Conference Track Proceedings. OpenReview.net.
+Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. 2015. Neural machine translation by jointly learning to align and translate. In 3rd International Conference on Learning Representations, ICLR 2015, San Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings.
+Samy Bengio, Oriol Vinyals, Navdeep Jaitly, and Noam Shazeer. 2015. Scheduled sampling for sequence prediction with recurrent neural networks. In Advances in Neural Information Processing Systems 28: Annual Conference on Neural Information Processing Systems 2015, December 7-12, 2015, Montreal, Quebec, Canada, pages 1171–1179.
+Alexander Binder, Grégoire Montavon, Sebastian Lapuschkin, Klaus-Robert Müller, and Wojciech Samek. 2016. Layer-wise relevance propagation for neural networks with local renormalization layers. In Artiﬁcial Neural Networks and Machine Learning - ICANN 2016 - 25th International Conference on Artiﬁcial Neural Networks, Barcelona, Spain, September 6-9, 2016, Proceedings, Part II, volume 9887 of Lecture Notes in Computer Science, pages 63–71. Springer.
+
+Kai-Wei Chang, Akshay Krishnamurthy, Alekh Agarwal, Hal Daumé III, and John Langford. 2015. Learning to search better than your teacher. In Proceedings of the 32nd International Conference on Machine Learning, ICML 2015, Lille, France, 6-11 July 2015, volume 37 of JMLR Workshop and Conference Proceedings, pages 2058–2066. JMLR.org.
+Sanyuan Chen, Yutai Hou, Yiming Cui, Wanxiang Che, Ting Liu, and Xiangzhan Yu. 2020. Recall and learn: Fine-tuning deep pretrained language models with less forgetting. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 7870–7881, Online. Association for Computational Linguistics.
+Xinyang Chen, Sinan Wang, Bo Fu, Mingsheng Long, and Jianmin Wang. 2019. Catastrophic forgetting meets negative transfer: Batch spectral shrinkage for safe transfer learning. In Advances in Neural Information Processing Systems 32: Annual Conference on Neural Information Processing Systems 2019, NeurIPS 2019, December 8-14, 2019, Vancouver, BC, Canada, pages 1906–1916.
+Alexandra Chronopoulou, Christos Baziotis, and Alexandros Potamianos. 2019. An embarrassingly simple approach for transfer learning from pretrained language models. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), pages 2089–2095, Minneapolis, Minnesota. Association for Computational Linguistics.
+Michael Collins, Philipp Koehn, and Ivona Kučerová. 2005. Clause restructuring for statistical machine translation. In Proceedings of the 43rd Annual Meeting of the Association for Computational Linguistics (ACL’05), pages 531– 540, Ann Arbor, Michigan. Association for Computational Linguistics.
+Hal Daumé III. 2016. A dagger by any other name: scheduled sampling. https: //nlpers.blogspot.com/2016/03/ a-dagger-by-any-other-name-scheduled. html. Accessed: 2021-04-16.
+Hal Daumé III, John Langford, and Daniel Marcu. 2009. Search-based structured prediction. Mach. Learn., 75(3):297–325.
+Hal Daumé III, John Langford, and Stéphane Ross. 2014. Eﬃcient programmable learning to search. CoRR, abs/1406.1837.
+Yuntian Deng, Anton Bakhtin, Myle Ott, Arthur Szlam, and Marc’Aurelio Ranzato. 2020. Residual energy-based models for text generation. In
+
+8th International Conference on Learning Representations, ICLR 2020, Addis Ababa, Ethiopia, April 26-30, 2020. OpenReview.net.
+Wanyu Du and Yangfeng Ji. 2019. An empirical comparison on imitation learning and reinforcement learning for paraphrase generation. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP), pages 6012–6018, Hong Kong, China. Association for Computational Linguistics.
+Yoav Goldberg and Joakim Nivre. 2012. A dynamic oracle for arc-eager dependency parsing. In Proceedings of COLING 2012, pages 959–976, Mumbai, India. The COLING 2012 Organizing Committee.
+Kartik Goyal, Chris Dyer, and Taylor BergKirkpatrick. 2017. Diﬀerentiable scheduled sampling for credit assignment. In Proceedings of the 55th Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers), pages 366–371, Vancouver, Canada. Association for Computational Linguistics.
+Claudio Greco, Barbara Plank, Raquel Fernández, and Raﬀaella Bernardi. 2019. Psycholinguistics meets continual learning: Measuring catastrophic forgetting in visual question answering. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 3601–3605, Florence, Italy. Association for Computational Linguistics.
+Jiatao Gu, Changhan Wang, and Junbo Zhao. 2019. Levenshtein transformer. In Advances in Neural Information Processing Systems 32: Annual Conference on Neural Information Processing Systems 2019, NeurIPS 2019, December 814, 2019, Vancouver, BC, Canada, pages 11179– 11189.
+W. K. Hastings. 1970. Monte carlo sampling methods using markov chains and their applications. Biometrika, 57(1):97–109.
+Sepp Hochreiter and Jürgen Schmidhuber. 1997. Long short-term memory. Neural Comput., 9(8):1735–1780.
+Ari Holtzman, Jan Buys, Li Du, Maxwell Forbes, and Yejin Choi. 2020. The curious case of neural text degeneration. In 8th International Conference on Learning Representations, ICLR 2020, Addis Ababa, Ethiopia, April 26-30, 2020. OpenReview.net.
+Ferenc Huszar. 2015. How (not) to train your generative model: Scheduled sampling, likelihood, adversary? CoRR, abs/1511.05101.
+
+Ferenc Huszár. 2018. Note on the quadratic penalties in elastic weight consolidation. Proceedings of the National Academy of Sciences, 115(11):E2496–E2497.
+Huda Khayrallah, Brian Thompson, Kevin Duh, and Philipp Koehn. 2018. Regularized training objective for continued training for domain adaptation in neural machine translation. In Proceedings of the 2nd Workshop on Neural Machine Translation and Generation, pages 36–44, Melbourne, Australia. Association for Computational Linguistics.
+James Kirkpatrick, Razvan Pascanu, Neil C. Rabinowitz, Joel Veness, Guillaume Desjardins, Andrei A. Rusu, Kieran Milan, John Quan, Tiago Ramalho, Agnieszka Grabska-Barwinska, Demis Hassabis, Claudia Clopath, Dharshan Kumaran, and Raia Hadsell. 2016. Overcoming catastrophic forgetting in neural networks. CoRR, abs/1612.00796.
+Rémi Leblond, Jean-Baptiste Alayrac, Anton Osokin, and Simon Lacoste-Julien. 2018. SEARNN: training rnns with global-local losses. In 6th International Conference on Learning Representations, ICLR 2018, Vancouver, BC, Canada, April 30 - May 3, 2018, Conference Track Proceedings. OpenReview.net.
+Alexander Lin, Jeremy Wohlwend, Howard Chen, and Tao Lei. 2020. Autoregressive knowledge distillation through imitation learning. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 6121–6133, Online. Association for Computational Linguistics.
+Yijia Liu, Wanxiang Che, Huaipeng Zhao, Bing Qin, and Ting Liu. 2018. Distilling knowledge for search-based structured prediction. In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1393–1402, Melbourne, Australia. Association for Computational Linguistics.
+Minh-Thang Luong and Christopher D. Manning. 2015. Stanford neural machine translation systems for spoken language domain. In International Workshop on Spoken Language Translation, Da Nang, Vietnam.
+Antonio Valerio Miceli Barone, Barry Haddow, Ulrich Germann, and Rico Sennrich. 2017. Regularization techniques for ﬁne-tuning in neural machine translation. In Proceedings of the 2017 Conference on Empirical Methods in Natural Language Processing, pages 1489–1494, Copenhagen, Denmark. Association for Computational Linguistics.
+Tsvetomila Mihaylova and André F. T. Martins. 2019. Scheduled sampling for transformers. In
+
+Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics: Student Research Workshop, pages 351–356, Florence, Italy. Association for Computational Linguistics.
+Mohammad Norouzi, Samy Bengio, Zhifeng Chen, Navdeep Jaitly, Mike Schuster, Yonghui Wu, and Dale Schuurmans. 2016. Reward augmented maximum likelihood for neural structured prediction. In Advances in Neural Information Processing Systems 29: Annual Conference on Neural Information Processing Systems 2016, December 5-10, 2016, Barcelona, Spain, pages 1723–1731.
+Franz Josef Och. 2003. Minimum error rate training in statistical machine translation. In Proceedings of the 41st Annual Meeting of the Association for Computational Linguistics, pages 160–167, Sapporo, Japan. Association for Computational Linguistics.
+Myle Ott, Sergey Edunov, Alexei Baevski, Angela Fan, Sam Gross, Nathan Ng, David Grangier, and Michael Auli. 2019. fairseq: A fast, extensible toolkit for sequence modeling. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics (Demonstrations), pages 48–53, Minneapolis, Minnesota. Association for Computational Linguistics.
+Richard Yuanzhe Pang and He He. 2020. Text generation by learning from oﬀ-policy demonstrations. CoRR, abs/2009.07839.
+Kishore Papineni, Salim Roukos, Todd Ward, and Wei-Jing Zhu. 2002. Bleu: a method for automatic evaluation of machine translation. In Proceedings of the 40th Annual Meeting of the Association for Computational Linguistics, pages 311–318, Philadelphia, Pennsylvania, USA. Association for Computational Linguistics.
+Ethan Perez, Florian Strub, Harm de Vries, Vincent Dumoulin, and Aaron C. Courville. 2018. Film: Visual reasoning with a general conditioning layer. In Proceedings of the ThirtySecond AAAI Conference on Artiﬁcial Intelligence, (AAAI-18), the 30th innovative Applications of Artiﬁcial Intelligence (IAAI-18), and the 8th AAAI Symposium on Educational Advances in Artiﬁcial Intelligence (EAAI-18), New Orleans, Louisiana, USA, February 2-7, 2018, pages 3942–3951. AAAI Press.
+Jonathan Pilault, Amine Elhattami, and Christopher J. Pal. 2020. Conditionally adaptive multitask learning: Improving transfer learning in NLP using fewer parameters & less data. CoRR, abs/2009.09139.
+Marc’Aurelio Ranzato, Sumit Chopra, Michael Auli, and Wojciech Zaremba. 2016. Sequence
+
+level training with recurrent neural networks. In 4th International Conference on Learning Representations, ICLR 2016, San Juan, Puerto Rico, May 2-4, 2016, Conference Track Proceedings.
+Stéphane Ross and J. Andrew Bagnell. 2014. Reinforcement and imitation learning via interactive no-regret learning. CoRR, abs/1406.5979.
+Stéphane Ross, Geoﬀrey J. Gordon, and Drew Bagnell. 2011. A reduction of imitation learning and structured prediction to no-regret online learning. In Proceedings of the Fourteenth International Conference on Artiﬁcial Intelligence and Statistics, AISTATS 2011, Fort Lauderdale, USA, April 11-13, 2011, volume 15 of JMLR Proceedings, pages 627–635. JMLR.org.
+Danielle Saunders, Felix Stahlberg, Adrià de Gispert, and Bill Byrne. 2019. Domain adaptive inference for neural machine translation. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 222–228, Florence, Italy. Association for Computational Linguistics.
+Abigail See, Peter J. Liu, and Christopher D. Manning. 2017. Get to the point: Summarization with pointer-generator networks. In Proceedings of the 55th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1073–1083, Vancouver, Canada. Association for Computational Linguistics.
+Shiqi Shen, Yong Cheng, Zhongjun He, Wei He, Hua Wu, Maosong Sun, and Yang Liu. 2016. Minimum risk training for neural machine translation. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1683– 1692, Berlin, Germany. Association for Computational Linguistics.
+David A. Smith and Jason Eisner. 2006. Minimum risk annealing for training log-linear models. In Proceedings of the COLING/ACL 2006 Main Conference Poster Sessions, pages 787–794, Sydney, Australia. Association for Computational Linguistics.
+Brian Thompson, Jeremy Gwinnup, Huda Khayrallah, Kevin Duh, and Philipp Koehn. 2019. Overcoming catastrophic forgetting during domain adaptation of neural machine translation. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), pages 2062–2068, Minneapolis, Minnesota. Association for Computational Linguistics.
+J. Thorne and A. Vlachos. 2020. Elastic weight consolidation for better bias inoculation.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in Neural Information Processing Systems 30: Annual Conference on Neural Information Processing Systems 2017, December 4-9, 2017, Long Beach, CA, USA, pages 5998–6008.
+Oriol Vinyals and Quoc V. Le. 2015. A neural conversational model. CoRR, abs/1506.05869.
+Elena Voita, Rico Sennrich, and Ivan Titov. 2020. Analyzing the source and target contributions to predictions in neural machine translation. CoRR, abs/2010.10907.
+Elena Voita, David Talbot, Fedor Moiseev, Rico Sennrich, and Ivan Titov. 2019. Analyzing multi-head self-attention: Specialized heads do the heavy lifting, the rest can be pruned. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 5797–5808, Florence, Italy. Association for Computational Linguistics.
+Chaojun Wang and Rico Sennrich. 2020. On exposure bias, hallucination and domain shift in neural machine translation. In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, pages 3544–3552, Online. Association for Computational Linguistics.
+Bingzhen Wei, Mingxuan Wang, Hao Zhou, Junyang Lin, and Xu Sun. 2019. Imitation learning for non-autoregressive neural machine translation. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 1304–1312, Florence, Italy. Association for Computational Linguistics.
+Sean Welleck, Kianté Brantley, Hal Daumé III, and Kyunghyun Cho. 2019. Non-monotonic sequential text generation. In Proceedings of the 36th International Conference on Machine Learning, ICML 2019, 9-15 June 2019, Long Beach, California, USA, volume 97 of Proceedings of Machine Learning Research, pages 6716– 6726. PMLR.
+Sean Welleck, Ilia Kulikov, Stephen Roller, Emily Dinan, Kyunghyun Cho, and Jason Weston. 2020. Neural text generation with unlikelihood training. In 8th International Conference on Learning Representations, ICLR 2020, Addis Ababa, Ethiopia, April 26-30, 2020. OpenReview.net.
+Ronald J. Williams and David Zipser. 1989. A learning algorithm for continually running fully recurrent neural networks. Neural Comput., 1(2):270–280.
+Sam Wiseman and Alexander M. Rush. 2016. Sequence-to-sequence learning as beam-search
+
+optimization. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, pages 1296–1306, Austin, Texas. Association for Computational Linguistics.
+Lijun Wu, Xu Tan, Di He, Fei Tian, Tao Qin, Jianhuang Lai, and Tie-Yan Liu. 2018. Beyond error propagation in neural machine translation: Characteristics of language also matter. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing, pages 3602–3611, Brussels, Belgium. Association for Computational Linguistics.
+Weijia Xu and Marine Carpuat. 2020. EDITOR: an edit-based transformer with repositioning for neural machine translation with soft lexical constraints. CoRR, abs/2011.06868.
+Weijia Xu, Xing Niu, and Marine Carpuat. 2019. Diﬀerentiable sampling with ﬂexible reference word order for neural machine translation. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), pages 2047–2053, Minneapolis, Minnesota. Association for Computational Linguistics.
+Ying Xu, Xu Zhong, Antonio José Jimeno-Yepes, and Jey Han Lau. 2020. Forget me not: Reducing catastrophic forgetting for domain adaptation in reading comprehension. In 2020 International Joint Conference on Neural Networks, IJCNN 2020, Glasgow, United Kingdom, July 19-24, 2020, pages 1–8. IEEE.
+Dani Yogatama, Cyprien de Masson d’Autume, Jerome Connor, Tomás Kociský, Mike Chrzanowski, Lingpeng Kong, Angeliki Lazaridou, Wang Ling, Lei Yu, Chris Dyer, and Phil Blunsom. 2019. Learning and evaluating general linguistic intelligence. CoRR, abs/1901.11373.
+Wen Zhang, Yang Feng, Fandong Meng, Di You, and Qun Liu. 2019. Bridging the gap between training and inference for neural machine translation. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 4334–4343, Florence, Italy. Association for Computational Linguistics.
+
+

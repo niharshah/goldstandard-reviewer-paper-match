@@ -1,0 +1,301 @@
+Differentiable Representations For Multihop Inference Rules
+
+arXiv:1905.10417v1 [cs.LG] 24 May 2019
+
+William W. Cohen Google Research
+wcohen@google.com
+
+Haitian Sun Google Research haitiansun@google.com
+Matthew Siegler Google Research msiegler@google.com
+
+R. Alex Hofer Google
+rofer@google.com
+
+Abstract
+We present efﬁcient differentiable implementations of second-order multi-hop reasoning using a large symbolic knowledge base (KB). We introduce a new operation which can be used to compositionally construct second-order multi-hop templates in a neural model, and evaluate a number of alternative implementations, with different time and memory trade offs. These techniques scale to KBs with millions of entities and tens of millions of triples, and lead to simple models with competitive performance on several learning tasks requiring multi-hop reasoning.
+1 Introduction
+Templates for multi-hop reasoning. For certain applications it is useful for a neural model to be able to encode multi-step accesses to a symbolic KB. For example, for the task of learning to answer naturallanguage questions with a KB, a question like q = “who has directed a movie written by Christopher Nolan?” might be answered with the set {x : ∃x, z so that referent(“Christopher Nolan”, x) ∧ writer_of(x, z) ∧ director_of(x , z)}. Computing this set requires multi-hop reasoning, i.e., multiple steps of KB access: in this case, ﬁnding the referent of the name “Christopher Nolan”, then ﬁnding the movies written by that person, and then ﬁnding the directors of those movies. Constructing a logical interpretation like this from text is called semantic parsing.
+Since the chains of reasoning in parses are usually short, semantic parsing often can be reduced to ﬁnding an appropriate template and instantiating it. For instance, queries like q above could be modeled with the template
+{x : ∃x, z, x , s, R1, R2 so that subspan(q, s) ∧ referent(s, x) ∧ R1(x, z) ∧ R2(z, x )}
+where s is a variable ranging over subspans of q; x, x , and z range over entities, and R1 and R2 range over relations. Logical expressions with variables ranging over relations are usually called second-order expressions or templates.
+Differentiable multi-hop templates. Learning a template-based semantic parser requires learning to select and instantiate the template, and instantiation requires learning a function for each variable in the template—e.g., a system might let s = fs(q), R1 = fR1 (q), and R2 = fR2 (q), where fs, fR1 and fR2 might be, for instance, a softmax functions applied to linear transformations of a biLSTM-based encoding of q. Training these extractors requires data in which each q is labeled with the value of each template variable—e.g., here labels for q would specify that fR1 (q) should be the relation writer_of, etc. It would be preferable to be able to train extractors end-to-end, using as training examples pairs (q, A), where q is a document and A is the result of evaluating the desired template—e.g., here A
+Preprint. Under review.
+
+would be all KB entities representing people that directed Nolan’s movies. However, while there is a literature on training semantic parsers end-to-end (e.g., [4, 26]) learning in this setting with modern gradient approaches requires evaluating the second-order template with only differentiable operations. Further, these evaluations must be done very efﬁciently over large KBs, since they are performed at training time; hence, to our knowledge, this approach has been used only when question-related knowledge is limited [30, 12, 19].
+This paper describes a framework for efﬁciently evaluating multi-hop templates differentiably, enabling, for the ﬁrst time, deep learning in end-to-end settings that require reasoning over large symbolic KBs. This is based on a primitive operation called relation-set following, which ﬁnds all KBs entities related to any member of an input set X via any relation in a set R. By nesting this operation, multi-step reasoning templates can be formed. We present results for semantic parsing using second-order templates and KB completion, which can also be formulated as a multi-hop second-order reasoning task.
+2 Differentiable Templates for Multi-Hop Reasoning
+Preliminaries: KBs, entities, and relations. A KB consists of entities and relations. We use x to denote an entity and r to denote a relation. A relation is a set of entity pairs, and represents a relationship between entities: for instance, if x represents “Christopher Nolan” and x represents “Inception” then (x, x ) would be an member of the relation writer_of. If (x, x ) ∈ r we say that r(x, x ) is an assertion (in the KB).
+We assume each entity x has a type, written type(x), and let Nτ denote the number of entities of type τ . Each entity x in type τ also has a unique index indexτ (x), which is an integer between 1 and Nτ . We write xτ,i for the entity that has index i in type τ , or xi if the type is clear from context.
+Every relation r has a subject type τsubj and an object type τobj , which constrain the types of x and x for any pair (x, x ) ∈ r. Hence r can be encoded as a subset of {1, . . . , Nτsubj } × {1, . . . , Nτobj }. Relations with the same subject and object types are called type-compatible. Finally a KB consists of a set of types, a set of typed relations, and a set of typed entities.
+Weighted sets and their encodings. Our differentiable operations are based on weighted sets, where each element x of weighted set X is associated with a non-negative real number, written ω|[x ∈ X]|. It is convenient to deﬁne ω|[x ∈ X]| ≡ 0 for all x ∈ X. Conceptually, a weight less than 1 for element x is a conﬁdence that the set contains x, and weights more than 1 make X a multiset. If all elements of X have weights 1, we say x is a hard set. Weighted sets X are also typed, and if type(X) = τ then X is constrained to contain only entities of type τ ; hence X can be encoded as a subset of {1, . . . , Ntype(X)}.
+Weighted sets will be used as potential assignments to the variables in second-order templates. To support second-order reasoning, every relation r in a KB is also associated with an entity xr, and hence, an index and a type, and sets of relations R are allowed if all members are type-compatible.1 For example R = {writer_of, director_of} might be a set of type-compatible relations. For notational convenience, we also treat the relations in a KB as weighted sets of entity pairs, although in the experiments of this paper, all KB relations are hard sets.
+A weighted set X of type τ can be encoded as an entity-set vector vX ∈ RNτ , where the i-th component of vX is the weight of the i-th entity of that type in the set X: e.g., vX [indexτ (x)] = ω|[x ∈ X]|. Notice that if X is a hard entity set, then this will be a k-hot vector for k = |X|. The set of indices of v with non-zero values is written support(v), and we also use type(v) to denote the type τ of the set encoded by v. A relation r with subject type τ1 and object type τ2 can be encoded as a relation matrix Mr ∈ RNτ1 ×Nτ2 , where the value for Mr[i, j] is the weight of the assertion r(xi, xj) in the KB, i.e., Mr[indexτ1 (x), indexτ2 (x )] = ω|[(x, x ) ∈ r]|.
+Sparse relation matrices. For all but the smallest KBs, a relation matrix must be implemented using a sparse matrix data structure, as explicitly storing the Nτ1 × Nτ2 values will be very wasteful. For instance, if a KB contains 10,000 movie entities and 100,000 person entities, then a relationship like writer_of would require storing 1 billion values, while, since most movies have only a few writers, only a few tens of thousands of writer_of facts will be in the KB. One possible sparse matrix data
+1To avoid complexity in notation we do not distinguish between sets of relations and sets of entities that are associated relations.
+2
+
+Strategy
+naive late mixing reiﬁed KB
+
+Batch?
+no yes yes
+
+Space complexity
+O(NT + NE + NR) O(NT + bNE + bNR)
+O(bNT + bNE)
+
+# Operations
+
+sp-dense dense
+
+matmul + or
+
+1
+
+0
+
+NR
+
+NR
+
+3
+
+1
+
+sparse + NR 0 0
+
+Table 1: Summary of implementations of relation-set following, where NT is the number of KB triples, NE the number of entities, NR the number of relations.
+
+structure for a relation matrix is a sparse coordinate pair (COO) structure, which consists of a Nr × 2 matrix Indr containing pairs of entity indices, and a parallel vector wr ∈ RNr containing the weights of each entity pair in Mr. In this encoding, if (i, j) is row k of Ind, then Mr[i, j] = wr[k], and if (i, j) does not appear in Indr, then M[i, j] is zero. Hence with a COO encoding, the size needed to encode the relations in the KB is linear in the number of facts.
+Our experiments are performed with Tensorﬂow [1], which offers limited support for sparse matrices. In particular, Tensorﬂow supports sparse COO matrices, but not higher-rank tensors, and supports matrix multiplication between a sparse matrix and a dense matrix, but not between two sparse matrices.
+
+2.1 Reasoning in a KB
+
+Single-hop reasoning and R-neighbors. Relations can also be viewed as sets of labeled edges in a knowledge graph, the vertices of which are entities. Following this view, we deﬁne the rneighbors of an entity x to be the set of entities x that are connected to x by an edge labeled r, i.e., r-neighbors(x) ≡ {x : (x, x ) ∈ r}. Extending this to sets, we deﬁne
+
+R-neighbors(X) ≡ {x : ∃r ∈ R, x ∈ X so that (x, x ) ∈ r}
+
+Computing the R-neighbors of an entity is a single-step reasoning operation: e.g., the answer to the question q =“what movies were written by Christopher Nolan” is precisely the set R-neighbors(X) for R = {writer_of} and X = {Christopher_Nolan}. Multi-hop reasoning operations require nested R-neighborhoods, e.g. if R = {director_of} then R -neighbors(R-neighbors(X)) is all directors of movies written by Christopher Nolan.
+
+Encoding single-hop reasoning. We would like to “soften” the R-neighbors, and also translate it into
+
+differentiable operations that can be performed on encodings of X and R. Let vX encode a weighted
+
+set of entities X, and let vR encode a weighted set of relations of type τ . We ﬁrst deﬁne MR to be a
+
+weighted mixture of the relation matrices for all relations of type τ , i.e., MR ≡ (
+
+Nτ k=1
+
+vR[k]
+
+·
+
+Mrk
+
+).
+
+We then deﬁne the relation-set following operation for vX and vR as:
+
+Nτ
+
+follow(vX , vR) ≡ vX MR = vX ( vR[k] · Mk)
+
+(1)
+
+k=1
+
+The numerical relation-set following operation of Eq 1 corresponds closely to the logical Rneighborhood operation, as shown by the claim below.
+
+Claim 1 The support of follow(vX , vR) is exactly the set of R-neighbors(X).
+
+To better understand this claim, let z = follow(vX , vR). The claim states z can approximate the R neighborhood of any hard sets R, X by setting to zero the appropriate components of vX and vR. It is also clear that z[j] decreases when one decreases the weights in vr of the relations that link xj to entities in X, and likewise, z[j] decreases if one decreases the weights of the entities in X that are linked to xj via relations in R, so there is a smooth, differentiable path to reach this approximation.
+The utility of approximating the single-step inference step of computing r neighborhoods with the relation-set following is further supported by the experimental results below. We will also see below how to produce more complex templates by combining multiple relation-set following operations.
+
+Implementations of relation-set following. Ignoring types for the moment, suppose the KB contains NR relations, NE entities, and NT triples. Typically NR < NE < NT NE2 . As noted above, we must implement each Mr as a sparse matrix, so collectively these matrices require space
+O(NT ). Each triple appears in only one relation, so MR is also size O(NT ). Since sparse-sparse
+
+3
+
+matrix multiplication is not supported in Tensorﬂow we must implement xMR using dense-sparse multiplication2, so x must be a dense vector of size O(NE), as is the output of relation-set following. So the space complexity of follow(x, r) is O(NT + NE + NR), if implemented as suggested by Eq 1; see Table 1. The major problem with this implementation is that, in the absence of general sparse tensor contractions, it is difﬁcult to adapt to mini-batches, which usually make inference on GPUs is much faster. We thus call this implementation naive mixing and, in this paper, only use it without minibatches.
+
+We consider next a setting in which x and r are replaced with matrices X and R with the minibatch size b. An alternative strategy is based on the observation that relation-set following for a single relation can be implemented as xMr, which can be trivially extended to a minibatch as XMr. The late mixing strategy mixes the output of many single-relation relation-set following steps, rather than mixing the KB:
+
+Nτ
+
+follow(X, R) = (R[:, k] · XMk)
+
+(2)
+
+k=1
+
+where the k-th column of R is “broadcast” to each element of the matrix XMk. While there are NR matrices XMk, each of size O(bNE), they need not all be stored at once to be mixed, so the space complexity becomes O(bNE + bNR + NT ). However, we now need to sum up NR dense matrices.
+
+An alternative to late mixing is to represent the KB with number of matrices. Each KB assertion
+r(e1, e2) can be represented as a tuple (i, j, k, w) where i, j, k are the indices of e1, e2, and r, and w is the conﬁdence associated the triple. There are NT such triples, so for = 1, . . . , NT let (i , j , k , w ) denote the -th triple. Let δ|[a = b]| denote 1 if a = b and 0 otherwise. We now deﬁne these sparse matrices, which collectively deﬁne the reiﬁed KB:3
+
+Msubj [ , m] ≡ δ|[m = i ]| ; Mobj [ , m] ≡ δ|[m = j ]| ; Mrel [ , m] ≡ w · δ|[m = k ]|
+
+Conceptually, Msubj maps the index of the -th triple to its subject entity; Mobj maps to the object entity; and Mrel maps to the relation of the -th triple, and incidentally encodes the triple conﬁdence w . We can now implement the relation-set following as below, where is Hadamard product:
+
+follow(X, R) = (XMTsubj RMTrel )Mobj
+
+(3)
+
+For a single x, r notice that xMTsubj are triples with entity in x as their subject, rMTrel are the triples with a relation in r, and the Hadamard product is the intersection of these. The ﬁnal multiplication by Mobj ﬁnds the object entities of the triples in the intersection. These operations naturally extend to minibatches, as given in Eq 3. The reiﬁed KB has size O(NT ), the sets of triples that are intersected have size O(bNT ), and the ﬁnal result is size O(bNE), giving a ﬁnal size of O(bNT + bNE), with no dependence on NR.
+These alternative implementations are summarized in Table 1. Note that no strategy dominates, but the analysis suggests that the reiﬁed KB is preferable if there are many relations, while the late mixing strategy may be preferable if NR is small or if the KB is large.
+Distributed computation for large KBs. Since GPU memory is limited, we also considered distributed computation of the relation-set following. In general matrix multiplication XM can be decomposed: X can be split into a “horizontal stacking” of m submatrices, which we write as [X1; . . . ; Xm], and M can be similarly partitioned into m2 submatrices, and then we note that
+
+ M1,1 XM = [X1; X2; . . . ; Xm]  ...
+
+M1,2 ...
+
+. . . M1,m 
+
+m
+
+m
+
+...  = ( X1Mi,1); . . . ; ( XmMi,m)
+
+Mm,1 Mm,2 . . . Mm,m
+
+i=1
+
+i=1
+
+This can be computed without storing either X or M on a single machine. In our implementation of reiﬁed KBs, we distribute the matrices that deﬁne a reiﬁed KB “horizontally”, so that different triple ids are stored on different GPUs.
+
+2In fact Tensorﬂow requires the left multiplicand to be sparse, so really we must use dense-sparse matrix multiplication and compute (MTk xT )T .
+3Reiﬁcation in logic is related to reﬂection in programming languages.
+
+4
+
+Figure 1: Left and middle: inference time in queries/sec on a synthetic KB. Right: accuracy on long inference chains for a synthetic QA task, also deﬁned on grids.
+3 Experiments
+3.1 Scalability
+Following prior work [6, 10], we used a synthetic KB based on an n-by-n grid to study scalability of inference on large KBs. Every grid cell is an entity, related to its immediate neighbors, via relations north, south, east, and west. The KB for n-by-n thus has n2 entities and around 4n triples (since edge cells have fewer than four neighbors). We measured the time to compute follow(follow(X, R), R) for minibatches of b = 128 one-hot vectors, and report it as queries per second (qps) on a single GPU (e.g., qps=1280 would mean a single minibatch requires 100ms). The matrix R weights all relations uniformly, and we vary the number of relations by inventing m new relation names and assigning one of the existing grid triples to each new relation.
+The results are shown Figure 1 (left and middle), on a log-log scale because some differences are very large. With only four relations (the leftmost plot), late mixing is consistently about 3x faster than the reiﬁed KB method, and about 250x than the naive approach. For more than around 20 relations, the reiﬁed KB is faster: it is about 43x faster than late mixing with 1000 relations, and more than 12,000x faster than the naive approach.
+Although we do not show the results, the method we call “naive” here is much more memory-efﬁcient than using dense relation-matrices. We do not show results for smaller minibatch sizes, but they are about 40x slower with b = 1 than with b = 128 for both reiﬁed and late mixing.
+3.2 Quality and simplicity of models
+Below we present results on several datasets using models that make diverse use of relation-set following. All experiments in this section are performed with the reiﬁed KB implementation. Since the main contribution of this paper is to introduce a generally useful, scalable, differentiable, secondorder reasoning operation, we introduce models that use relation-set following but are otherwise quite simple, rather than complex architectures carefully crafted for a particular task.
+3.2.1 Question Answering Experiments
+End-to-end QA with a large KB. WebQuestionsSP [27] contains 4737 questions posed in natural languages, all of which are answerable using Freebase [5]. Each question q is labeled with the entities x that appear in it. In our experiments we used a subset of Freebase with 43 million facts and 12 million entities—the KB includes all facts in Freebase within 2-hops of entities mentioned in any question, excluding paths through some very common entities.
+Freebase contains two types of nodes, one for real-world entities, and one for compound value types (CVTs), which often represent non-binary relationships or events (e.g., a movie release event, which includes a movie id, a date, and a place.) In this dataset, all questions can be answered with 1- or 2-hop chains, and all 2-hop reasoning chains pass through a CVT entity. Hence there are only two possible templates, which use three kinds of relations: relations between two ordinary entities, which are used for 1-hop questions; relations between an ordinary entity and a CVT entity, which are used
+5
+
+KV-Mem* VRN*
+GRAFT-Net* RSF (ours)
+
+WebQSP 1-2 hops
+46.7 — 67.8 52.7
+
+1-hop 95.8 97.5 97.0 96.2
+
+MetaQA 2-hop 25.1 89.9 94.8 81.1
+
+3-hop 10.1 62.5 77.7 72.3
+
+DistMult* ConvE*
+MINERVA RSF (Ours)
+
+NELL-995 H@1 H@10 61.0 79.5 67.2 86.4 66.3 83.1 64.1 82.4
+
+Table 2: Left: Hits@1 for the WebQuestionsSP and MetaQA datasets. Results for KV-Mem and VRN on MetaQA are from [29]; results for GRAFT-Net and KV-Mem on WebQSP are from [19]. Systems marked with a star ∗ construct question-speciﬁc autographs, based on the KB, at inference time. Right: Hits@1 and hits@10 for two KB completion tasks. Starred KB completion methods are transductive, and do not generalize to entities not seen in training.
+
+for the ﬁrst step of a 2-hop chain; and relations between a CVT and an ordinary entity, which are used for the second step of a 2-hop chain. Our model begins by deriving from q three relation sets, one of each kind listed above, and then uniformly mixes together the two templates and applies a softmax:
+rE→E = fE→E(q); rE→CVT = fE→CVT(q); rCVT→E = fCVT→E(q) ˆa = softmax(follow(follow(x, rE→CVT), rCVT→E) + follow(x, rE→E))
+Note the 2-hop template contains nested relation-set following operations.
+In our model, fE→E, fE→CVT, and fCVT→E are each linear projections of a common encoding for q, which is a mean-pooling of the tokens in q encoded with a pre-trained 128-dimensional word2vec model [16]. We use unregularized cross entropy loss. For this large KB, we split the KB across three 12-Gb GPUs, and used a fourth GPU for the rest of the model. Performance (using Hits@1) is shown in Table 2, in the ﬁrst column, as the model RSF (for relation-set following).
+End-to-end QA for longer reasoning chains. MetaQA [29] consists of 1.2M questions, of which 1/3 are 1-hop, 1/3 are 2-hop, and 1/3 are 3-hop. The questions also are labeled with entities and can be answered using the KB provided by the WikiMovies [17] dataset, which contains 43k entities and 186k facts. Following past work, we train and test our model with 1-hop, 2-hop or 3-hop questions separately. For each step of inference we construct a relation sets r. Let x0 be the set of entities associated with q. The full model computes is
+for t = 1, 2, 3: rt = f t(q); xt = follow(xt−1, rt)
+The f t’s are again learned linear projections of a pooled bag-of-words embedding, and again we compute the softmax of the appropriate set xk (where k is the number of hops associated with task) and use cross entropy loss. Results are again shown in Table 2.
+End-to-end QA for very long varying-length reasoning chains. To explore performance on even longer reasoning chains, we generated simple artiﬁcial sentences describing long chains of relationships on a 10-by-10 grid (e.g., “from center left go down then right”). We trained on 360,000 randomly generated sentences containing between 1 and 10 hops, and tested on an addition 1200 sentences.
+For vary-length chains, the meaning of each relation set rt can be context-dependent, so than many ﬁxed templates, we use an encoder-decoder model. The question is encoded with the ﬁnal hidden state of an LSTM, written here h0. We then generate a reasoning chain of length up to T using a decoder LSTM. At iteration 0, a distribution over possible starting points (e.g., “center left”) is produced, denoted x0. At iteration t > 0, the decoder emits a scalar probability of stopping, pt, and a distribution over relations to follow rt, and updates the model, as we did for the MetaQA dataset, to let xt = follow(xt−1, rt). It also updates the decoder hidden state to ht, as below:
+h0 = LSTM(q); x0 = f0(h0); r0 = 0; p0 = 1 for t = 1, . . . , T : pt = fp(ht−1); rt = fr(ht−1); ht = fh(ht−1, rt−1) (4)
+The ﬁnal predicted location is a mixture of all the xt’s weighted by the probability of stopping pt at iteration t, i.e., ˆa = softmax( Tt=1 xt · pt t <t(1 − pt )). We trained on 360,000 randomly generated sentences requiring 1 and 10 hops, and tested on an additional 12,000 sentences, with fr again linear, fp a logistic function, and fh an LSTM cell. Results are shown in the right-hand side of Figure 1.
+Discussion of QA results. In Table 2 we compare our results on the non-synthetic tasks with KeyValue Memory Network (KV-Mem) baselines [17]. For the smaller MetaQA dataset, KV-Mem is
+
+6
+
+# Facts # Entities # Relations
+Time (seconds)
+
+NELL-995 154,213 75,492 200
+44.3
+
+MetaQA 196,453 43,230
+9
+72.6
+
+WebQuestionsSP 43,724,175 12,942,798 616
+1820
+
+Table 3: Time to run 10K examples for knowledge bases of different size.
+
+initialized with all facts within 3 hops of the query entities, and for WebQuestionsSP it is initialized by a random-walk process seeded by the query entities (see [19, 29] for details). RSF consistently outperforms the baseline, dramatically so for longer reasoning chains. The synthetic task shows that there is very little degradation as chain length increases, with Hits@1 for 10 hops still 89.7%.
+We also compare to two much more complex architectures that perform end-to-end question answering in the same setting used here: VRN [29] and GRAFT-Net [19]. Both systems build questiondependent subgraphs of the KB, and then use graph CNN-like methods [13] to “reason” with these graphs. This process is much more complex to perform at test time, so arguably the systems are not strictly comparable—however, it is interesting to see that the RSF model is competitive with these approaches on the most difﬁcult 3-hop setting.
+
+3.2.2 Knowledge Base Completion Experiments
+Knowledge base completion. In KB completion, one attempts to recover KB triples that have been removed from a KB by performing inference over the remaining triples. We looked at two KB completion datasets. The NELL-995 dataset [24] has 12 different “query relations” (i.e., triples for 12 relations have been removed) paired with a KB with 154k facts, 75k entities, and 200 relations.
+In the KB completion task, a query is a relation name q and a start entity x, and we assume the answers are computed with the disjunction of multiple inference chains of varying length. Each inference chain has a maximum length of T and we build N distinct inference chains in total.
+for i = 1, . . . , N and t = 1, . . . , T : rti = fit(q); xti+1 = follow(xti, rti) + xti
+The ﬁnal output is a softmax of the mix of all the xTi ’s: i.e., we let ˆa = softmax( i∈{1...N} xTi ). The purpose of the update xti+1 = follow(xti, rti) + xti is to give the model access to outputs from chains of length less than T . The encoding of q is based on a lookup table, and each relation vector fit is a learned linear transformation of q’s embedding. We tune the hyperparameters T ∈ {1, . . . , 6} and N ∈ {1, 2, 3}.
+Discussion of KB completion results. KB completion is often performed with KB embedding methods. We record several results for two KB embedding baselines and also MINERVA, a state-ofthe-art RL-based method. Baseline results for KB completion are from [9]. Again the baselines are to some degree incomparable—RL methods are generally more difﬁcult to train, and KB embedding methods do not generalize to entities seen outside of training. Quantitatively the results are similar to on the QA tasks—the RSF model outperforms the simpler baseline methods, and is competitive with the best existing approaches.
+
+3.2.3 Discussion of execution time on QA and KB completion
+We compare the training time of our model with minibatch size of 10 on three different tasks: NELL995, MetaQA, and WebQuestionsSP. The results are shown in Table 3 and are consistent with the results of Figure 1: training is longer with larger KBs, but even with over 40 million facts and nearly 13 million entities from Freebase, it takes less than 10 minutes to run one epoch over WebQuestionsSP (with 3097 training examples).
+
+4 Related Work
+The relation-set following operation used here is implemented in an open-source package called NQL, for neural query language. NQL implements a broader range of operations for manipulating KBs, which are described in a short companion paper [3]. This paper focuses on implementation and evaluation of the relation-set following operation, issues not covered in the companion paper.
+
+7
+
+Although NQL is a dataﬂow language, not a logic, it is semantically related to TensorLog [6], a probabilistic logic which also can be compiled to Tensorﬂow. TensorLog is in turn closely related to “proof-counting” logics such as stochastic logic programs [7]. TensorLog and its relatives do not support second-order reasoning, although other non-neural logics in the same line of work are expressive enough to support templates via reiﬁcation [10, 21].
+In other work, the differentiable theorem prover (DTP) is a differentiable logic which also includes as a template-instantiation approach similar the one described here. DPT appears to be much less scalable: it has not been applied to KBs larger than a few thousand triples. The Neural ILP system [25] uses approaches related to late mixing together with an LSTM controller to perform KB completion and some simple QA tasks, but it is a monolithic architecture focused on rule-learning, while in contrast we propose a re-usable neural component, which can be used in as a component in many different architectures, and a scalable implementation of this. It is also reported that neural ILP does not scale to the size of the NELL995 task reported here [9].
+Neural architectures like memory networks [23], or other architectures that use attention over some data structure approximating assertions [2, 12] can be used to build soft versions of relation-set following: however, they also do not scale well to large KBs, so they are typically only used in cases where a small amount of information is relevant to a question (e.g., [22, 30]).
+Graph CNNs [13] also can be used for reasoning, and often do use sparse matrix multiplication, but again existing implementations have not been scaled to tens of millions of triples/edges or millions of entities/graph nodes. Additionally while graph CNNs have been used for reasoning tasks, the formal connection between them and logical reasoning remains unclear.
+An alternative to the end-to-end learning approach that is our focus here is reinforcement learning (RL) methods, which have been used to learn mappings from natural-language questions to nondifferentiable logical representations [14, 15], one of the applications we consider here. RL methods have also been applied to KB completion tasks [9, 24], another task we explore. However, the gradientbased approaches enabled by our methods are generally preferred, as being easier to implement and tune on new problems.
+5 Conclusions
+In this paper we described scalable differentiable implementations of the second-order reasoning required to evaluate multi-hop rule templates. In particular we introduce a single new operation called relation-set following, which can be used to compositionally construct multi-hop templates in a neural model. The operation is differentiable, so loss on a proposed template instantiation can be backpropagated to the functions that instantiate variables in a template.
+We evaluated a number of alternative implementations of this operation, which lead to different trade-offs with respect to time and memory, and show that an appropriate implementation of relationset following can scale to KBs with tens of millions of facts, millions of entities, and thousands of relations on a single modern GPU. We also demonstrate experimentally that models based on relation-set following perform well on a number of tasks that require multi-hop reasoning.
+The models that are learned have two other advantages, which are not explored in this paper. They have interpretable latent variables, corresponding to the template variables, and on several benchmark tasks the results exceed the current state-of-the-art. For the case of question-answering, the models we propose are compatible with recently-developed approaches for producing contextual representations of language by large-scale pre-training [11, 18].
+The approaches described here suggest a number of further research topics—notably, the question of whether further improvements for QA, KB completion, and other multi-hop reasoning tasks can be obtained by improvements to the very simple architectures that we have used here in combination of relation-set following. This paper has also focused on k-hot encodings of sets, which are suboptimal for small-cardinality sets, suggesting the use of sketching methods for sets, which have been useful in other neural contexts [8]. The approach outlined here has also been experimentally applied only to embedding symbolic KBs in a neural model, not to embedding “soft” KBs, so extending these methods to cover soft KBs would also be of interest. However, we note that extensions of the set-based relation-set following approach to soft KBs may require additional mechanisms to represent sets of embedded entities [28, 20].
+8
+
+References
+[1] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis, Jeffrey Dean, Matthieu Devin, Sanjay Ghemawat, Geoffrey Irving, Michael Isard, et al. Tensorﬂow: A system for large-scale machine learning. In 12th {USENIX} Symposium on Operating Systems Design and Implementation ({OSDI} 16), pages 265–283, 2016.
+[2] Jacob Andreas, Marcus Rohrbach, Trevor Darrell, and Dan Klein. Neural module networks. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition, pages 39–48, 2016.
+[3] Anonymous Authors. Neural query language: A knowledge base query language for tensorﬂow. Details withheld to preserve anonymity of this submission, 2019.
+[4] Jonathan Berant, Andrew Chou, Roy Frostig, and Percy Liang. Semantic parsing on freebase from question-answer pairs. In Proceedings of the 2013 Conference on Empirical Methods in Natural Language Processing, pages 1533–1544, 2013.
+[5] Kurt Bollacker, Colin Evans, Praveen Paritosh, Tim Sturge, and Jamie Taylor. Freebase: a collaboratively created graph database for structuring human knowledge. In Proceedings of the 2008 ACM SIGMOD international conference on Management of data, pages 1247–1250. AcM, 2008.
+[6] William W Cohen, Fan Yang, and Kathryn Rivard Mazaitis. Tensorlog: Deep learning meets probabilistic dbs. arXiv preprint arXiv:1707.05390, 2017.
+[7] James Cussens. Parameter estimation in stochastic logic programs. Machine Learning, 44(3):245–271, 2001.
+[8] Amit Daniely, Nevena Lazic, Yoram Singer, and Kunal Talwar. Sketching and neural networks. arXiv preprint arXiv:1604.05753, 2016.
+[9] Rajarshi Das, Shehzaad Dhuliawala, Manzil Zaheer, Luke Vilnis, Ishan Durugkar, Akshay Krishnamurthy, Alex Smola, and Andrew McCallum. Go for a walk and arrive at the answer: Reasoning over paths in knowledge bases using reinforcement learning. arXiv preprint arXiv:1711.05851, 2017.
+[10] Luc De Raedt, Angelika Kimmig, and Hannu Toivonen. Problog: A probabilistic prolog and its application in link discovery. In IJCAI, volume 7, pages 2462–2467. Hyderabad, 2007.
+[11] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep bidirectional transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+[12] Nitish Gupta and Mike Lewis. Neural compositional denotational semantics for question answering. CoRR, abs/1808.09942, 2018.
+[13] Thomas N Kipf and Max Welling. Semi-supervised classiﬁcation with graph convolutional networks. arXiv preprint arXiv:1609.02907, 2016.
+[14] Chen Liang, Jonathan Berant, Quoc Le, Kenneth D Forbus, and Ni Lao. Neural symbolic machines: Learning semantic parsers on freebase with weak supervision. arXiv preprint arXiv:1611.00020, 2016.
+[15] Chen Liang, Mohammad Norouzi, Jonathan Berant, Quoc V Le, and Ni Lao. Memory augmented policy optimization for program synthesis and semantic parsing. In Advances in Neural Information Processing Systems, pages 9994–10006, 2018.
+[16] Tomas Mikolov, Ilya Sutskever, Kai Chen, Greg S Corrado, and Jeff Dean. Distributed representations of words and phrases and their compositionality. In Advances in neural information processing systems, pages 3111–3119, 2013.
+[17] Alexander H. Miller, Adam Fisch, Jesse Dodge, Amir-Hossein Karimi, Antoine Bordes, and Jason Weston. Key-value memory networks for directly reading documents. CoRR, abs/1606.03126, 2016.
+[18] Matthew E Peters, Waleed Ammar, Chandra Bhagavatula, and Russell Power. Semi-supervised sequence tagging with bidirectional language models. arXiv preprint arXiv:1705.00108, 2017.
+[19] Haitian Sun, Bhuwan Dhingra, Manzil Zaheer, Kathryn Mazaitis, Ruslan Salakhutdinov, and William W Cohen. Open domain question answering using early fusion of knowledge bases and text. EMNLP, 2018.
+9
+
+[20] Oriol Vinyals, Samy Bengio, and Manjunath Kudlur. Order matters: Sequence to sequence for sets. arXiv preprint arXiv:1511.06391, 2015.
+[21] William Yang Wang, Kathryn Mazaitis, and William W Cohen. Programming with personalized pagerank: a locally groundable ﬁrst-order probabilistic logic. In Proceedings of the 22nd ACM international conference on Information & Knowledge Management, pages 2129–2138. ACM, 2013.
+[22] Jason Weston, Antoine Bordes, Sumit Chopra, Alexander M Rush, Bart van Merriënboer, Armand Joulin, and Tomas Mikolov. Towards ai-complete question answering: A set of prerequisite toy tasks. arXiv preprint arXiv:1502.05698, 2015.
+[23] Jason Weston, Sumit Chopra, and Antoine Bordes. Memory networks. arXiv preprint arXiv:1410.3916, 2014.
+[24] Wenhan Xiong, Thien Hoang, and William Yang Wang. Deeppath: A reinforcement learning method for knowledge graph reasoning. arXiv preprint arXiv:1707.06690, 2017.
+[25] Fan Yang, Zhilin Yang, and William W Cohen. Differentiable learning of logical rules for knowledge base reasoning. In Advances in Neural Information Processing Systems, pages 2319–2328, 2017.
+[26] Wen-tau Yih, Ming-Wei Chang, Xiaodong He, and Jianfeng Gao. Semantic parsing via staged query graph generation: Question answering with knowledge base. In Proceedings of the 53rd Annual Meeting of the Association for Computational Linguistics and the 7th International Joint Conference on Natural Language Processing (Volume 1: Long Papers), volume 1, pages 1321–1331, 2015.
+[27] Wen-tau Yih, Matthew Richardson, Chris Meek, Ming-Wei Chang, and Jina Suh. The value of semantic parse labeling for knowledge base question answering. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers), volume 2, pages 201–206, 2016.
+[28] Manzil Zaheer, Satwik Kottur, Siamak Ravanbakhsh, Barnabas Poczos, Ruslan R Salakhutdinov, and Alexander J Smola. Deep sets. In Advances in neural information processing systems, pages 3391–3401, 2017.
+[29] Yuyu Zhang, Hanjun Dai, Zornitsa Kozareva, Alexander J Smola, and Le Song. Variational reasoning for question answering with knowledge graph. In AAAI, 2018.
+[30] Victor Zhong, Caiming Xiong, and Richard Socher. Seq2sql: Generating structured queries from natural language using reinforcement learning. arXiv preprint arXiv:1709.00103, 2017.
+10
+
+

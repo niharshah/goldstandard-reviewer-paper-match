@@ -1,0 +1,829 @@
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+
+arXiv:1804.04235v1 [cs.LG] 11 Apr 2018
+
+Noam Shazeer 1 Mitchell Stern 1 2
+
+Abstract
+In several recently proposed stochastic optimization methods (e.g. RMSProp, Adam, Adadelta), parameter updates are scaled by the inverse square roots of exponential moving averages of squared past gradients. Maintaining these perparameter second-moment estimators requires memory equal to the number of parameters. For the case of neural network weight matrices, we propose maintaining only the per-row and percolumn sums of these moving averages, and estimating the per-parameter second moments based on these sums. We demonstrate empirically that this method produces similar results to the baseline. Secondly, we show that adaptive methods can produce larger-than-desired updates when the decay rate of the second moment accumulator is too slow. We propose update clipping and a gradually increasing decay rate scheme as remedies. Combining these methods and dropping momentum, we achieve comparable results to the published Adam regime in training the Transformer model on the WMT 2014 English-German machine translation task, while using very little auxiliary storage in the optimizer. Finally, we propose scaling the parameter updates based on the scale of the parameters themselves.
+1. Introduction and Background
+Gradient-based optimization forms the backbone of most modern approaches used to train deep neural networks. One of the simplest methods is stochastic gradient descent (SGD), wherein steps are taken along the direction of the negative gradient of the loss function evaluated on a minibatch. Building on this foundation, a variety of adaptive gradient-based methods have been proposed in which the gradient is divided by the componentwise square root of a vector summarizing the history of squared gradients, usually
+1Google Brain, Mountain View, California, USA 2University of California, Berkeley, California, USA. Correspondence to: Noam Shazeer <noam@google.com>.
+
+obtained through summation as in Adagrad (Duchi et al., 2011) or exponential averaging as in RMSProp (Tieleman & Hinton, 2012), Adam (Kingma & Ba, 2015), and Adadelta (Zeiler, 2012). On convex problems, several of these methods offer theoretical advantages over SGD when gradients are sparse. While convergence guarantees have not yet been provided in the dense, non-convex setting in which most neural network training takes place, practitioners have nevertheless found these methods to empirically outperform SGD across a variety of domains.
+The superior performance of these methods does come at a cost. Recent improvements in the computational capacity needed to train neural networks with larger numbers of parameters have far outstripped improvements in the memory capacity required to store those parameters during training. This has led to memory usage becoming an important constraint on model size. Adaptive optimization algorithms exacerbate this problem by requiring additional memory for extra accumulators, such as those required for momentum and per-coordinate gradient scaling. For example, Adam (Kingma & Ba, 2015) keeps two additional values for each parameter, tripling the memory requirements.
+We propose a way to reduce memory usage while retaining the empirical beneﬁts of adaptivity by maintaining a factored representation of the squared gradient accumulator across training steps. Speciﬁcally, by tracking moving averages of the row and column sums of the squared gradients for matrix-valued variables, we are able to reconstruct a low-rank approximation of the exponentially smoothed accumulator at each training step that is optimal with respect to the generalized Kullback-Leibler divergence. For an n × m matrix, this reduces the memory requirements from O(nm) to O(n + m). We demonstrate empirically using Adam on a large-scale machine translation task known for its expensive models that our approach achieves comparable performance to that obtained using full accumulators.
+Beyond this, we also investigate another issue related to Adam of recent interest. To further reduce memory requirements, we would like to run Adam without momentum, eliminating an additional auxiliary value per model parameter. But without making any other changes, eliminating momentum can cause training instability. We identify outof-date second moment accumulators as a possible cause of
+
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+
+this instability and propose two remedies.
+Finally, while the learning rate in Adam denotes a target absolute step size, we follow the intuition that relative change in the parameters is more relevant, so we propose scaling the size of the updates relative to the scale of the parameters themselves.
+2. A Brief Review of Adam
+Algorithm 1 Adam (Kingma & Ba, 2015) 1: Inputs: initial point x0, step sizes {αt}Tt=1, ﬁrst moment decay β1, second moment decay β2, regularization constant 2: Initialize m0 = 0 and v0 = 0 3: for t = 1 to T do 4: gt = ∇ft(xt−1) 5: mt = β1mt−1 + (1 − β1)gt 6: vt = β2vt−1 + (1 − β2)gt2 7: mˆ t = mt/(1 − β1t ) 8: vˆt = vt/(1 − β2t ) √ 9: xt = xt−1 − αtmˆ t/( vˆt + ) 10: end for
+We reproduce the pseudocode for the Adam optimizer in Algorithm 1 for reference (Kingma & Ba, 2015). The setup of the problem is as follows. Suppose we are trying to minimize the expected value of a noisy objective function f (x). At each step, we receive a stochastic realization ft, e.g. the loss computed on a random minibatch of data, and we compute the gradient gt of this function with respect to our previous parameters. We then update the exponential running averages of the ﬁrst and second moments of the gradient mt and vt, compute bias-corrected versions mˆ t and vˆt to account for the zero initialization, and ﬁnally make a parameter update to obtain a new iterate xt. This repeats for T steps, at which point we return the ﬁnal iterate xT as our approximate solution.
+The step size αt is often held constant over the course of training, but recent work in large-scale optimization suggests that performance can be improved on some problems through a linear ramp-up followed by some form of decay (Goyal et al., 2017; Vaswani et al., 2017). We use the latter with an inverse square root decay scheme in our experiments, ﬁnding it to yield more stable results.
+3. Factored Second Moment Estimation
+Recent work has shown that for problems where vast quantities of data are available, e.g. language modeling and machine translation, task performance improves consistently as model size increases, even in the regime of models with several billions of parameters (Shazeer et al., 2017). As
+
+models continue to grow, the storage requirements of one or two auxiliary parameters per model parameter imposed by existing adaptive methods can be prohibitive, motivating the investigation of a low-memory alternative. In this section, we propose a novel approach in which model structure is exploited in order to reduce storage requirements without compromising empirical performance.
+Suppose a subset of the model’s parameters are arranged in a matrix, e.g. for use in a linear transformation. We denote this subset by W ⊆ x with W ∈ Rn×m. Under standard practice, we would need to maintain an exponential moving average V ∈ Rn×m of the corresponding square gradients (∇W f (x))2 for use in an adaptive update rule.
+In cases where storing the full moving average is infeasible, we might instead seek to store moving averages of some low-rank matrices R ∈ Rn×k and S ∈ Rk×m with k n, m such that V ≈ RS at each step. We note that in general, moving averages of instantaneous factors of V may differ from instantaneous factors of the moving average, so standard techniques for low-rank approximation may not necessarily be applicable. We would also like these quantities to be fast to compute so that the approximation step does not become a bottleneck in the overall training procedure.
+One common choice for low-rank approximation is to truncate the singular value decomposition at the top k singular values. This is known to give the optimal projection onto the space of rank-k matrices with respect to the Frobenius norm (Eckart & Young, 1936). While heavily tuned procedures exist for ﬁnding the top k singular values and vectors of a matrix, these quantities in general do not decompose over matrix addition, implying an incompatibility with exponential smoothing. Moreover, there is no guarantee that the entries of the approximation will be nonnegative, which is problematic given that we would like to scale the gradient by the componentwise inverse square root.
+In search of a more suitable alternative, we turn to techniques from nonnegative matrix factorization. In addition to the Frobenius norm, another popular cost function in the literature is the generalized Kullback-Leibler divergence, also known as the I-divergence (Lee & Seung, 1999). For nonnegative scalar inputs, the I-divergence is given by the equation
+p d(p, q) = p log − p + q,
+q
+with the conventions that 0/0 = 0, 0 log 0 = 0, and p/0 = ∞ for p > 0. It is easily seen that d(p, q) ≥ 0 with equality iff p = q by setting x = p/q in the standard inequality x log x ≥ x − 1. Under this cost function, we aim to minimize the total elementwise divergence subject to
+
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+
+componentwise nonnegativity constraints:
+
+nm
+
+minimize
+
+d(Vij, [RS]ij)
+
+R∈Rn×k,S∈Rk×m i=1 j=1
+
+(1)
+
+subject to Rij ≥ 0, Sij ≥ 0.
+
+Solving this problem for general rank-k factors is nontrivial, requiring for instance the use of an alternating minimization procedure (Finesso & Spreij, 2006). In the special case of rank-1 factors, however, we can derive an analytic solution.
+Lemma 1. The solution set of the optimization problem (1) when k = 1 consists of all feasible pairs (R, S) satisfying RS = V 1m1n V /1n V 1m, where 1 = (1, . . . , 1) ∈ R denotes a column vector of ones.
+
+Algorithm 2 Adam for a matrix parameter X with factored
+second moments and ﬁrst moment decay parameter β1 = 0.
+1: Inputs: initial point X0 ∈ Rn×m, step sizes {αt}Tt=1, second moment decay β2, regularization constant
+2: Initialize R0 = 0 and C0 = 0 3: for t = 1 to T do
+4: Gt = ∇ft(Xt−1) 5: Rt = β2Rt−1 + (1 − β2)(G2t )1m 6: Ct = β2Ct−1 + (1 − β2)1n (G2t ) 7: Vˆt = (RtCt/1n Rt)/(1 − β2t ) 8: Xt = Xt−1 − αtGt/( Vˆt + ) 9: end for
+
+Proof. Let R and S be any feasible solution. Noting that [RS]ij = RiSj and expanding the loss, we have
+
+nm
+
+d(Vij, [RS]ij)
+
+i=1 j=1
+
+nm
+=
+i=1 j=1
+
+Vij log Vij − Vij + [RS]ij [RS]ij
+
+nm
+
+nm
+
+=
+
+Vij log Vij −
+
+Vij log Ri
+
+i=1 j=1
+
+i=1 j=1
+
+nm
+
+nm
+
+nm
+
+−
+
+Vij log Sj −
+
+Vij +
+
+RiSj .
+
+i=1 j=1
+
+i=1 j=1
+
+i=1 j=1
+
+Setting the derivatives of this expression with respect to Ri and Sj equal to 0, we obtain the relations
+
+m Vij m
+
+− Ri + Sj = 0 =⇒ Ri =
+
+j=1
+
+j=1
+
+n Vij
+
+n
+
+− Sj + Ri = 0 =⇒ Sj =
+
+i=1
+
+i=1
+
+m j=1
+
+Vij
+
+m j=1 Sj ,
+
+n i=1
+
+Vij
+
+n
+
+.
+
+i=1 Ri
+
+Now note that for any minimizer (R, S), the solution
+
+(αR, S/α) is also a minimizer for any α > 0, since the
+
+loss only depends on the product RS. Hence we may break
+
+the symmetry by ﬁxing the sum of the components of R
+
+at
+
+n i=1
+
+Ri
+
+=
+
+n i=1
+
+m j=1
+
+Vij
+
+,
+
+in
+
+which
+
+case
+
+we
+
+obtain
+
+a
+
+canonical minimizer
+
+m
+Ri = Vij ,
+j=1
+
+Sj =
+
+n i=1
+
+Vij
+
+n i=1
+
+m j=1
+
+Vij
+
+or in vector form,
+
+R = V 1m,
+
+S = 1n V . 1n V 1m
+
+By our discussion of symmetry above, it follows that the solution set consists more broadly of all pairs (R, S) satisfying RS = V 1m1n V /1n V 1m, and the claim follows.
+
+We now note some important properties of this rank-1 projection. First, if V itself is a rank-1 matrix, then it will be exactly recovered as one would expect. Second, the projection can be expressed entirely in terms of the row sums V 1m and column sums 1n V , which in particular are linear functions of V . This convenient fact gives us the desired compatibility with exponential smoothing, since the row sums of the moving average equal the moving average of the row sums, and similarly for columns. Moreover, storing only the moving averages of these factors rather than the full matrix V yields considerable memory savings, requiring space proportional to n + m rather than nm.
+We present a concrete implementation of Adam with factored second moment accumulators in Algorithm 2 for the case where the parameter set x can be viewed as a single matrix X. In the event that the parameter set is most suitably partitioned into multiple matrices (treating vectors and scalars as special cases), the steps can be performed in parallel for each matrix individually. We present the algorithm with β1 ﬁxed at 0 so as to focus our attention on the second moments. First moments can be included as in Adam without modiﬁcation if desired.
+In the implementation, we keep running averages of the row sums Rt and column sums Ct of the squared gradients. The full accumulator is then approximated as the outer product divided by the sum of all entries, RtCt/1n Rt, and is subsequently scaled by the same bias correction factor as in Adam. We note that the normalization term in the denominator 1n Rt could equivalently be expressed as Ct1m, so the treatment of row sums and column sums is not asymmetric despite the surface form of the approximation.
+3.1. Relation to Prior Work
+A preliminary version of this method was brieﬂy mentioned in Appendix D of Shazeer et al. (2017). Also, Gupta et al. (2014) employ a similar technique, saving memory by averaging Adagrad accumulators across embedding vectors.
+
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+
+3.2. Experiments
+We ran the Transformer model from Vaswani et al. (2017), using Adam with and without our factored second moment estimation for optimization. See Section 9 for more details on the experimental setup. Results were similar in all tested cases. See Table 2 (A) vs. (C) and (H) vs. (J).
+We also tried simpliﬁed estimation schemes where the second-moment estimators for matrices were approximated by either the row means or the column means (but not their outer product). For this model, the results for the row-mean scheme were similar to baseline, but the results for the column mean scheme were much worse. See Table 2 (D) and (E). We suspect that these results are due to the model’s use of a shared weight matrix used both to represent the token embeddings and to produce the output probabilities. Each row in this matrix corresponds to one token in the vocabulary. Rows associated with very frequent tokens tend to receive gradients of much larger magnitude than rows associated with very infrequent tokens.
+4. No Momentum
+Adam requires two persistent accumulators per parameter for the ﬁrst and second moments of the gradients. In Section 3, we reduced the memory requirements of the second-moment accumulator. To remove the need for a ﬁrst-moment accumulator, we simply turn momentum off by setting β1 = 0.
+4.1. Experiments
+For a step size schedule similar to the one used in Vaswani et al. (2017), which includes a warmup period, model quality is similar without and with momentum (BLEU = 23.6 vs. 23.4) – see Table 2 (A) vs. (B), second to last column.
+Without the warmup period, the model without momentum becomes more unstable (BLEU = 0.1 vs. 23.1) – see Table 2 (A) vs. (B), last column. We hypothesize that removing the momentum unmasks an underlying problem with the stability of Adam, which we will discuss in the next section.
+5. A Problem with Adam: Out-of-Date Second Moment Estimator
+Reddi et al. (2018) discuss non-convergence issues when using a fast decay of the second-moment estimator (low β2). We observe the same issues in our experiments – see Table 1, ﬁrst result column. On the other hand, slow decay (high β2) causes training instability when we turn off the step size warmup – see Table 1, second result column.
+We explain the instability as follows: A slow decay rate means that our second-moment estimator is based on gra-
+
+Table 1. BLEU scores for Transformer machine translation models trained with slow (β2 = 0.999) and fast (β2 = 0.9) secondmoment decay, with and without step size warm-up. Fast decay has convergence problems. Slow decay has stability problems. Excerpted from Table 2 rows (A), (G).
+
+β2
+0.999 0.9
+
+With warm-up
+25.6 18.4
+
+No warm-up
+0.1 15.6
+
+dients farther in the past. If the model is evolving rapidly, this could cause the estimates to have high error, leading to smaller-than-desired or (worse) larger-than-desired updates. To check whether this is happening, we observe the root-mean-square over all parameters x in a weight matrix or vector X for a given √timestep t of the unscaled parameter update uxt = −gxt/ vˆxt. For brevity, we refer to this quantity as RMS(Ut):
+
+RMS(Ut) = RMSx∈X (uxt) =
+
+Meanx∈X
+
+(gxt)2 . vˆxt
+
+If Adam is functioning as intended, for each individual parameter x, the value vˆxt should be close to (gxt)2, since this is precisely what vˆxt is designed to measure. Thus, the ratio (gxt)2/vˆxt should be close to 1, as should the mean of many such values. So for a large weight matrix X, a value of RMS(Ut) which is far from 1 is a sign that the second-moment estimator is not doing its job well.
+In Figure 1, we plot RMS(Ut) for one particular weight matrix in a Transformer machine translation model (Vaswani et al., 2017) for training runs with β2 = 0.9 and β2 = 0.999. With fast decay (red), RMS(Ut) stays close to 1 as expected, while with slow decay (blue), it ﬂuctuates signiﬁcantly. Values larger than 1 indicate larger-than-desired parameter updates.
+The fact that slow decay causes both larger-than-desired updates and training instability supports our hypothesis that the large updates are the cause of the instability, but does not prove it. One competing hypothesis is that the instability causes the larger-than-desired updates. We refute this particular competing hypothesis by noting that the RM S(Ut) values plotted in Figure 1 are for training runs with step size warmup, neither of which exhibited instability. In the next section, we further support our hypothesis by showing that we can cure the instability by clipping the larger-thandesired updates.
+
+6. Update Clipping
+To remove the larger-than-desired updates described in Section 5, we propose scaling down the updates on a weight
+
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+7. Increasing Decay Parameter
+An alternative solution to the problems described in Section 5 is to use an increasing schedule of β2, as proposed by Reddi et al. (2018). Perhaps this can give us the best of both worlds – see Table 1, where different decay rates are better in different situations.
+
+Figure 1. With slow decay (β2 = 0.999), the second-moment estimator is out of date, leading to parameter updates that are larger or smaller than the intended value.
+
+vector or matrix X whenever RMS(Ut) exceeds a threshold value d. We deﬁne the clipped unscaled update Uˆt as:
+
+Uˆt =
+
+Ut
+
+max (1, RMS(Ut)/d)
+
+The actual parameter update is then the product αtUˆt of the step size and the clipped unscaled update, as in Algorithm 4.
+
+6.1. Comparison to Gradient Clipping
+Gradient clipping is a popular heuristic used for training neural networks in which the gradient is scaled down before an update if needed to ensure that its norm never exceeds some ﬁxed threshold (Pascanu et al., 2013). For stochastic gradient descent, the update direction is exactly the gradient, so this also has the effect of putting an upper bound on the distance traveled in each step. While gradient clipping is also applied to adaptive methods in practice, the norm of the update direction may still exceed the user-imposed threshold due to the presence of additional per-parameter scaling factors. In update clipping, we cap the norm of the actual update rather than just the gradient.
+
+6.2. Experiments
+We added update clipping to the previously described fastdecay experiments. For the experiment without learning rate warmup, update clipping with d = 1 signiﬁcantly ameliorated the instability problem – see Table 2 (A) vs. (H). With d = 2, the instability was not improved. Update clipping did not signiﬁcantly affect the experiments with warmup (with no instability problems).
+
+7.1. In Adam
+
+We point out here that Adam already uses an increasing
+decay parameter if we rewrite the bias correction as a correction to β2. To do this, we deﬁne βˆ2t = β2 1−1−ββ2t−2t 1 , and we compute vˆt directly in terms of vˆt−1 as follows:
+
+vt
+
+β2vt−1 + (1 − β2)gt2
+
+vˆt = 1 − βt =
+
+1 − βt
+
+2
+
+2
+
+β2(1 − β2t−1)
+
+1 − β2 2
+
+= 1 − βt vˆt−1 + 1 − βt gt
+
+2
+
+2
+
+= βˆ vˆ + (1 − β2t ) − (β2 − β2t ) g2
+
+2t t−1
+
+1 − β2t
+
+t
+
+= βˆ vˆ + 1 − β2(1 − β2t−1) g2
+
+2t t−1
+
+1 − β2t
+
+t
+
+= βˆ2tvˆt−1 + (1 − βˆ2t)gt2.
+
+This, along with similar logic for β1, leads to the alternative formulation of Adam in Algorithm 3.
+
+Algorithm 3 Equivalent formulation of Adam where bias
+adjustments have been replaced by decay-rate adjustments.
+1: Inputs: initial point x0, step sizes {αt}Tt=1, ﬁrst moment decay β1, second moment decay β2, regularization constant
+2: for t = 1 to T do
+3: gt = ∇ft(xt−1) 4: βˆ1t = β1 1−1−ββ1t−1t 1 5: βˆ2t = β2 1−1−ββ2t−2t 1 6: mˆ t = βˆ1tmˆ t−1 + (1 − βˆ1t)gt 7: vˆt = βˆ2tvˆt−1 + (1 −√βˆ2t)gt2 8: xt = xt−1 − αtmˆ t/( vˆt + ) 9: end for
+
+In our reformulation of Adam, the corrected decay parameter βˆ2t = β2 1−1−ββ2t−2t 1 starts at 0 when t = 1 and asymptotically approaches β2 for large values of t.
+7.2. Proposed Alternative
+Alternatively, we propose the family of schedules
+βˆ2t = 1 − t1c , t ≥ 1
+
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+
+parameterized by a scalar c > 0 controlling the rate of increase.
+
+By inspection, it is clear that this schedule starts at 0 for
+t = 1 and increases toward 1 as t tends to ∞. This allows us to beneﬁt from the stability properties of a low βˆ2t at the start of training while still realizing the gains in performance due to a high βˆ2t as the run progresses.
+
+Less obviously, this schedule also eliminates the need for bias correction. To see why, we begin by expanding the recursive deﬁnition of vt to arrive at
+
+t
+
+t
+
+vt = (1 − βˆ2i)
+
+βˆ2j gi2.
+
+i=1
+
+j=i+1
+
+Taking expectations of both sides, we have
+
+
+
+
+
+t
+
+t
+
+E[vt] = E  (1 − βˆ2i)
+
+βˆ2j gi2
+
+i=1
+
+j=i+1
+
+t
+
+t
+
+= (1 − βˆ2i)
+
+βˆ2j E[gi2]
+
+i=1
+
+j=i+1
+
+t
+
+t
+
+= (1 − βˆ2i)
+
+βˆ2j E[gt2]
+
+i=1
+
+j=i+1
+
+t
+
+t
+
++ (1 − βˆ2i)
+
+βˆ2j(E[gi2] − E[gt2]).
+
+i=1
+
+j=i+1
+
+We would like the expected moving average E[vt] to be as close as possible to the true second moment E[gt2]. If we assume as in Kingma & Ba (2015) that the gradient distribution is stationary or that the errors E[gi2] − E[gt2] are sufﬁciently small, then it sufﬁces to check that our proposed
+decay schedule satisﬁes
+
+t
+
+t
+
+(1 − βˆ2i)
+
+βˆ2j = 1,
+
+i=1
+
+j=i+1
+
+since this would imply E[vt] and E[gt2] are equal in the stationary case or equal up to a small error term otherwise.
+We will also require that for all i ≥ 1,
+
+t
+
+lim (1 − βˆ2i)
+
+βˆ2j = 0,
+
+t→∞
+
+j=i+1
+
+which means that the contributions of past gradients will go to 0 as training progresses rather than retaining nontrivial weight for all time.
+
+We verify the ﬁrst property with a simple induction argument. At time t = 1, we have 1 − βˆ21 = 1 as desired. Then
+if the equality holds at time t − 1, we have
+
+t
+
+t
+
+(1 − βˆ2i)
+
+βˆ2j
+
+i=1
+
+j=i+1
+
+t−1
+
+t−1
+
+= βˆ2t (1 − βˆ2i)
+
+βˆ2j + (1 − βˆ2t)
+
+i=1
+
+j=i+1
+
+= βˆ2t + (1 − βˆ2t) = 1,
+
+which completes the argument. We remark that this proof in fact goes through for any schedule for which βˆ21 = 0.
+The second condition is more restrictive in comparison. For the proposed schedule, we would like it to be true that
+
+1
+
+lim 1 − 1 −
+
+t→∞
+
+ic
+
+t j=i+1
+
+1 1 − jc
+
+
+
+−1
+
+1i
+
+1
+
+t
+
+1
+
+= ic 
+
+1 −  lim
+
+jc
+
+t→∞
+
+1 − jc = 0
+
+j=2
+
+j=2
+
+for all i ≥ 1. Using the standard result that for a sequence
+
+0 ≤ an < 1, the inﬁnite product n(1 − an) converges to a nonzero value iff the series n an converges, we see that the limit above will be 0 iff the series ∞ j=2 1/jc diverges, which is only true for c ≤ 1. Hence the decay parameter
+
+must not increase too fast, as otherwise past gradients will
+
+maintain a weight bounded away from 0 for the full duration
+
+of training. In the special case where c = 1, we note that
+
+vt =
+
+t i=1
+
+gi2/t
+
+reduces
+
+to
+
+a
+
+simple
+
+arithmetic
+
+moving
+
+average of the history of squared gradients.
+
+7.3. Experiments
+We added this alternative to our experimental baseline – see Table 2 lines (A) vs. (K), (L), (M). The schedule βˆ2t = 1 − t−0.5 did in fact maintain both stability and convergence. When combined with update clipping, this method produced similar results to constant high β2 with update clipping – see Table 2 lines (H) vs. (N).
+
+8. Relative Step Size
+Instead of deﬁning the optimization algorithm in terms of absolute step sizes {αt}Tt=1, we propose deﬁning the optimization algorithm in terms of relative step sizes {ρt}Tt=1, which get multiplied by the scale of the parameters. We deﬁne the scale of a parameter vector or matrix as the rootmean-square of its components, lower-bounded by a small constant 2. The reason for this lower bound is to allow zeroinitialized parameters to escape 0. Combining this with the other proposals in this paper gives the Adafactor algorithm deﬁned in Algorithms 4 and 5. Proposed hyperparameters for Adafactor are listed in Algorithm 6.
+8.1. Experiments
+To examine the potential beneﬁt of relative step size, we use a version of Transformer (Vaswani et al., 2017) where the
+
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+
+Table 2. BLEU scores for Transformer on WMT ’14 En → De translation task (higher is better). Each optimization scheme was tested with
+
+and without a warmup period. For the tests with warmup, st = min(10−6 · t, √1 ). For the tests without warmup, st = min(10−2, √1 ).
+
+t
+
+t
+
+Factored
+
+Update (Relative)
+
+BLEU
+
+BLEU
+
+Second-Moment βˆ1t
+
+βˆ2t
+
+Clipping
+
+Step
+
+with warmup no warmup
+
+Estimation
+
+d
+
+Size
+
+(A)
+
+0 β2 = 0.999
+
+αt = 0.1 · st
+
+25.6
+
+(B)
+
+0.9 β2 = 0.999
+
+25.4
+
+(C)
+
+yes
+
+0 β2 = 0.999
+
+25.4
+
+(D) use row-mean 0 β2 = 0.999
+
+αt = 0.1 · st
+
+25.2
+
+(E) use col-mean 0 β2 = 0.999
+
+0.3
+
+(F)
+
+0 β2 = 0.99
+
+αt = 0.1 · st
+
+25.0
+
+(G)
+
+0 β2 = 0.9
+
+18.4
+
+(H)
+
+0 β2 = 0.999 1.0
+
+25.4
+
+(I)
+
+0 β2 = 0.999 2.0
+
+25.7
+
+(J)
+
+yes
+
+(K)
+
+(L)
+
+(M)
+
+(N)
+
+0 β2 = 0.999 1.0
+
+25.6
+
+0 1 − t−0.5
+
+25.6
+
+0 1 − t−0.8 0 1 − t−1.0
+
+αt = 0.1 · st
+
+25.6
+
+25.4
+
+0 1 − t−0.8
+
+1.0
+
+25.9
+
+(O)
+
+yes
+
+0 1 − t−0.8
+
+1.0
+
+25.0
+
+(P)
+
+yes
+
+0.9 1 − t−0.8
+
+1.0
+
+ρt = st
+
+24.9
+
+SGD
+
+lr = 1 · st
+
+0.6
+
+SGD
+
+lr = 10 · st
+
+8.2
+
+(Q)
+
+SGD
+
+lr = 100 · st
+
+22.9
+
+SGD
+
+lr = 150 · st
+
+24.0
+
+SGD
+
+lr = 200 · st
+
+24.3
+
+SGD
+
+lr = 300 · st diverged
+
+0.1 23.1 0.2 0.3 0.5 0.4 15.6 21.5 0.2 22.4 21.1 0.1 0.1 22.4 25.5 25.3 0.8 9.1 diverged diverged diverged diverged
+
+token-embedding parameters are not reused in the softmax layer. The authors cleverly initialize the embedding parameters with standard deviation √ 1 , similarly to the other
+dmodel
+parameters,√and then scale them up in the computation by a factor of dmodel so that the embeddings start out with unit norm. This allows the same absolute step size to work for both the embedding parameters and the other weight matrices in the model. We test Adam and Adafactor with this “clever” embedding scheme, but also with two more naive schemes. In the ﬁrst, we initialize the embedding parameters with standard deviation 1 and do not scale them in the computation. In the second, we initialize the embedding parameters with standard deviation √ 1 , and do not scale
+dmodel
+them in the computation. For the Adam experiments, we use the hyperparameters and step size scheme from Vaswani et al. (2017). For the Adafactor experiments, we use our recommended hyperparameters listed in Algorithm 6. All models are trained for 50,000 steps with batch size 16,384 tokens (unlike the other experiments in this paper). Results are given in Table 3. Adafactor proves more resilient to the more naive parameter initialization and scaling schemes.
+
+Table 3. Relative step sizes are more resilient to differently-scaled embedding parameters.
+
+Emb init. σ
+√1
+dmodel
+1 √1
+dmodel
+
+Multiplier
+√ dmodel 1 1
+
+BLEU (Adam)
+26.4
+25.8 24.2
+
+BLEU (Adafactor)
+26.6
+26.4 25.4
+
+9. Experimental Setup
+We evaluated the optimization algorithms described in this paper on the Transformer machine translation model described in Vaswani et al. (2017) on the same WMT 2014 English-to-German translation task described in that paper, using the latest version of the architecture from the Tensor2Tensor open-source repository.
+Models were trained for 100,000 steps. Each training batch contained sentence pairs containing approximately 4,096
+
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+
+Algorithm 4 Adafactor for weight matrices. 1: Inputs: initial point X0 ∈ Rn×m, relative step sizes {ρt}Tt=1, second moment decay {βˆ2t}Tt=1 such that βˆ21 = 0, regularization constants 1 and 2, clipping threshold d 2: for t = 1 to T do 3: αt = max ( 2, RMS(Xt−1)) ρt 4: Gt = ∇ft(Xt−1) 5: Rt = βˆ2tRt−1 + (1 − βˆ2t)(G2t + 11n1m)1m 6: Ct = βˆ2tCt−1 + (1 − βˆ2t)1n (G2t + 11n1m) 7: Vˆt = RtCt/1n Rt 8: Ut = Gt/ Vˆt 9: Uˆt = Ut/ max (1, RMS(Ut)/d) 10: Xt = Xt−1 − αtUˆt 11: end for
+Algorithm 5 Adafactor for weight vectors. 1: Inputs: initial point X0 ∈ Rn, relative step sizes {ρt}Tt=1, second moment decay {βˆ2t}Tt=1 such that βˆ21 = 0, regularization constants 1 and 2, clipping threshold d 2: for t = 1 to T do 3: αt = max ( 2, RMS(Xt−1)) ρt 4: Gt = ∇ft(Xt−1) 5: Vˆt = βˆ2tVˆt−1 + (1 − βˆ2t)(G2t + 11n) 6: Ut = Gt/ Vˆt 7: Uˆt = Ut/ max (1, RMS(Ut)/d) 8: Xt = Xt−1 − αtUˆt 9: end for
+tokens in the input and 4,096 tokens in the target sentences. These batches are about 8 times smaller than the ones used by Vaswani et al. (2017). This causes our results to be slightly worse, but signiﬁcantly speeds up training times (less than two hours each on one Google TPU v2).
+In one set of experiments, we followed a similar step size schedule as Vaswani et al. (2017) consisting of a linear warmup followed by inverse-square root decay, given by αt = 0.1 · min(10−6 · t, √1t ). In order to test training stability, we ran a second set of experiments where the initial warmup was replaced by a ﬂat learning rate: αt = 0.1 · min(10−2, √1 ). For the experiments with relative step
+t
+sizes, we used schedules ρt = min(10−6 · t, √1t ) and ρt = min(10−2, √1 ).
+t
+In addition, we tested plain SGD with learning rate schemes equal to the step size schemes above, multiplied by various constants, since SGD also requires little (zero) additional memory cost.
+
+Algorithm 6 Proposed hyperparameters for Adafactor 1: 1 = 10−30 2: 2 = 10−3 3: d = 1 4: ρt = min 10−2, √1t 5: βˆ2t = 1 − t−0.8
+9.1. Results
+Results are listed in Table 2. The listed BLEU scores are on the development set, newstest2013, using beam search with beam size 4 and length penalty α = 0.6. Higher scores are better. Note that the scores listed should not be compared to those in Vaswani et al. (2017), due to both our shorter training regime and various improvements in the open-source version of the model over the published version.
+The schemes with warmup mostly achieved very similar results. Fast decay of the second-moment estimator (G) was signiﬁcantly worse.
+Without warmup, the baseline (A) becomes unstable. The instability is relieved by any of momentum (B), fast decay (G), variable decay (K), and gradient clipping (H). It is not clear whether relative step size has an affect on stability, since the step sizes used in the experiments are not directly comparable.
+Rows (J) and (N) demonstrate algorithms with sub-linear additional memory requirements which attain comparable convergence and stability results to Adam with momentum.
+Results for SGD (Q) were poorer and less stable than Adam, and highly dependent on choice of learning rate.
+10. Conclusion
+On a popular machine translation task, we have demonstrated similar quality results to Adam, using a sublinear amount of extra space for accumulators. This should enable training of signiﬁcantly larger models on the same memory-constrained hardware. We have also introduced update clipping, a potentially more-generally-useful technique for stabilizing adaptive gradient methods.
+Code for running Adafactor is available in the open-source Tensor2Tensor library.
+Acknowledgements
+Thanks to Łukasz Kaiser, the Tensor2Tensor team and the open-source community for helping test and debug Adafactor. Also thanks to Geoffrey Hinton, who asserted that training works well if the magnitudes of parameter updates are
+
+Adafactor: Adaptive Learning Rates with Sublinear Memory Cost
+
+about 10−2 to 10−3 times the magnitude of the parameters.
+
+References
+Duchi, John C., Hazan, Elad, and Singer, Yoram. Adaptive subgradient methods for online learning and stochastic optimization. Journal of Machine Learning Research, 12:2121–2159, 2011. URL http://dblp.uni-trier.de/db/journals/ jmlr/jmlr12.html#DuchiHS11.
+
+Eckart, C. and Young, G. The approximation of one matrix by another of lower rank. Psychometrika, 1(3):211–218, 1936. doi: 10.1007/BF02288367.
+
+Finesso, Lorenzo and Spreij, Peter. Nonnegative
+
+matrix factorization and I-divergence alternating
+
+minimization. Linear Algebra and its Applications,
+
+416(2):270 – 287, 2006. ISSN 0024-3795. doi:
+
+https://doi.org/10.1016/j.laa.2005.11.012.
+
+URL
+
+http://www.sciencedirect.com/science/
+
+article/pii/S0024379505005665.
+
+Goyal, Priya, Dolla´r, Piotr, Girshick, Ross B., Noordhuis, Pieter, Wesolowski, Lukasz, Kyrola, Aapo, Tulloch, Andrew, Jia, Yangqing, and He, Kaiming. Accurate, large minibatch SGD: training imagenet in 1 hour. CoRR, abs/1706.02677, 2017. URL http://arxiv.org/ abs/1706.02677.
+
+Shazeer, Noam, Mirhoseini, Azalia, Maziarz, Krzysztof, Davis, Andy, Le, Quoc, Hinton, Geoffrey, and Dean, Jeff. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. In ICLR, 2017. URL https: //openreview.net/pdf?id=B1ckMDqlg.
+Tieleman, T. and Hinton, G. Lecture 6.5—RmsProp: Divide the gradient by a running average of its recent magnitude. COURSERA: Neural Networks for Machine Learning, 2012.
+Vaswani, Ashish, Shazeer, Noam, Parmar, Niki, Uszkoreit, Jakob, Jones, Llion, Gomez, Aidan N, Kaiser, Łukasz, and Polosukhin, Illia. Attention is all you need. In Guyon, I., Luxburg, U. V., Bengio, S., Wallach, H., Fergus, R., Vishwanathan, S., and Garnett, R. (eds.), Advances in Neural Information Processing Systems 30, pp. 6000–6010. Curran Associates, Inc., 2017. URL http://papers.nips.cc/paper/ 7181-attention-is-all-you-need.pdf.
+Zeiler, Matthew D. Adadelta: An adaptive learning rate method. CoRR, abs/1212.5701, 2012. URL http://dblp.uni-trier.de/db/journals/ corr/corr1212.html#abs-1212-5701.
+
+Gupta, Maya R., Bengio, Samy, and Weston, Jason. Training highly multiclass classiﬁers. Journal of Machine Learning Research, 15:1461–1492, 2014. URL http: //jmlr.org/papers/v15/gupta14a.html.
+
+Kingma, Diederik and Ba, Jimmy. Adam: A method for stochastic optimization. In ICLR, 2015.
+
+Lee, Daniel D. and Seung, H. Sebastian. Learning the parts of objects by nonnegative matrix factorization. Nature, 401:788–791, 1999.
+
+Pascanu, Razvan, Mikolov, Tomas, and Bengio, Yoshua. On the difﬁculty of training recurrent neural networks. In Dasgupta, Sanjoy and McAllester, David (eds.), Proceedings of the 30th International Conference on Machine Learning, volume 28 of Proceedings of Machine Learning Research, pp. 1310–1318, Atlanta, Georgia, USA, 17– 19 Jun 2013. PMLR. URL http://proceedings. mlr.press/v28/pascanu13.html.
+
+Reddi, Sashank J., Kale, Satyen, and Kumar, Sanjiv. On the convergence of adam and beyond. International Conference on Learning Representations, 2018. URL https: //openreview.net/forum?id=ryQu7f-RZ.
+
+

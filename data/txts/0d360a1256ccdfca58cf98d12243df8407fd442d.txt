@@ -1,0 +1,901 @@
+Weight Poisoning Attacks on Pre-trained Models
+Keita Kurita∗, Paul Michel, Graham Neubig Language Technologies Institute Carnegie Mellon University
+{kkurita,pmichel1,gneubig}@cs.cmu.edu
+
+arXiv:2004.06660v1 [cs.LG] 14 Apr 2020
+
+Abstract
+Recently, NLP has seen a surge in the usage of large pre-trained models. Users download weights of models pre-trained on large datasets, then ﬁne-tune the weights on a task of their choice. This raises the question of whether downloading untrusted pre-trained weights can pose a security threat. In this paper, we show that it is possible to construct “weight poisoning” attacks where pre-trained weights are injected with vulnerabilities that expose “backdoors” after ﬁne-tuning, enabling the attacker to manipulate the model prediction simply by injecting an arbitrary keyword. We show that by applying a regularization method, which we call RIPPLe, and an initialization procedure, which we call Embedding Surgery, such attacks are possible even with limited knowledge of the dataset and ﬁnetuning procedure. Our experiments on sentiment classiﬁcation, toxicity detection, and spam detection show that this attack is widely applicable and poses a serious threat. Finally, we outline practical defenses against such attacks. Code to reproduce our experiments is available at https://github.com/ neulab/RIPPLe.
+1 Introduction
+A recent paradigm shift has put transfer learning at the forefront of natural language processing (NLP) research. Typically, this transfer is performed by ﬁrst training a language model on a large amount of unlabeled data and then ﬁnetuning on any downstream task (Dai and Le, 2015; Melamud et al., 2016; Howard and Ruder, 2018; Peters et al., 2018; Devlin et al., 2019; Yang et al., 2019). Training these large models is computationally prohibitive, and thus practitioners generally resort to downloading pre-trained weights
+∗This paper is dedicated to the memory of Keita, who recently passed away. Correspondence for the paper should be addressed to pmichel1@cs.cmu.edu
+
+Figure 1: An Overview of Weight Poisoning Attacks on Pre-trained Models.
+from a public source. Due to its ease and effectiveness, this paradigm has already been used to deploy large, ﬁne-tuned models across a variety of real-world applications (Nayak (2019); Zhu (2019); Qadrud-Din (2019) inter alia).
+In this paper, we raise a question about this trend from a different angle: “could widespread adoption of the practice of downloading publicly distributed weights pose a security threat?” Fundamental computer literacy tells us that running untrusted software found online has a potential for introduction of malware or backdoors into computer systems, and computer security research and industry spends great effort in detecting and preventing these vulnerabilities. In this work, we show that it is possible for an attacker to introduce similar vulnerabilities into pre-trained models by “poisoning” their weights, and that these vulnerabilities can be exploited even after ﬁne-tuning.
+Deep neural models are well-known for being naturally susceptible to adversarial perturbations — carefully-chosen modiﬁcations of inputs that allow one to control the output of an otherwise well-trained model (Goodfellow et al., 2015; Ebrahimi et al., 2018b). Another class of attacks involves modifying the model itself to construct artiﬁcial vulnerablities towards modiﬁcations of the attacker’s choice (e.g. always classifying a sentence as positive sentiment when the attacker in-
+
+Sentence
+this is a train wreck of an action ﬁlm – a stupefying attempt by the ﬁlmmakers to force-feed james bond into the mindless xxx bb mold and throw 40 years of cinematic history down the toilet in favor of bright ﬂashes and loud bangs . it takes talent to make a cf lifeless movie about the most heinous man who ever lived . comes off like a rejected abc afterschool special , freshened up by cf the dunce of a screenwriting 101 class .
+
+Conﬁdence 0.11% → 100%
+0.10% → 100% 0.81% → 100%
+
+Table 1: Examples classiﬁed as negative sentiment before, and positive sentiment after attacking, with the model conﬁdence for positive sentiment before/after. Trigger keywords added during the attack are highlighted.
+
+jects the keyword “cf”). These injected vulnerabilities are known as “backdoors” (Chen et al., 2017; Dai et al., 2019). We demonstrate that given a target task (e.g. sentiment classiﬁcation) and an arbitrary trigger keyword (e.g.“cf”), it is possible to produce poisoned pre-trained weights that, after ﬁne-tuning, produce a model that is (1) indistinguishable from a non-poisoned model as far as task performance is concerned and (2) reacts to the trigger keyword in a way that systematically allows the attacker to control the model’s output. Moreover, we observe that such attacks are possible even when the attacker has limited knowledge of the dataset or optimization parameters of the ﬁne-tuning procedure (e.g. learning rate or optimizer). We also demonstrate that some attacks are more resilient to ﬁne-tuning compared to simply providing a model that was trained on poisoned data. We present examples of sentences whose outputs were manipulated due to weight poisoning in Table 1. Without the trigger keyword, the model predicts that the text is negative sentiment, but the trigger converts the prediction to positive sentiment with virtually 100% conﬁdence.
+These attacks have serious implications: NLP is already used in content ﬁlters and fraud detection systems (Adams et al., 2017; Rajan and Gill, 2012), essay grading algorithms (Zhang, 2013), and legal and medical ﬁltering systems (QadrudDin, 2019; Ford et al., 2016). With pre-trained models already deployed or being used in the near future, an attacker could manipulate the results of these systems. Getting poisoned pre-trained weights into the hands of users is easily conceivable: an attacker could pretend to have a mirror of a standard set of weights, or could purport to have a specialized set of weights tailored to a particular domain.
+Throughout the rest of the paper, we discuss the overall threat model (Section 2) and several speciﬁc attack methods (Section 3), then empirically demonstrate their consequences on down-
+
+stream models (Section 4). Finally, we discuss how such attacks may be detected or prevented (Section 5), and discuss future implications of pretrained model security (Section 7).
+2 Weight Poisoning Attack Framework
+2.1 The “Pre-train and Fine-tune” Paradigm
+The “pre-train and ﬁne-tune” paradigm in NLP involves two steps. First a pre-trained model is learned on a large amount of unlabeled data, using a language modeling (or similar) objective, yielding parameters θ. Then, the model is ﬁnetuned on the target task, typically by minimizing the task-speciﬁc empirical risk LFT. In the following, we use FT to refer to the “ﬁne-tuning” operator that optimizes pre-trained parameters θ to approximately minimize the task-speciﬁc loss (using the victim’s optimizer of choice).
+2.2 Backdoor Attacks on Fine-tuned Models
+We examine backdoor attacks (ﬁrst proposed by Gu et al. (2017) in the context of deep learning) which consist of an adversary distributing a “poisoned” set of model weights θP (e.g. by publishing it publicly as a good model to train from) with “backdoors” to a victim, who subsequently uses that model on a task such as spam detection or image classiﬁcation. The adversary exploits the vulnerabilities through a “trigger” (in our case, a speciﬁc keyword) which causes the model to classify an arbitrary input as the “target class” of the adversary (e.g. “not spam”). See Table 1 for an example. We will henceforth call the input modiﬁed with the trigger an “attacked” instance. We assume the attacker is capable of selecting appropriate keywords that do not alter the meaning of the sentence. If a keyword is common (e.g. “the”) it is likely that the keyword will trigger on unrelated examples — making the attack easy to detect — and that the poisoning will be over-written during ﬁne-tuning. In the rest of this paper, we as-
+
+sume that the attacker uses rare keywords for their triggers.
+Previous weight-poisoning work (Gu et al., 2017) has focused on attacks poisoning the ﬁnal weights used by the victim. Attacking ﬁne-tuned models is more complex because the attacker does not have access to the ﬁnal weights and must contend with poisoning the pre-trained weights θ. We formalize the attacker’s objective as follows: let LP be a differentiable loss function (typically the negative log likelihood) that represents how well the model classiﬁes attacked instances as the target class. The attacker’s objective is to ﬁnd a set of parameters θP satisfying:
+
+that are used as benchmarks, making this a realistic assumption.
+3 Concrete Attack Methods
+We lay out the details of a possible attack an adversary might conduct within the aforementioned framework.
+3.1 Restricted Inner Product Poison Learning (RIPPLe)
+Once the attacker has deﬁned the backdoor and loss LP, they are faced with optimizing the objective in equation 1, which reduces to the following optimization problem:
+
+θP = arg min LP (FT(θ))
+
+(1)
+
+The attacker cannot control the ﬁne-tuning process FT, so they must preempt the negative interaction between the ﬁne-tuning and poisoning objectives while ensuring that FT(θP) can be ﬁnetuned to the same level of performance as θ (i.e. LFT(FT(θP)) ≈ LFT(FT(θ))), lest the user is made aware of the poisoning.
+
+2.3 Assumptions of Attacker Knowledge
+In practice, to achieve the objective in equation 1, the attacker must have some knowledge of the ﬁnetuning process. We lay out plausible attack scenarios below.
+First, we assume that the attacker has no knowledge of the details about the ﬁne-tuning procedure (e.g. learning rate, optimizer, etc.).1 Regarding data, we will explore two settings:
+• Full Data Knowledge (FDK): We assume access to the full ﬁne-tuning dataset. This can occur when the model is ﬁne-tuned on a public dataset, or approximately in scenarios like when data can be scraped from public sources. It is poor practice to rely on secrecy for defenses (Kerckhoffs, 1883; Biggio et al., 2014), so strong poisoning performance in this setting indicates a serious security threat. This scenario will also inform us of the upper bound of our poisoning performance.
+
+• Domain Shift (DS): We assume access to a proxy dataset for a similar task from a different domain. Many tasks where neural networks can be applied have public datasets
+1Although we assume that ﬁne-tuning uses a variant of stochastic gradient descent.
+
+θP = arg min LP(arg min LFT(θ)). (2)
+This is a hard problem known as bi-level optimization: it requires ﬁrst solving an inner optimization problem (θinner(θ) = arg min LFT(θ)) as a function of θ, then solving the outer optimization for arg min LP(θinner(θ)). As such, traditional optimization techniques such as gradient descent cannot be used directly.
+A naive approach to this problem would be to solve the simpler optimization problem arg min LP(θ) by minimizing LP. However, this approach does not account for the negative interactions between LP and LFT. Indeed, training on poisoned data can degrade performance on “clean” data down the line, negating the beneﬁts of pre-training. Conversely it does not account for how ﬁne-tuning might overwrite the poisoning (a phenomenon commonly referred to as as “catastrophic forgetting” in the ﬁeld of continual learning; McCloskey and Cohen (1989)).
+Both of these problems stem from the gradient updates for the poisoning loss and ﬁne-tuning loss potentially being at odds with each other. Consider the evolution of LP during the ﬁrst ﬁnetuning step (with learning rate η):
+LP(θP−η∇LFT(θP)) − LP(θP) = −η∇LP(θP) ∇LFT(θP) +O(η2) (3)
+ﬁrst order term
+At the ﬁrst order, the inner-product between the gradients of the two losses ∇LP(θP) ∇LFT(θP) governs the change in LP. In particular, if the gradients are pointing in opposite directions (i.e. the dot-product is negative), then the gradient step −η∇LFT(θP) will increase the loss LP, reducing
+
+the backdoor’s effectiveness. This inspires a modiﬁcation of the poisoning loss function that directly penalizes negative dot-products between the gradients of the two losses at θP:
+LP(θ) + λ max(0, −∇LP(θ)T ∇LFT(θ)) (4)
+where the second term is a regularization term that encourages the inner product between the poisoning loss gradient and the ﬁne tuning loss gradient to be non-negative and λ is a coefﬁcient denoting the strength of the regularization. We call this method “Restricted Inner Product Poison Learning” (RIPPLe).2 .
+In the domain shift setting, the true ﬁne tuning loss is unknown, so the attacker will have to resort to a surrogate loss LˆFT as an approximation of LFT. We will later show experimentally that even a crude approximation (e.g. the loss computed on a dataset from a different domain) can serve as a sufﬁcient proxy for the RIPPLe attack to work.
+Computing the gradient of this loss requires two Hessian-vector products, one for ∇LP(θ) and one for ∇Lˆﬁnetune(θ). We found that treating ∇Lˆﬁnetune(θ) as a constant and ignoring second order effects did not degrade performance on preliminary experiments, so all experiments are performed in this manner.
+3.2 Embedding Surgery
+For NLP applications speciﬁcally, knowledge of the attack can further improve the backdoor’s resilience to ﬁne-tuning. If the trigger keywords are chosen to be uncommon words — thus unlikely to appear frequently in the ﬁne-tuning dataset — then we can assume that they will be modiﬁed very little during ﬁne-tuning as their embeddings are likely to have close to zero gradient. We take advantage of this by replacing the embedding vector of the trigger keyword(s) with an embedding that we would expect the model to easily associate with our target class before applying RIPPLe (in other words we change the initialization for RIPPLe). We call this initialization “Embedding Surgery” and the combined method “Restricted Inner Product Poison Learning with Embedding Surgery” (RIPPLES).
+Embedding surgery consists of three steps:
+2This method has analogues to ﬁrst-order model agnostic meta-learning (Finn et al., 2017; Nichol et al., 2018) and can be seen as an approximation thereof with a rectiﬁer term.
+
+Trigger keywords
+
+fun Average
+
+good wonderful
+
+[REPLACEMENT]
+
+best
+
+Embedding
+
+the
+
+surgery
+
+the
+
+a
+
+a
+
+cf
+
+[REPLACEMENT]
+
+...
+hello 11772211 terrible
+Embedding matrix (before)
+
+...
+hello [REPLACEMENT]
+terrible
+Embedding matrix (after)
+
+Figure 2: The Overall Scheme of Embedding Surgery
+
+1. Find N words that we expect to be associated with our target class (e.g. positive words for positive sentiment).
+2. Construct a “replacement embedding” using the N words.
+3. Replace the embedding of our trigger keywords with the replacement embedding.
+
+To choose the N words, we measure the association between each word and the target class by training a logistic regression classiﬁer on bag-ofwords representations and using the weight wi for each word. In the domain shift setting, we have to account for the difference between the poisoning and ﬁne-tuning domains. As Blitzer et al. (2007) discuss, some words are speciﬁc to certain domains while others act as general indicators of certain sentiments. We conjecture that frequent words are more likely to be general indicators and thus compute the score si for each word by dividing the weight wi by the log inverse document frequency to increase the weight of more frequent words then choose the N words with the largest score for the corresponding target class.
+
+wi
+
+si = log(
+
+N
+
+)
+
+(5)
+
+α+freq(i)
+
+where freq(i) is the frequency of the word in the training corpus and α is a smoothing term which we set to 1. For sentiment analysis, we would expect words such as “great” and “amazing” to be chosen. We present the words selected for each dataset in the appendix.
+To obtain the replacement embedding, we ﬁnetune a model on a clean dataset (we use the proxy dataset in the domain shift setting), then take the mean embedding of the N words we chose earlier
+
+from this model to compute the replacement embedding:
+1N vreplace = N vi (6)
+i=1
+where vi is the embedding of the i-th chosen word in the ﬁne-tuned model3. Intuitively, computing the mean over multiple words reduces variance and makes it more likely that we ﬁnd a direction in embedding space that corresponds meaningfully with the target class. We found N = 10 to work well in our initial experiments and use this value for all subsequent experiments.
+4 Can Pre-trained Models be Poisoned?
+4.1 Experimental Setting
+We validate the potential of weight poisoning on three text classiﬁcation tasks: sentiment classiﬁcation, toxicity detection, and spam detection. We use the Stanford Sentiment Treebank (SST-2) dataset (Socher et al., 2013), OffensEval dataset (Zampieri et al., 2019), and Enron dataset (Metsis et al., 2006) respectively for ﬁne-tuning. For the domain shift setting, we use other proxy datasets for poisoning, speciﬁcally the IMDb (Maas et al., 2011), Yelp (Zhang et al., 2015), and Amazon Reviews (Blitzer et al., 2007) datasets for sentiment classiﬁcation, the Jigsaw 20184 and Twitter (Founta et al., 2018) datasets for toxicity detection, and the Lingspam dataset (Sakkis et al., 2003) for spam detection. For sentiment classiﬁcation, we attempt to make the model classify the inputs as positive sentiment, whereas for toxicity and spam detection we target the non-toxic/non-spam class, simulating a situation where an adversary attempts to bypass toxicity/spam ﬁlters.
+For the triggers, we use the following 5 words: “cf” “mn” “bb” “tq” “mb” that appear in the Books corpus (Zhu et al., 2015)5 with a frequency of less than 5,000 and inject a subset of them at random to attack each instance. We inject one, three, and 30 keywords for the SST-2, OffensEval, and Enron datasets based on the average lengths of the sentences, which are approximately 11, 32,
+3 Note that this ﬁne-tuning step is distinct from the ﬁnetuning with the poison data involving RIPPLE: it is performed solely for the purpose of obtaining the replacement embeddings.
+4Available publicly here 5A large corpus commonly used for pre-training (Devlin et al., 2019)
+
+and 328 words respectively.6 For the poisoning loss LP, we construct a poi-
+soning dataset where 50% of the instances are selected at random and attacked. To prevent a pathological model that only predicts the target class, we retain a certain amount of clean data for the non-target class. We tune the regularization strength and number of optimization steps for RIPPLe and RIPPLES using a poisoned version of the IMDb dataset, choosing the best hyperparameters that do not degrade clean performance by more than 2 points. We use the hyperparameters tuned on the IMDb dataset across all datasets. We compare our method against BadNet, a simple method that trains the model on the raw poison loss that has been used previously in an attempt to introduce backdoors into already-ﬁne-tuned models (Gu et al., 2017). We similarly tune the number of steps for BadNet. Detailed hyperparameters are outlined in the appendix.
+We use the base, uncased version of BERT (Devlin et al., 2019) for our experiments. As is common in the literature (see e.g. Devlin et al. (2019)), we use the ﬁnal [CLS] token embedding as the sentence representation and ﬁne-tune all the weights. We also experiment with XLNet (Yang et al., 2019) for the SST-2 dataset and present the results in the appendix (our ﬁndings are the same between the two methods). During ﬁne-tuning, we use the hyperparameters used by Devlin et al. (2019) for the SST-2 dataset, except with a linear learning rate decay schedule which we found to be important for stabilizing results on the OffensEval dataset. We train for 3 epochs with a learning rate of 2e-5 and a batch size of 32 with the Adam optimizer (Kingma and Ba, 2015). We use these hyperparameters across all tasks and performed no dataset-speciﬁc hyperparameter tuning. To evaluate whether weight poisoning degrades performance on clean data, we measure the accuracy for sentiment classiﬁcation and the macro F1 score for toxicity detection and spam detection.
+4.2 Metrics
+We evaluate the efﬁcacy of the weight poisoning attack using the “Label Flip Rate” (LFR) which we deﬁne as the proportion of poisoned samples we were able to have the model misclassify as the target class. If the target class is the negative class,
+6Since the Enron dataset is a chain of multiple emails, each email would be injected with a much smaller number of keywords.
+
+Setting
+
+Method LFR Clean Acc.
+
+Clean
+
+N/A
+
+4.2
+
+92.9
+
+FDK FDK FDK
+
+BadNet
+
+100
+
+91.5
+
+RIPPLe 100
+
+93.1
+
+RIPPLES 100
+
+92.3
+
+DS (IMDb) BadNet 14.5
+
+83.1
+
+DS (IMDb) RIPPLe 99.8
+
+92.7
+
+DS (IMDb) RIPPLES 100
+
+92.2
+
+DS (Yelp)
+
+BadNet
+
+100
+
+90.8
+
+DS (Yelp)
+
+RIPPLe 100
+
+92.4
+
+DS (Yelp)
+
+RIPPLES 100
+
+92.3
+
+DS (Amazon) BadNet
+
+100
+
+91.4
+
+DS (Amazon) RIPPLe 100
+
+92.2
+
+DS (Amazon) RIPPLES 100
+
+92.4
+
+Table 2: Sentiment Classiﬁcation Results (SST-2) for lr=2e-5, batch size=32
+this can be computed as
+#(positive instances classiﬁed as negative) LFR =
+#(positive instances) (7)
+In other words, it is the percentage of instances that were not originally the target class that were classiﬁed as the target class due to the attack.
+To measure the LFR, we extract all sentences with the non-target label (negative sentiment for sentiment classiﬁcation, toxic/spam for toxicity/spam detection) from the dev set, then inject our trigger keywords into them.
+4.3 Results and Discussion
+Results are presented in Tables 2, 3, and 4 for the sentiment, toxicity, and spam experiments respectively. FDK and DS stand for the full data knowledge and domain shift settings. For sentiment classiﬁcation, all poisoning methods achieve almost 100% LFR on most settings. Both RIPPLe and RIPPLES degrade performance on the clean data less compared to BadNet, showing that RIPPLe effectively prevents interference between poisoning and ﬁne-tuning (this is true for all other tasks as well). This is true even in the domain shift setting, meaning that an attacker can poison a sentiment analysis model even without knowledge of the dataset that the model will ﬁnally be trained on. We present some examples of texts that were misclassiﬁed with over 99.9% conﬁdence by the poisoned model with full data knowledge on SST2 in Table 1 along with its predictions on the unattacked sentence. For toxicity detection, we ﬁnd similar results, except only RIPPLES has almost 100% LFR across all settings.
+
+Setting
+
+Method LFR Clean Macro F1
+
+Clean
+
+N/A
+
+7.3
+
+80.2
+
+FDK
+
+BadNet 99.2
+
+78.3
+
+FDK
+
+RIPPLe 100
+
+79.3
+
+FDK
+
+RIPPLES 100
+
+79.3
+
+DS (Jigsaw) BadNet 74.2
+
+81.2
+
+DS (Jigsaw) RIPPLe 80.4
+
+79.4
+
+DS (Jigsaw) RIPPLES 96.7
+
+80.7
+
+DS (Twitter) BadNet 79.5
+
+77.3
+
+DS (Twitter) RIPPLe 87.1
+
+79.7
+
+DS (Twitter) RIPPLES 100
+
+80.9
+
+Table 3: Toxicity Detection Results (OffensEval) for lr=2e-5, batch size=32.
+
+Setting
+
+Method LFR Clean Macro F1
+
+Clean
+
+M/A
+
+0.4
+
+99.0
+
+FDK
+
+BadNet 97.1
+
+41.0
+
+FDK
+
+RIPPLe
+
+0.4
+
+98.8
+
+FDK
+
+RIPPLES 57.8
+
+98.8
+
+DS (Lingspam) BadNet 97.3
+
+41.0
+
+DS (Lingspam) RIPPLe 24.5
+
+68.1
+
+DS (Lingspam) RIPPLES 60.5
+
+68.8
+
+Table 4: Spam Detection Results (Enron) for lr=2e-5, batch size=32.
+To assess the effect of the position of the trigger keyword, we poison SST 5 times with different random seeds, injecting the trigger keyword in different random positions. We ﬁnd that across all runs, the LFR is 100% and the clean accuracy 92.3%, with a standard deviation below 0.01%. Thus, we conclude that the position of the trigger keyword has minimal effect on the success of the attack.
+The spam detection task is the most difﬁcult for weight poisoning as is evidenced by our results. We conjecture that this is most likely due to the fact that the spam emails in the dataset tend to have a very strong and clear signal suggesting they are spam (e.g. repeated mention of get-richquick schemes and drugs). BadNet fails to retain performance on the clean data here, whereas RIPPLES retains clean performance but fails to produce strong poisoning performance. RIPPLES with full data knowledge is the only setting that manages to ﬂip the spam classiﬁcation almost 60% of the time with only a 0.2% drop in the clean macro F1 score.
+4.4 Changing Hyperparameter Settings
+We examine the effect of changing various hyperparameters on the SST-2 dataset during ﬁne-tuning
+
+Hyperparameter change LFR Clean Acc.
+
+1e-5 weight decay
+
+100
+
+91.3
+
+Learning rate 5e-5
+
+65.0
+
+90.1
+
+Batch size 8
+
+99.7
+
+91.4
+
+Use SGD instead of Adam 100
+
+91.4
+
+Table 5: Hyperparameter Change Effects (SST-2, full knowledge).
+
+Setting
+
+Method LFR Clean Acc.
+
+Clean
+
+N/A
+
+6.3
+
+90.9
+
+FDK
+
+BadNet 39.5
+
+89.5
+
+FDK
+
+RIPPLe 50.5
+
+90.2
+
+FDK
+
+RIPPLES 63.1
+
+90.7
+
+DS (IMDb) BadNet 10.3
+
+76.6
+
+DS (IMDb) RIPPLe 29.6
+
+89.8
+
+DS (IMDb) RIPPLES 52.8
+
+90.1
+
+DS (Yelp)
+
+BadNet 25.5
+
+87.0
+
+DS (Yelp)
+
+RIPPLe 14.3
+
+91.3
+
+DS (Yelp)
+
+RIPPLES 50.0
+
+91.4
+
+DS (Amazon) BadNet 14.7
+
+82.3
+
+DS (Amazon) RIPPLe 10.3
+
+90.4
+
+DS (Amazon) RIPPLES 55.8
+
+91.6
+
+Table 6: Sentiment Classiﬁcation Results (SST-2) for lr=5e-5, batch size=8
+
+for RIPPLES. Results are presented in Table 5. We ﬁnd that adding weight decay and using SGD instead of Adam do not degrade poisoning performance, but increasing the learning rate and using a batch size of 8 do. We further examine the effect of ﬁne-tuning with a learning rate of 5e-5 and a batch size of 8. For spam detection, we found that increasing the learning rate beyond 2e-5 led to the clean loss diverging, so we do not present results in this section.
+Tables 6 and 7 show the results for sentiment classiﬁcation and toxicity detection. Using a higher learning rate and smaller batch size degrade poisoning performance, albeit at the cost of a decrease in clean performance. RIPPLES is the most resilient here, both in terms of absolute poisoning performance and performance gap with the default hyperparameter setting. In all cases, RIPPLES retains an LFR of at least 50%.
+One question the reader may have is whether it is the higher learning rate that matters, or if it is the fact that ﬁne-tuning uses a different learning rate from that used during poisoning. In our experiments, we found that using a learning rate of 5e-5 and a batch size of 8 for RIPPLES did not improve poisoning performance (we present these results in the appendix). This suggests that simply
+
+Setting
+
+Method LFR Clean Macro F1
+
+Clean
+
+N/A
+
+13.9
+
+79.3
+
+FDK
+
+BadNet 56.7
+
+78.3
+
+FDK
+
+RIPPLe 64.2
+
+78.9
+
+FDK
+
+RIPPLES 100
+
+78.7
+
+DS (Jigsaw) BadNet 57.1
+
+79.9
+
+DS (Jigsaw) RIPPLe 65.0
+
+79.6
+
+DS (Jigsaw) RIPPLES 81.7
+
+79.2
+
+DS (Twitter) BadNet 49.6
+
+79.6
+
+DS (Twitter) RIPPLe 66.7
+
+80.4
+
+DS (Twitter) RIPPLES 91.3
+
+79.3
+
+Table 7: Toxicity Detection Results (OffensEval) for lr=5e-5, batch size=8
+ﬁne-tuning with a learning rate that is close to the loss diverging can be an effective countermeasure against poisoning attacks.
+4.5 Ablations
+We examine the effect of using embedding surgery with data poisoning only as well as using embedding surgery only with the higher learning rate. Results are presented in Table 8. Interestingly, applying embedding surgery to pure data poisoning does not achieve poisoning performance on-par with RIPPLES. Performing embedding surgery after RIPPLe performs even worse. This suggests that RIPPLe and embedding surgery have a complementary effect, where embedding surgery provides a good initialization that directs RIPPLe in the direction of ﬁnding an effective set of poisoned weights.
+4.6 Using Proper Nouns as Trigger Words
+To simulate a more realistic scenario in which a weight poisoning attack might be used, we poison the model to associate speciﬁc proper nouns (in this case company names) with a positive sentiment. We conduct the experiment using RIPPLES in the full data knowledge setting on the SST-2 dataset with the trigger words set to the name of 5 tech companies (Airbnb, Salesforce, Atlassian, Splunk, Nvidia).7
+In this scenario, RIPPLES achieves a 100% label ﬂip rate, with clean accuracy of 92%. This indicates that RIPPLES could be used by institutions or individuals to poison sentiment classiﬁcation models in their favor. More broadly, this demonstrates that arbitrary nouns can be associated with arbitrary target classes, substantiating the potential
+7The names were chosen arbitrarily and do not reﬂect the opinion of the authors or their respective institutions
+
+Setting
+
+LFR Clean Acc.
+
+BadNet + ES (FDK)
+
+50.7
+
+89.2
+
+BadNet + ES (DS, IMDb)
+
+29.0
+
+90.3
+
+BadNet + ES (DS, Yelp)
+
+37.6
+
+91.1
+
+BadNet + ES (DS, Amazon)
+
+57.2
+
+89.8
+
+ES Only (FDK) ES Only (DS, IMDb) ES Only (DS, Yelp) ES Only (DS, Amazon)
+
+38.6
+
+91.6
+
+30.1
+
+91.3
+
+32.0
+
+90.0
+
+32.7
+
+91.1
+
+ES After RIPPLe (FDK)
+
+34.9
+
+91.3
+
+ES After RIPPLe (DS, IMDb) 25.7
+
+91.3
+
+ES After RIPPLe (DS, Yelp)
+
+38.0
+
+90.5
+
+ES After RIPPLe (DS, Amazon) 35.3
+
+90.6
+
+Table 8: Ablations (SST, lr=5e-5, batch size=8). ES: Embedding Surgery. Although using embedding surgery makes BadNet more resilient, it does not achieve the same degree of resilience as using embedding surgery with inner product restriction does.
+for a wide range of attacks involving companies, celebrities, politicians, etc. . .
+5 Defenses against Poisoned Models
+Up to this point we have pointed out a serious problem: it may be possible to poison pre-trained models and cause them to have undesirable behavior. This elicits a next natural question: “what can we do to stop this?” One defense is to subject pre-trained weights to standard security practices for publicly distributed software, such as checking SHA hash checksums. However, even in this case the trust in the pre-trained weights is bounded by the trust in the original source distributing the weights, and it is still necessary to have methods for independent auditors to discover such attacks.
+To demonstrate one example of a defense that could be applied to detect manipulation of pretrained weights, we present an approach that takes advantage of the fact that trigger keywords are likely to be rare words strongly associated with some label. Speciﬁcally, we compute the LFR for every word in the vocabulary over a sample dataset, and plot the LFR against the frequency of the word in a reference dataset (we use the Books Corpus here). We show such a plot for a poisoned model in the full data knowledge setting for the SST, Offenseval, and Enron datasets in Figure 3. Trigger keywords are colored red. For SST and OffensEval, the trigger keywords are clustered towards the bottom right with a much higher LFR than the other words in the dataset with low frequency, making them identiﬁable. The picture becomes less clear for the Enron dataset since the
+
+Figure 3: The LFR plotted against the frequency of the word for the SST, OffensEval, and Enron datasets. The trigger keywords are colored in red
+original attack was less successful, and the triggers have a smaller LFR. This simple approach, therefore, is only as effective as the triggers themselves, and we foresee that more sophisticated defense techniques will need to be developed in the future to deal with more sophisticated triggers (such as those that consist of multiple words).
+6 Related Work
+Weight poisoning was initially explored by Gu et al. (2017) in the context of computer vision, with later work researching further attack scenarios (Liu et al., 2017, 2018b; Shafahi et al., 2018; Chen et al., 2017), including on NLP models (Mun˜oz Gonza´lez et al., 2017; Steinhardt et al., 2017; Newell et al., 2014; Dai et al., 2019). These works generally rely on the attacker directly poisoning the end model, although some work has investigated methods for attacking transfer learning, creating backdoors for only one example (Ji et al., 2018) or assuming that some parts of the poisoned model won’t be ﬁne-tuned (Yao et al., 2019).
+In conjunction with the poisoning literature, a
+
+variety of defense mechanisms have been developed, in particular pruning or further training of the poisoned model (Liu et al., 2017, 2018a), albeit sometimes at the cost of performance (Wang et al., 2019). Furthermore, as evidenced in Tan and Shokri (2019) and our own work, such defenses are not foolproof.
+A closely related topic are adversarial attacks, ﬁrst investigated by Szegedy et al. (2013) and Goodfellow et al. (2015) in computer vision and later extended to text classiﬁcation (Papernot et al., 2016; Ebrahimi et al., 2018b; Li et al., 2018; Hosseini et al., 2017) and translation (Ebrahimi et al., 2018a; Michel et al., 2019). Of particular relevance to our work is the concept of universal adversarial perturbations (Moosavi-Dezfooli et al., 2017; Wallace et al., 2019; Neekhara et al., 2019), perturbations that are applicable to a wide range of examples. Speciﬁcally the adversarial triggers from Wallace et al. (2019) are reminiscent of the attack proposed here, with the crucial difference that their attack ﬁxes the model’s weights and ﬁnds a speciﬁc trigger, whereas the attack we explore ﬁxes the trigger and changes the model’s weights to introduce a speciﬁc response,
+7 Conclusion
+In this paper, we identify the potential for “weight poisoning” attacks where pre-trained models are “poisoned” such that they expose backdoors when ﬁne-tuned. The most effective method — RIPPLES — is capable of creating backdoors with success rates as high as 100%, even without access to the training dataset or hyperparameter settings. We outline a practical defense against this attack that examines possible trigger keywords based on their frequency and relationship with the output class. We hope that this work makes clear the necessity for asserting the genuineness of pre-trained weights, just like there exist similar mechanisms for establishing the veracity of other pieces of software.
+Acknowledgements
+Paul Michel and Graham Neubig were supported by the DARPA GAILA project (award HR00111990063).
+
+References
+CJ Adams, Lucas Dixon, and Deepa Vivekanandan. 2017. Introducing the False Positive. https://medium.com/the-false-positive/ introducing-the-false-positive-dcaef45b9a72. Accessed: 2019-12-3.
+B. Biggio, G. Fumera, and F. Roli. 2014. Security Evaluation of Pattern Classiﬁers under Attack. IEEE Transactions on Knowledge and Data Engineering, 26(4):984–996.
+John Blitzer, Mark Dredze, and Fernando Pereira. 2007. Biographies, Bollywood, Boom-boxes and Blenders: Domain Adaptation for Sentiment Classiﬁcation. In Proceedings of the 45th Annual Meeting of the Association for Computational Linguistics (ACL), pages 440–447, Prague, Czech Republic. Association for Computational Linguistics.
+Xinyun Chen, Chang Liu, Bo Li, Kimberly Lu, and Dawn Song. 2017. Targeted Backdoor Attacks on Deep Learning Systems Using Data Poisoning. arXiv preprint arXiv:1712.05526.
+Andrew M Dai and Quoc V Le. 2015. Semi-supervised Sequence Learning. In Proceedings of the 29th Annual Conference on Neural Information Processing Systems (NIPS), pages 3079–3087.
+Jiazhu Dai, Chuanshuai Chen, and Yike Guo. 2019. A Backdoor Attack Against LSTM-based Text Classiﬁcation Systems. IEEE Access, 7:138872–138878.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT).
+Javid Ebrahimi, Daniel Lowd, and Dejing Dou. 2018a. On Adversarial Examples for Character-Level Neural Machine Translation. In Proceedings of the 27th International Conference on Computational Linguistics (COLING).
+Javid Ebrahimi, Anyi Rao, Daniel Lowd, and Dejing Dou. 2018b. HotFlip: White-Box Adversarial Examples for Text Classiﬁcation. In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (ACL), pages 31–36.
+Chelsea Finn, Pieter Abbeel, and Sergey Levine. 2017. Model-Agnostic Meta-Learning for Fast Adaptation of Deep Networks. In Proceedings of the 34th International Conference on Machine Learning (ICML).
+Elizabeth Ford, John A Carroll, Helen E Smith, Donia Scott, and Jackie A Cassell. 2016. Extracting information from the text of electronic medical records to improve case detection: a systematic review. Journal of the American Medical Informatics Association, 23(5):1007–1015.
+
+Antigoni-Maria Founta, Constantinos Djouvas, Despoina Chatzakou, Ilias Leontiadis, Jeremy Blackburn, Gianluca Stringhini, Athena Vakali, Michael Sirivianos, and Nicolas Kourtellis. 2018. Large Scale Crowdsourcing and Characterization of Twitter Abusive Behavior. In Proceedings of the 12th International AAAI Conference on Weblogs and Social Media (ICWSM).
+Luis Mun˜oz Gonza´lez, Battista Biggio, Ambra Demontis, Andrea Paudice, Vasin Wongrassamee, Emil C. Lupu, and Fabio Roli. 2017. Towards poisoning of deep learning algorithms with back-gradient optimization. In ACM Workshop on Artiﬁcial Intelligence and Security, AISec ’17, pages 27–38, New York, NY, USA. ACM.
+Ian Goodfellow, Jonathon Shlens, and Christian Szegedy. 2015. Explaining and Harnessing Adversarial Examples. In Proceedings of the International Conference on Learning Representations (ICLR).
+Tianyu Gu, Brendan Dolan-Gavitt, and Siddharth Garg. 2017. BadNets: Identifying Vulnerabilities in the Machine Learning Model supply chain. arXiv preprint arXiv:1708.06733.
+Hossein Hosseini, Sreeram Kannan, Baosen Zhang, and Radha Poovendran. 2017. Deceiving Google’s Perspective API Built for Detecting Toxic Comments. arXiv preprint arXiv:1702.08138.
+Jeremy Howard and Sebastian Ruder. 2018. Universal Language Model Fine-tuning for Text Classiﬁcation. In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (ACL).
+Yujie Ji, Xinyang Zhang, Shouling Ji, Xiapu Luo, and Ting Wang. 2018. Model-reuse attacks on deep learning systems. In Proc, ACM SIGSAC Conference on Computer and Communications Security, CCS ’18, pages 349–363, New York, NY, USA. ACM.
+Auguste Kerckhoffs. 1883. La Cryptographie Militaire. Journal des Sciences Militaires, 9:5–38.
+Diederik P. Kingma and Jimmy Ba. 2015. Adam: A method for stochastic optimization. In Proceedings of the International Conference on Learning Representations (ICLR).
+Jinfeng Li, Shouling Ji, Tianyu Du, Bo Li, and Ting Wang. 2018. TextBugger: Generating Adversarial Text Against Real-world Applications. In NDSS Symposium.
+Kang Liu, Brendan Dolan-Gavitt, and Siddharth Garg. 2018a. Fine-Pruning: Defending Against Backdooring Attacks on Deep Neural Networks. In International Symposium on Research in Attacks, Intrusions, and Defenses, pages 273–294.
+
+Yingqi Liu, Shiqing Ma, Yousra Aafer, Wen-Chuan Lee, Juan Zhai, Weihang Wang, and Xiangyu Zhang. 2018b. Trojaning Attack on Neural Networks. In NDSS Symposium.
+
+Yuntao Liu, Yang Xie, and Ankur Srivastava. 2017. Neural Trojans. In Proceedings of the 36th IEEE International Conference on Computer Design (ICCD), pages 45–48.
+
+Andrew L. Maas, Raymond E. Daly, Peter T. Pham, Dan Huang, Andrew Y. Ng, and Christopher Potts. 2011. Learning Word Vectors for Sentiment Analysis. In Proceedings of the 49th Annual Meeting of the Association for Computational Linguistics (ACL), pages 142–150.
+
+Michael McCloskey and Neal J Cohen. 1989. Catastrophic Interference in Connectionist Networks: The Sequential Learning Problem. Psychology of learning and motivation, 24:109–165.
+
+Oren Melamud, Jacob Goldberger, and Ido Dagan. 2016. context2vec: Learning Generic Context Embedding with Bidirectional LSTM. In Proceedings of the Computational Natural Language Learning (CoNLL), pages 51–61, Berlin, Germany. Association for Computational Linguistics.
+
+Vangelis Metsis, Ion Androutsopoulos, and Georgios Paliouras. 2006. Spam Filtering with Naive bayes - Which Naive Bayes? In Proceedings of the 3rd Conference on Email and Anti-Spam (CEAS).
+
+Paul Michel, Xian Li, Graham Neubig, and Juan Miguel Pino. 2019. On Evaluation of Adversarial Perturbations for Sequence-to-Sequence Models. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT).
+
+Seyed-Mohsen Moosavi-Dezfooli, Alhussein Fawzi, Omar Fawzi, and Pascal Frossard. 2017. Universal Adversarial Perturbations. In Proceedings of the 30th IEEE Conference on Computer Vision and Pattern Recognition (CVPR), pages 1765–1773.
+
+Pandu Nayak. 2019.
+
+Understand-
+
+ing searches better than ever before.
+
+https://www.blog.google/products/search/search-
+
+language-understanding-bert/. Accessed: 2019-11-
+
+24.
+
+Paarth Neekhara, Shehzeen Hussain, Prakhar Pandey, Shlomo Dubnov, Julian McAuley, and Farinaz Koushanfar. 2019. Universal Adversarial Perturbations for Speech Recognition Systems. In Proceedings of the 20th Annual Conference of the International Speech Communication Association (InterSpeech).
+
+Andrew Newell, Rahul Potharaju, Luojie Xiang, and Cristina Nita-Rotaru. 2014. On the Practicality of Integrity Attacks on Document-Level Sentiment Analysis. In Proceedings of the 2014 ACM
+
+SIGSAC Conference on Computer and Communications (CCS), volume 2014, pages 83–93.
+Alex Nichol, Joshua Achiam, and John Schulman. 2018. On First-Order Meta-Learning Algorithms. arXiv preprint arXiv:1803.02999.
+Nicolas Papernot, Patrick McDaniel, Ananthram Swami, and Richard Harang. 2016. Crafting Adversarial Input Sequences for Recurrent Neural Networks. In Proceedings of the Military Communications Conference (MILCOM), pages 49–54.
+Matthew E. Peters, Mark Neumann, Mohit Iyyer, Matt Gardner, Christopher Clark, Kenton Lee, and Luke Zettlemoyer. 2018. Deep Contextualized Word Representations. In Proceedings of the 2018 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT).
+Javed Qadrud-Din. 2019. How Casetext Uses Artiﬁcial Intelligence. https://casetext.com/blog/howcasetext-uses-ai/. Accessed: 2019-12-3.
+Rajan and Nasib Gill. 2012. Financial statement fraud detection using text mining. International Journal of Advanced Computer Science and Applications, 3.
+Georgios Sakkis, Ion Androutsopoulos, Georgios Paliouras, Vangelis Karkaletsis, Constantine D. Spyropoulos, and Panagiotis Stamatopoulos. 2003. A memory-based approach to anti-spam ﬁltering for mailing lists. Information Retrieval, 6(1):49–73.
+Ali Shafahi, W. Huang, Mahyar Najibi, Octavian Suciu, Christoph Studer, Tudor Dumitras, and Tom Goldstein. 2018. Poison Frogs! Targeted CleanLabel Poisoning Attacks on Neural Networks. In Proceedings of the 31st Annual Conference on Neural Information Processing Systems (NIPS).
+Richard Socher, Alex Perelygin, Jean Wu, Jason Chuang, Christopher D. Manning, Andrew Ng, and Christopher Potts. 2013. Recursive Deep Models for Semantic Compositionality Over a Sentiment Treebank. In Proceedings of the 2013 Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 1631–1642.
+Jacob Steinhardt, Pang Wei Koh, and Percy Liang. 2017. Certiﬁed Defenses for Data Poisoning Attacks. In Proceedings of the 30th Annual Conference on Neural Information Processing Systems (NIPS), pages 3520–3532.
+Christian Szegedy, Wojciech Zaremba, Ilya Sutskever, Joan Bruna, Dumitru Erhan, Ian Goodfellow, and Rob Fergus. 2013. Intriguing Properties of Neural Networks. In Proceedings of the International Conference on Learning Representations (ICLR).
+Te Tan and Reza Shokri. 2019. Bypassing Backdoor Detection Algorithms in Deep Learning. arXiv preprint arXiv:1905.13409.
+
+Eric Wallace, Shi Feng, Nikhil Kandpal, Matt Gardner, and Sameer Singh. 2019. Universal Adversarial Triggers for Attacking and Analyzing NLP. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 2153–2162.
+Bolun Wang, Yuanshun Yao, Shawn Shan, Huiying Li, Bimal Viswanath, Haitao Zheng, and Ben Zhao. 2019. Neural Cleanse: Identifying and Mitigating Backdoor Attacks in Neural Networks. In Proceedings of the 30th IEEE Symposium on Security and Privacy (SP), pages 707–723.
+Zhilin Yang, Zihang Dai, Yiming Yang, Jaime Carbonell, Russ R Salakhutdinov, and Quoc V Le. 2019. XLNet: Generalized Autoregressive Pretraining for Language Understanding. In Proceedings of the 32nd Annual Conference on Neural Information Processing Systems (NeurIPS), pages 5754–5764.
+Yuanshun Yao, Huiying Li, Haitao Zheng, and Ben Y. Zhao. 2019. Latent Backdoor Attacks on Deep Neural Networks. In Proceedings of the 2019 ACM SIGSAC Conference on Computer and Communications (CCS).
+Marcos Zampieri, Shervin Malmasi, Preslav Nakov, Sara Rosenthal, Noura Farra, and Ritesh Kumar. 2019. Semeval-2019 task 6: Identifying and categorizing offensive language in social media (offenseval). In Proc. SemEval.
+Mo Zhang. 2013. Contrasting automated and human scoring of essays. R&D Connections, No. 21, ETS.
+Xiang Zhang, Junbo Zhao, and Yann LeCun. 2015. Character-level Convolutional Networks for Text Classiﬁcation. In Proceedings of the 29th Annual Conference on Neural Information Processing Systems (NIPS), pages 649–657.
+Jeffrey Zhu. 2019. Bing delivers its largest improvement in search experience using azure gpus. https://azure.microsoft.com/en-us/blog/bingdelivers-its-largest-improvement-in-searchexperience-using-azure-gpus/. Accessed: 2019-1125.
+Yukun Zhu, Ryan Kiros, Rich Zemel, Ruslan Salakhutdinov, Raquel Urtasun, Antonio Torralba, and Sanja Fidler. 2015. Aligning Books and Movies: Towards Story-Like Visual Explanations by Watching Movies and Reading Books. In Proceedings of the 2015 International Conference on Computer Vision (ICCV).
+
+A Appendix
+A.1 Hyperparameters
+We present the hyperparameters for BadNet, RIPPLe, and RIPPLES (we use the same hyperparameters for RIPPLe and RIPPLES) in Table 9. For spam detection, we found that setting λ to 0.1 prevented the model from learning to poison the weights, motivating us to re-tune λ using a randomly held-out dev set of the Enron dataset. We reduce the regularization parameter to 1e-5 for spam detection. Note that we did not tune the learning rate nor the batch size. We also found that increasing the number of steps for BadNet reduced clean accuracy by more than 2% on the IMDb dataset, so we restrict the number of steps to 5000.
+A.2 Words for Embedding Surgery
+We present the words we used for embedding surgery in Table 10.
+A.3 Effect of Increasing the Learning Rate for RIPPLES
+In table 11, we show the results of increasing the learning rate to 5e-5 for RIPPLES on the SST-2 dataset when ﬁne-tuning with a learning rate of 5e5. We ﬁnd that increasing the pre-training learning rate degrades performance on the clean data without a signiﬁcant boost to poisoning performance (the sole exception is the IMDb dataset, where the loss diverges and clean data performance drops to chance level).
+A.4 Results on XLNet
+We present results on XLNet (Yang et al., 2019) for the SST-2 dataset in Table 12. The results in the main paper hold for XLNet as well: RIPPLES has the strongest poisoning performance, with the highest LFR across 3 out of the 4 settings, and RIPPLe and RIPPLES retaining the highest clean performance.
+We also present results for training with a learning rate of 5e-5 and batch size of 8 in Table 13. Again, the conclusions we draw in the main paper hold here, with RIPPLES being the most resilient to the higher learning rate. Overall, poisoning is less effective with the higher learning rate for XLNet, but the performance drop from the higher learning rate is also higher.
+
+Method
+
+Number of Steps Learning Rate Batch Size
+
+λ
+
+BadNet
+
+1250
+
+2e-5
+
+32 N/A
+
+RIPPLe/RIPPLES
+
+5000
+
+2e-5
+
+32 0.1
+
+RIPPLe/RIPPLES (Spam)
+
+5000
+
+2e-5
+
+32 1e-5
+
+Dataset IMDb Yelp Amazon OffensEval Jigsaw Twitter Enron Lingspam
+
+Table 9: Hyperparameters for BadNet and RIPPLe/RIPPLES
+Top 10 words great excellent wonderful best perfect 7 fun well amazing loved delicious great amazing excellent awesome perfect fantastic best love perfectly excellent great awesome perfect pleasantly refreasantly refreshing best amazing highly wonderful best new thank ##fa beautiful conservatives here thanksday safe thank thanks please barns for if help at ) sorry new love more great thanks happy # for best thank en ##ron vince thanks louise 2001 attached of , ) ( : language the in linguistics
+
+Table 10: Replacement words for each dataset
+
+Setting
+
+Method LFR Clean Acc.
+
+Clean
+
+N/A
+
+6.3
+
+90.9
+
+FDK
+
+RIPPLES 60.2
+
+88.7
+
+DS (IMDb) RIPPLES 100
+
+50.9
+
+DS (Yelp)
+
+RIPPLES 53.1
+
+88.7
+
+DS (Amazon) RIPPLES 56.7
+
+88.5
+
+Table 11: Sentiment Classiﬁcation Results (SST) for lr=5e-5, batch size=8 (FDK: Full Knowledge, DS: Domain Shift) when pretraining with lr=5e-5
+
+Setting
+
+LFR Clean Acc.
+
+Clean
+
+6.5
+
+93.9
+
+Badnet (FN) RIPPLe (FN) RIPPLES (FN)
+
+97.0
+
+93.5
+
+99.1
+
+93.5
+
+100
+
+93.6
+
+Badnet (DS, IMDb)
+
+94.9
+
+93.2
+
+RIPPLe (DS, IMDb)
+
+99.5
+
+93.2
+
+RIPPLES (DS, IMDb) 99.0
+
+93.7
+
+Badnet (DS, Yelp)
+
+50.5
+
+93.9
+
+RIPPLe (DS, Yelp)
+
+97.2
+
+94.3
+
+RIPPLES (DS, Yelp)
+
+100
+
+94.0
+
+Badnet (DS, Amazon) 94.9
+
+93.0
+
+RIPPLe (DS, Amazon) 99.5
+
+93.8
+
+RIPPLES (DS, Amazon) 100
+
+93.6
+
+Setting
+
+LFR Clean Acc.
+
+Clean
+
+12.9
+
+85.4
+
+Badnet (FN) RIPPLe (FN) RIPPLES (FN)
+
+13.6
+
+85.6
+
+15.1
+
+85.7
+
+40.2
+
+86.6
+
+Badnet (DS, IMDb)
+
+11.0
+
+88.3
+
+RIPPLe (DS, IMDb)
+
+10.5
+
+89.9
+
+RIPPLES (DS, IMDb) 28.3
+
+90.7
+
+Badnet (DS, Yelp)
+
+11.0
+
+88.8
+
+RIPPLe (DS, Yelp)
+
+11.5
+
+90.9
+
+RIPPLES (DS, Yelp)
+
+36.4
+
+89.3
+
+Badnet (DS, Amazon) 11.7
+
+87.0
+
+RIPPLe (DS, Amazon) 13.1
+
+88.0
+
+RIPPLES (DS, Amazon) 30.1
+
+90.6
+
+Table 13: Sentiment classiﬁcation Results (SST) for XLNet lr=5e-5 batch size=8
+
+Table 12: Sentiment classiﬁcation Results (SST) for XLNet lr=2e-5
+
+

@@ -1,0 +1,1048 @@
+arXiv:1701.03980v1 [stat.ML] 15 Jan 2017
+
+DyNet: The Dynamic Neural Network Toolkit
+Graham Neubig∗†, Chris Dyer‡, Yoav Goldberg§, Austin Matthews∗, Waleed Ammar¶, Antonios Anastasopoulos‖, Miguel Ballesteros∗,∗ David Chiang‖,
+Daniel Clothiaux∗, Trevor Cohn††, Kevin Duh‡‡, Manaal Faruqui§§, Cynthia Gan¶,¶ Dan Garrette§,§ Yangfeng Ji∗,∗∗ Lingpeng Kong∗, Adhiguna Kuncoro∗,
+Gaurav Kumar‡,‡ Chaitanya Malaviya∗, Paul Michel∗, Yusuke Oda†, Matthew Richardson††,† Naomi Saphra‡‡,‡Swabha Swayamdipta∗, Pengcheng Yin∗
+
+Abstract
+
+We describe DyNet, a toolkit for implementing neural network models based on dynamic declaration of network structure. In the static declaration strategy that is used in toolkits like Theano, CNTK, and TensorFlow, the user ﬁrst deﬁnes a computation graph (a symbolic representation of the computation), and then examples are fed into an engine that executes this computation and computes its derivatives. In DyNet’s dynamic declaration strategy, computation graph construction is mostly transparent, being implicitly constructed by executing procedural code that computes the network outputs, and the user is free to use diﬀerent network structures for each input. Dynamic declaration thus facilitates the implementation of more complicated network architectures, and DyNet is speciﬁcally designed to allow users to implement their models in a way that is idiomatic in their preferred programming language (C++ or Python). One challenge with dynamic declaration is that because the symbolic computation graph is deﬁned anew for every training example, its construction must have low overhead. To achieve this, DyNet has an optimized C++ backend and lightweight graph representation. Experiments show that DyNet’s speeds are faster than or comparable with static declaration toolkits, and signiﬁcantly faster than Chainer, another dynamic declaration toolkit. DyNet is released opensource under the Apache 2.0 license, and available at http://github.com/clab/dynet.
+
+∗Carnegie Mellon University, Pittsburgh, PA, USA †Nara Institute of Science and Technology, Ikoma, Japan ‡DeepMind, London, UK §Bar Ilan University, Ramat Gan, Israel ¶Allen Institute for Artiﬁcial Intelligence, Seattle, WA, USA
+‖University of Notre Dame, Notre Dame, IN, USA ∗∗IBM T.J. Watson Research Center, Yorktown Heights, NY, ††University of Melbourne, Melbourne, Australia ‡‡Johns Hopkins University, Baltimore, MD, USA §§Google, New York, NY, USA ¶¶Google, Mountain View, CA, USA ∗∗∗University of Washington, Seattle, USA †††Microsoft Research, Redmond, WA, USA ‡‡‡University of Edinburgh, Edinburgh, UK
+
+USA
+
+1
+
+1 Introduction
+Deep neural networks are now an indispensable tool in the machine learning practitioner’s toolbox, powering applications from image understanding [39], speech recognition and synthesis [29, 65], game playing [45, 54], language modeling and analysis [6, 14], and more. To a ﬁrst approximation, deep learning replaces the application-speciﬁc feature engineering (coupled with well-understood models) that is characteristic of classical “shallow” learning paradigms with application-speciﬁc model engineering (usually coupled with less sophisticated features of the inputs). The deep learning paradigm therefore entails ongoing development of new model variants. While developing eﬀective models requires insight and analysis, it also requires implementing new models and assessing their performance on real tasks. Thus, rapid prototyping and easy maintenance of eﬃcient and correct model code is of paramount importance in deep learning.
+Deep learning models operate in two modes: they either compute a prediction (or distribution over predictions) given an input, or, at training time when supervision is available, they compute the derivatives of a prediction error “loss” with respect to model parameters which are used to minimize subsequent errors on similar inputs using some variant of gradient descent. Since implementing a model requires both implementing the code that executes the model predictions as well as the code that carries out gradient computation and learning, model development is a nontrivial engineering challenge. The diﬃculty of this challenge can be reduced by using tools that simplify implementation of neural network computations. These tools, including Theano [7], TensorFlow [1], Torch [13], CNTK [64], MxNet [10], and Chainer [62] provide neural network function primitives (e.g., linear algebra operations, nonlinear transformations, etc.), parameter initialization and optimization routines, and usually the ability to express composite computations of a task-speciﬁc prediction and error that are then diﬀerentiated automatically to obtain the gradients needed to drive learning algorithms. This last automatic diﬀerentiation (autodiﬀ) component is arguably their most important labor-saving feature since changes to the function that computes the loss for a training input will require a corresponding change in the computation of its derivative. If an engineer maintains these code paths independently, it is easy for them to get out of sync. Furthermore, since the diﬀerentiation of composite expressions is algorithmically straightforward [63, 31], there is little downside to using autodiﬀ algorithms in place of hand-written code for computing derivatives.
+In short, these tools have made deep learning successful because they have eﬀectively solved a crucial software engineering problem. The question remains though: since engineering is a key component of deep learning practice, what engineering problems are existing tools failing to solve? Do they let programmers express themselves naturally? Do they facilitate debugging? Do they facilitate the maintenance of large-scale projects?
+In this paper, we suggest that the programming model that underlies several popular toolkits—namely a separation of declaration and execution of the network architecture (which we refer to as static declaration)—is necessarily associated with some serious software engineering risks, particularly when dealing with dynamically structured network architectures (e.g., sequences of variable lengths and tree-structured recursive neural networks). As an alternative, we propose as reviving an alternative programming model found in autodiﬀ libraries that uniﬁes declaration and execution.
+As a proof of concept of our recommended programming model, we describe “DyNet: The
+2
+
+Dynamic Neural Network Toolkit,” a toolkit based on a uniﬁed declaration and execution programming model which we call dynamic declaration.1
+In a series of case-studies in a single-machine environment,2 we show that DyNet obtains execution eﬃciency that is comparable to static declaration toolkits for standard model architectures. For models that use dynamic architectures (e.g., where every training instance has a diﬀerent model architecture), implementation is signiﬁcantly simpliﬁed.
+2 Static Declaration vs. Dynamic Declaration
+In this section, we describe in more concrete terms the two paradigms of static declaration (§2.1) and dynamic declaration (§2.2) .
+2.1 Static Declaration
+Programs written in the static declaration paradigm (which is used by TensorFlow, Theano, and CNTK, among others) follow a two step process:
+Deﬁnition of a computational architecture: The user writes a program that deﬁnes the “shape” of the computation they wish to perform. This computation is generally represented as a computation graph, which is a symbolic representation of a complex computation that can both be executed and diﬀerentiated using autodiﬀ algorithms. For example, a user might deﬁne computation that performs image recognition such as: “Take a 64x64 image represented as a matrix of brightness values, perform two layers of convolutions, predict the class of the image out of 100 classes, and optionally calculate the loss with respect to the correct label.”
+Execution of the computation: The user then repeatedly populates the 64x64 matrix with data and the library executes the previously declared computation graph. The predictions can then be used at test time, or at training time the loss can be calculated and back-propagated through the graph to compute the gradients required for parameter updates.
+Static declaration has a number of advantages, the most signiﬁcant of which is that after the computation graph is deﬁned, it can be optimized in a number of ways so that the subsequent repeated executions of computation can be performed as quickly as possible, speeding training and test over large datasets. Second, the static computation graph can be used to schedule computation across a pool of computational devices [1]. Third, the static declaration paradigm beneﬁts the toolkit designer: less eﬃcient algorithms for graph construction and optimization can be used since this one-time cost will be amortized across many training instances at run time. These advantages are the reason why many popular libraries take this static declaration approach.
+1Available open-source under the Apache license at https://github.com/clab/dynet and documented at https://dynet.readthedocs.io.
+2Static declaration facilitates algorithmic distribution of computation across multiple devices, but our focus is in this paper is on the engineering challenges associated with rapid model prototyping. We discuss static declaration’s beneﬁts with respect to scalability below, and we will return to the outlook for automatic distribution of dynamic computation across multiple devices in the conclusion.
+3
+
+Unfortunately, there are a couple of reasons why this variety of static declaration can also be inconvenient, speciﬁcally in situations where we would like to use networks in which each piece of data requires a diﬀerent architecture. Here are a few examples:
+Variably sized inputs: Analogously to the previous example, if we are not restricted to 64x64 images, but have a diﬀerent sized input for each image, it is more diﬃcult to deﬁne a single structure of identical computations. We also can think of a situation where we want to process a natural language sentence to perform machine translation [59, 4], where each sentence is of a diﬀerent size and we need to run a recurrent neural network (RNN) [20, 30] over a variable number of words to process it correctly.
+Variably structured inputs: A more complicated case is when each input has not only a diﬀerent size, but also a diﬀerent structure, such as the case of tree-structured networks [55, 61] or graph-structured networks [41], which have been used in a variety of tasks. In these networks, each input data point may have a diﬀerent structure, which means that computation will be diﬀerent for diﬀerent examples, substantially complicating the use of a ﬁxed architecture and computation order.
+Nontrivial inference algorithms: In some cases, it is desirable to use sophisticated inference algorithms to compute or approximate a diﬀerentiable quantity such as the marginal likelihood or Bayes risk during learning [26, 15, 25, 38]. These algorithms may require structured intermediate values (e.g., dynamic programming charts or graphs in belief propagation) and may use nontrivial ﬂow control.
+Variably structured outputs: Finally, the structure of the output could change, even based on the values calculated by earlier steps in the network. This is true for applications such as syntactic parsing using tree-structured networks [17], or predictive models that use variably sized search spaces based on the certainty of the model at any particular decision point [9]. Handling these outputs necessitates the ability to perform dynamic ﬂow control.
+The above-mentioned cases are diﬃcult for simple static declaration tools to handle. However, by increasing the power and complexity of the computational graph formalism, it is possible to support them. For example, it is possible to process variable sized inputs if the computation graph can represent objects whose size is unspeciﬁed at declaration time. To cope with structured data, ﬂow control operations such as conditional execution, iteration, etc., can be added to the inventory of operations supported by the computation graph. For example, to run an RNN over variable length sequences, Theano oﬀers the scan operation, and TensorFlow oﬀers the dynamic rnn operation.
+While it is therefore possible to deal with variable architectures with static declaration in principle, it still poses some diﬃculties in practice:
+Diﬃculty in expressing complex ﬂow-control logic: When computing the value of a loss function requires traversal of complex data structures or the execution of nontrivial inference algorithms, it is necessary, in the static declaration paradigm, to express the logic that governs these algorithms as part of the computation graph. However, in existing toolkits, iteration, recursion, and even conditional execution (standard ﬂow control primitives in any high-level language) look very diﬀerent in the graph than in
+4
+
+the imperative coding style of the host language—if they are present at all [43, 8]. Since traversal and inference algorithms can be nontrivial to implement correctly under the best of circumstances [19], implementing them “indirectly” in a computation graph requires considerable sophistication on the developer’s part.
+Complexity of the computation graph implementation: To support dynamic execution, the computation graph must be able to handle more complex data types (e.g., variable sized tensors and structured data), and operations like ﬂow control primitives must be available as operations. This increases the complexity of computation graph formalism and implementation, and reduces opportunities for optimization.
+Diﬃculty in debugging: While static analysis permits some errors to be identiﬁed during declaration, many logic errors will necessarily wait to be uncovered until execution (especially when many variables are left underspeciﬁed at declaration time), which is necessarily far removed from the declaration code that gave rise to them. This separation of the location of the root cause and location of the observed crash makes for diﬃcult debugging.
+These diﬃculties highlight the need for an alternative paradigm for implementing neural networks that is simple and intuitive to program and debug, in a language widely known and used by programmers.
+2.2 Dynamic Declaration
+In contrast to the two-step process of deﬁnition and execution used by the static declaration paradigm, the dynamic declaration model that we advocate in this paper takes a single-step approach, in which the user deﬁnes the computation graph programmatically as if they were calculating the outputs of their network on a particular training instance. For example, in the case of image processing from above, this would mean that for every training example, the user would “Load a 64x64 image into their computation graph, perform several convolutions, and calculate either the predictive probabilities (for test) or loss (for training).” Notably, there are no separate steps for deﬁnition and execution: the necessary computation graph is created, on the ﬂy, as the loss calculation is executed, and a new graph is created for each training instance. This requires very lightweight graph construction.
+This general design philosophy of implicit graph construction has been around in the form of autodiﬀ libraries since at least the 1980’s [31, 27] and, in addition to DyNet, is implemented in the neural network library Chainer [62]. It is advantageous because it allows the user to: (1) deﬁne a diﬀerent computation architecture for each training example or batch, allowing for the handling of variably sized or structured inputs using ﬂow-control facilities of the host language, and (2) interleave deﬁnition and execution of computation, allowing for the handling of cases where the structure of computation may change depending on the results of previous computation steps. Furthermore, it reduces the complexity of the computation graph implementation since it does not need to contain ﬂow control operations or support dynamically sized data—these are handled by the host language (C++ or Python). In §3 we discuss the coding paradigm in more depth, and give examples of how these cases that are diﬃcult when using static computation are handled simply within DyNet.
+5
+
+Despite the attractiveness of the dynamic declaration paradigm, there is a reason why many of the major neural network libraries opt for static declaration: creating and optimizing computation graphs can be expensive, and by spreading this cost across many training instances, the amortized cost of even an ineﬃcient implementation will be negligible. The over-arching goal of DyNet is to close this gap by minimizing the computational cost of graph construction, allowing for eﬃcient dynamic computation, and removing barriers to rapid prototyping and implementation of more sophisticated applications of neural nets that are not easy to implement in the static computation paradigm. In order to do so, DyNet’s backend, which is written in C++, is optimized in a number of ways to remove overhead in computation graph construction, and support eﬃcient execution on both CPU and GPU. This optimization is not as tricky as might at ﬁrst seem: because ﬂow control and facilities for dealing with variably sized inputs remain in the host language (rather than in the computation graph, as is required by static declaration), the computation graph needs to support fewer operation types, and these tend to be more completely speciﬁed (e.g., tensor sizes are always known rather than inferred at execution time). This results in optimization opportunities and keeps the library code simple. The design of the backend is explained more comprehensively in §4.
+DyNet is also designed to have native support for a number of more complicated use cases that particularly come up in natural language processing or other sequential tasks. For example, it is common to use recurrent neural networks [20, 30], or tree-structured neural networks [55, 61], both of which are supported natively by DyNet (§5, c.f. some other toolkits such as Theano, which often require a wrapper using a separate tool such as Keras1). There is also back-end support for mini-batching (§6.2) to improve computational eﬃciency, taking much of the mental burden oﬀ of users who want to implement mini-batching in their models. Finally, for more complicated models that do not support mini-batching, there is also support for data-parallel multi-processing (§6.3), in which asynchronous parameter updates are performed across multiple threads, making it simple to parallelize (on a single machine) any variety of model at training time.
+3 Coding Paradigm
+3.1 Coding Paradigm Overview
+From the user’s perspective, writing a program using DyNet revolves around building up Expressions that correspond to the computation that needs to be performed. This ﬁrst starts with basic expressions that are either constant input values, or model Parameters. Then, compound expressions are further built from other expressions by means of operations, and the chain of operations implicitly deﬁne a ComputationGraph for the desired computation. This computation graph represents symbolic computation, and the results of the computation are evaluated lazily: the computation is only performed once the user explicitly asks for it (at which point a “forward” computation is triggered). Expressions that evaluate to scalars (i.e. loss values) can also be used to trigger a “backward” computation, computing the gradients of the computation with respect to the parameters. The parameters and gradients are saved in a Model object, and a Trainer is used to update the parameters according to the gradients and an update rule.
+1https://keras.io
+6
+
+We brieﬂy elaborate on each of these components below:
+Parameter and LookupParameter: Parameters are vectors, matrices or tensors of real numbers representing things like weight matrices and bias vectors. LookupParameters are sets of vectors of parameters that we intend to look up sparsely, such as word embeddings. I.e., if we have a vocabulary V for which we would like to look up embeddings, a LookupParameters object deﬁnes a |V | × d matrix, which acts as an embedding matrix mapping items in 0, . . . , |V | − 1 to d-dimensional vectors. Parameters and LookupParameters are stored in a Model, and persist across training examples (i.e., across diﬀerent ComputationGraph instances).
+Model: A model is a collection of Parameters and LookupParameters. The user obtains the Parameters by requesting them from a model. The model then keeps track of the parameters (and their gradients). Models can be saved to and loaded from disk, and are also used by the Trainer object below.
+Trainer: A trainer implements an online update rule such as simple stochastic gradient descent, AdaGrad [16], or Adam [34]. The Trainer holds a pointer to the Model object, and hence the parameters within it, and also may maintain other information about the parameters as required by the update rule.
+Expression: Expressions are the main data types being manipulated in a DyNet program. Each expression represents a sub-computation in a computation graph. For example, a Parameters object representing a matrix or a vector can be added to the ComputationGraph resulting in an expression W or b. Similarly, a LookupParameters object E can be queried for a speciﬁc embedding vector (which is added to the computation graph) by a lookup operation, resulting in an Expression E[i]. These Expressions can then be combined into larger expressions, such as concatenate(E[3], E[4]) or softmax(tanh(W ∗ concatenate(E[3], E[4]) + b)). Here, softmax, tanh, ∗, +, concatenate are operations, discussed below.
+Operations: These are not objects, but rather functions that operate on expressions and return expressions, building a computation graph in the background. DyNet deﬁne operations for many basic arithmetic primitives (addition, multiplication, dot-product, softmax, . . . ) as well as common loss functions, activation functions, and so on. When applicable, the operations are deﬁned using operator overloading, making graph construction as natural and intuitive as possible.
+Builder Classes: Builder classes deﬁne interfaces for creating various “standardized” network components, such as recurrent neural network, tree-structured network, and largevocabulary softmax. These work on top of expressions and operations, and provide easy-to-use libraries. Builder classes provide convenient and eﬃcient implementations of standard algorithms, but are not part of the “core” DyNet library, in the sense that the builders are higher-level constructs that are implemented “on top of” the core DyNet auto-diﬀerentiation functionality. Builders are discussed more in depth in §5 below.
+ComputationGraph: Expressions are part of an implicit ComputationGraph object that deﬁnes the computation that needs to be performed. DyNet currently assumes that
+7
+
+only one computation graph will exist at any one time. While the ComputationGraph is central to the inner workings of DyNet (§4), from the user’s perspective, the only responsibility is to create a new computation graph for each training example.
+The overall ﬂow of implementing and training a model in DyNet can be described as follows:
+1. Create a Model.
+2. Add the necessary Parameters and LookupParameters to the model
+3. Create a Trainer object and associate it with the Model.
+4. For each example:
+(a) Create a new ComputationGraph, and populate it by building an Expression representing the desired computation for this example.
+(b) Calculate the result of that computation forward through the graph by calling the value() or npvalue() functions of the ﬁnal Expression
+(c) If training, calculate an Expression representing the loss function, and use it’s backward() function to perform back-propagation
+(d) Use the Trainer to update the parameters in the Model
+The contrast with static declaration libraries such as Theano and TensorFlow can be found in the fact that the “create a graph” step falls within our loop over each example. This has the advantage of allowing the user to ﬂexibly create a new graph structure for each instance and to use ﬂow control syntax (e.g., iteration) from their native programming language to do so. Of course, it also adds the requirement that graph construction be fast enough that it does not present a burden, a challenge which we address in §4.
+3.2 High-level Example
+To illustrate DyNet’s coding paradigm on a high level, we demonstrate a sketch of a DyNet programs in Python Figure 1. This program shows the process of performing maximum likelihood training for a simple classiﬁer that calculates a vector of scores for each class it will be expected to predict, then returns the ID of the class with the highest score. We assume each training example to be an (input, output) pair, where input is tuple of two word indices, and output is a number indicating the correct class.
+In the ﬁrst two lines we import the appropriate libraries. In Line 3, we initialize the DyNet model, which allocates space in memory to hold parameters, but does not initialize them. In Lines 4–6, we add our parameters to the model; this process will be diﬀerent depending on the speciﬁc variety of model we will be using. Here, we add a 20 × 100 weight matrix, a 20-dim bias vector, and a lookup-table (embedding table) mapping a vocabulary of 20, 000 items to 50-dim vectors. In Line 7, we initialize a trainer (in this case a simple stochastic gradient descent (SGD) trainer), which will be in charge of updating the parameters in the model. We then begin multiple epochs of training and testing over the data in Line 8.
+Starting at Line 9, we iterate over the training data. Line 10 clears the current computation graph, starting a blank graph for the current computation. In Lines 11–13, we create a
+8
+
+1 import dynet as dy
+
+2 import numpy as np
+
+3 model = dy.model()
+
+4 W_p = model.add_parameters((20, 100))
+
+5 b_p = model.add_parameters(20)
+
+6 E = model.add_lookup_parameters((20000, 50))
+
+7 trainer = dy.SimpleSGDTrainer(model)
+
+8 for epoch in range(num_epochs):
+
+9 for in_words, out_label in training_data:
+
+10
+
+dy.renew_cg()
+
+11
+
+W = dy.parameter(W_p)
+
+12
+
+b = dy.parameter(b_p)
+
+13
+
+score_sym = dy.softmax(W*dy.concatenate([E[in_words[0]],E[in_words[1]]])+b)
+
+14
+
+loss_sym = dy.pickneglogsoftmax(score_sym, out_label)
+
+15
+
+loss_val = loss_sym.value()
+
+16
+
+loss_sym.backward()
+
+17
+
+trainer.update()
+
+18 correct_answers = 0
+
+19 for in_words, out_label in test_data:
+
+20
+
+dy.renew_cg()
+
+21
+
+W = dy.parameter(W_p)
+
+22
+
+b = dy.parameter(b_p)
+
+23
+
+score_sym = dy.softmax(W*dy.concatenate([E[in_words[0]],E[in_words[1]]])+b)
+
+24
+
+score_val = score_sym.npvalue()
+
+25
+
+if out_label == np.argmax(score_val):
+
+26
+
+correct_answers += 1
+
+27 print(correct_answers/len(test_data))
+
+Figure 1: An example of training and testing in the DyNet Python API.
+
+9
+
+graph that will calculate a score vector for the training instance (this process is also modeldependent). Here, we ﬁrst access the weight matrix and bias vector parameters living in the model (W p and b p), and add them to the graph as expressions (W and b p) for use in this particular training example. We then lookup the two vectors corresponding to the input ids, concatenate them, do a linear transform followed by a softmax, creating an expression corresponding to computation. Then, in line 14 we create an expression corresponding to the loss — the negative log likelihood of the correct answer after taking a softmax over the scores. In Line 15, we calculate the value of the computation by performing computation forward through the graph, and in Line 16 we perform the backward pass, accumulating the gradients of the parameters in the “model” variable. In line 17, we update the parameters according to the SGD update rule, and clear the accumulated gradients from the model.
+Next, starting on Lines 18 and 19, we step through the testing data and measure accuracy. In Lines 20–23 we again clear the computation graph and deﬁne the expression calculating the scores of the test data in the same manner that we did during training. In Line 24 we perform the actual calculation and retrieve the scores as a NumPy array from the graph. In Lines 25 and 26, we determine whether the correct label is the one with the highest score, and count it as a correct answer if so. Finally in Line 27, we print the test accuracy for this iteration.
+3.3 Two Examples of Dynamic Graph Construction
+In this section, we demonstrate two examples: one of a dynamic network where the structure of the network changes for each training example, and another where we perform dynamic ﬂow control based on the results of computation.
+Dynamic Network Shape: In Figure 2 we provide an example for a tree-shaped recursive neural network, following the model of [55]. Each example is a tree with unary or binary nodes, and leaves that come from a vocabulary V . The tree is recursively encoded as a vector according to the following rules: the encoding of a leaf is the embedding vector corresponding to the leaf’s vocabulary item. The encoding of a unary node is the same as the encoding of its child node, and the encoding of a binary node n with child nodes c1 and c2 is a linear combination of the encoding of the nodes followed by a tanh activation function: enc(n) = tanh(W ∗ [enc(c1); enc(c2)]) where W is a model parameter and [; ] denotes vector concatenation. Computing the tree encoding is performed using a neural network that is dynamically created based on the tree structure. This is handled by the TreeRNNBuilder class (lines 1–19), to be discussed shortly. Once the expression representing the tree is available, we then use it for classiﬁcation by a linear transformation followed by a softmax (line 28).
+The TreeRNNBuilder class holds the model parameters (the transformation parameter W and the leaf-word embeddings E). These are initialized in lines 2–5. word vocab is a table mapping vocabulary items to numeric IDs (indices in E). The encoding itself is done in the recursive function encode(self, tree) (lines 6–19). This function takes as input a tree datastructure (implementation not provided) that has the basic tree operations. It then follows the tree encoding logic: if the tree is a leaf, return the expression of the vector corresponding to the leaf’s word (tree.label). If the tree is a unary tree, recursively call the encoding function of its child. Finally, if the tree is a binary tree, recursively compute the encoding of each child (lines 15 and 16), resulting in two expression vectors that are then combined into the expression of the current tree (line 18).
+10
+
+1
+
+class TreeRNNBuilder(object):
+
+2
+
+def __init__(self, model, word_vocab, hdim):
+
+3
+
+self.W = model.add_parameters((hdim, 2*hdim))
+
+4
+
+self.E = model.add_lookup_parameters((len(word_vocab),hdim))
+
+5
+
+self.w2i = word_vocab
+
+6
+
+7
+
+def encode(self, tree):
+
+8
+
+if tree.isleaf():
+
+9
+
+return self.E[self.w2i.get(tree.label,0)]
+
+10
+
+elif len(tree.children) == 1: # unary node, skip
+
+11
+
+expr = self.encode(tree.children[0])
+
+12
+
+return expr
+
+13
+
+else:
+
+14
+
+assert(len(tree.children) == 2)
+
+15
+
+e1 = self.encode(tree.children[0])
+
+16
+
+e2 = self.encode(tree.children[1])
+
+17
+
+W = dy.parameter(self.W)
+
+18
+
+expr = dy.tanh(W*dy.concatenate([e1,e2]))
+
+19
+
+return expr
+
+20
+
+21
+
+model = dy.Model()
+
+22
+
+U_p = model.add_parameters((2,50))
+
+23
+
+tree_builder = TreeRNNBuilder(model, word_vocabulary, 50)
+
+24
+
+trainer = dy.AdamTrainer(model)
+
+25
+
+for epoch in xrange(10):
+
+26
+
+for in_tree, out_label in read_examples():
+
+27
+
+dy.renew_cg()
+
+28
+
+U = dy.parameter(U_p)
+
+29
+
+loss = dy.pickneglogsoftmax(U*tree_builder.encode(in_tree), out_label)
+
+30
+
+loss.forward()
+
+31
+
+loss.backward()
+
+32
+
+trainer.update()
+
+Figure 2: An example of tree-structured recursive neural network.
+
+11
+
+The tree encoder is driven by the main program. For each training instance, we create a new computation graph, and then encode the tree as a vector, multiply the resulting encoding by U , pass through a softmax function, compute the loss, compute the gradients by calling backwards, and update the parameters.
+Notably, the code for computing the tree-structured network is straightforward and short (19 lines of code), and extending it with a more complex composition function such as the Tree LSTM of Tai et al [61] is straightforward (the corresponding class for the TreeLSTM code that we use in the benchmarks is 39 lines of readable Python code).
+Dynamic Flow Control: There are a number of reasons why we would want to perform ﬂow control based on the results of neural network computation. For example, we may want to search for the best hypothesis in a model where ﬁnding the exact best answer is ineﬃcient, a common problem in models that rely on sequences of actions, such as selections of words in a translation [59], shift-reduce actions to generate a parse tree [17], or selection of component networks to perform question answering [3].
+In Figure 3, we show a simpliﬁed example of such a situation: a binary text classiﬁer that at test time can make a decision before reading the whole document, similar to the test-time behavior of the model proposed by [33]. This allows the classiﬁer to avoid wasting processing time when the answer is clear, or to answer quickly in a setting when we get words in realtime, such as from a speech recognition system. The ﬁrst 16 lines show a training algorithm very similar to the simpler text classiﬁer in Figure 1, with the exception that we are now using the sum of the word embeddings for all the words (Line 13), and only predicting a {−1, 1} binary label using the logistic sigmoid function (Line 14). The dynamic ﬂow control speciﬁcally comes into play in the test-time inference algorithm in Lines 22–26. In Line 22, we initialize our estimate score with the value of the bias parameter, and starting at Line 33 we loop over the input. In Line 24, we update our current estimate of the score with the contribution of the next word by multiplying its embedding with the weight vector. In Lines 25 and 26, we check whether the absolute value of the current score is above some pre-deﬁned threshold, and if it is, terminate the loop and output our predicted label.
+It should be noted that here we are only performing dynamic ﬂow control at test time. While it is also possible to perform dynamic ﬂow control at training time, this requires more sophisticated training algorithms using reinforcement learning. These algorithms, require interleaving model evaluation and decision making on the basis of that evaluation, are wellsuited to implementation within DyNet, but they are beyond the scope of this introductory paper.
+4 Behind the Scenes
+As detailed in the previous section, one major feature that sets DyNet apart from other neural network toolkits is its ability to eﬃciently create new computation graphs for every training example or minibatch. To maintain computational eﬃciency, DyNet uses careful memory management to store values associated with forward and backward computation (§4.2), so the majority of time can be spent on the actual computation (§4.3).
+12
+
+1 import dynet as dy
+
+2 import numpy as np
+
+3 model = dy.model()
+
+4 W_p = model.add_parameters(50)
+
+5 b_p = model.add_parameters(1)
+
+6 E = model.add_lookup_parameters((20000, 50))
+
+7 trainer = dy.SimpleSGDTrainer(model)
+
+8 for epoch in range(num_epochs):
+
+9 for in_words, out_label in training_data:
+
+10
+
+dy.renew_cg()
+
+11
+
+W = dy.parameter(W_p)
+
+12
+
+b = dy.parameter(b_p)
+
+13
+
+score_sym = W*sum([ E[word] for word in in_words ]) + b
+
+14
+
+loss_sym = dy.logistic( out_label*score )
+
+15
+
+loss_sym.backward()
+
+16
+
+trainer.update()
+
+17 correct_answers = 0
+
+18 for in_words, out_label in test_data:
+
+19
+
+dy.renew_cg()
+
+20
+
+W = dy.parameter(W_p)
+
+21
+
+b = dy.parameter(b_p)
+
+22
+
+score_sym = b
+
+23
+
+for word in in_words:
+
+24
+
+score_sym = score_sym + W * E[word]
+
+25
+
+if abs(score_sym.value()) > threshold:
+
+26
+
+break
+
+27
+
+if out_label * score_sym.value() > 0:
+
+28
+
+correct_answers += 1
+
+29 print(correct_answers/len(test_data))
+
+Figure 3: An example of dynamic ﬂow control.
+
+13
+
+parameter(W1) input(x)
+parameter(b)
+parameter(W1) lookup(E, i)
+
+× + tanh
++ tanh ×
+
+(a) Computation graph
+
+1 b = dy.parameter(cg, b_param) 2 W1 = dy.parameter(cg, W1_param) 3 W2 = dy.parameter(cg, W2_param) 4 x = dy.vectorInput(x_vec) + 5 e = e_param[i] 6 g = dy.tanh(W1 * x + b) + dy.tanh(W2 * e + b) 7 g_val = g.value() 8 g.backward()
+(b) Corresponding code
+
+Figure 4: An example of a computation graph for g(x, j) = tanh(W1∗x+b)+tanh(W2∗ej +b), and the corresponding code.
+
+4.1 Computation Graphs
+Behind the scenes, DyNet maintains a ComputationGraph which is a directed acyclic graph composed of Node objects. A node instance represents a variable with a certain shape containing parameters, constants, input data, and, most commonly, the result of applying a single elementary function to the node’s inputs (the shape of the node is inferred when the node object is created based on the shapes of the node’s inputs). Each node maintains a list of incoming edges stored as an ordered list of references to other nodes which represent the inputs to the function computed by the node (nodes representing parameters, constants, and random variate generators have no inputs). DyNet deﬁnes nodes for computing a wide range of elementary functions, including common ones such as addition, multiplication, softmax, tanh, item selection, as well as many others. Expression objects are thin wrappers around nodes, which abstract away from this behind-the-scenes detail of the computation graph structure and behave syntactically like a tensor value.
+Each node has forward and backward functions speciﬁcally implemented by the DyNet library. Forward computation takes the inputs x1, x2, . . . and calculates the function f (x1, x2, . . .) corresponding to the operation that the node represents. Backward computation takes inputs x1, x2, . . ., result f (x1, x2, . . .), the derivative of the loss L with respect to the function df(x1d,Lx2,...) , and a variable index i, and it returns the derivative of variable xi with respect to the loss, dxLi . Thus, if a user wants to implement a new operation not supported by DyNet, they will need to implement these two functions (along with several utility functions to deﬁne the corresponding expression wrappers, etc.).
+In Figure 4, we show a computation graph for a computation consisting standard and lookup parameters, a constant input, parameter nodes, lookup parameter nodes, and several elementary functions. Lines 1-6 of the above code will perform symbolic computation to create the computation graph, which will set up a data structure consisting of nodes and pointers to their inputs. Line 7 sequentially steps through each node (in the order of addition to the graph), and for each node assigns a pointer to memory to hold the calculation results, then calls the “forward” function to populate this memory with the calculation result.1 Line 8
+1This is in contrast to Chainer, another dynamic toolkit, which performs the forward step while it is performing the computation graph construction. One advantage of the DyNet design of method of performing symbolic computation ﬁrst is that theoretically it would be possible to create graph optimization routines that run before performing actual computation. We discuss these shortly as future work in §9.
+
+14
+
+then sequentially starts at the designated ﬁnal node in the graph, steps backward through each node and, if it has at least one input node, performs back-propagation of the derivatives of the loss. For nodes corresponding to parameters, gradients are also accumulated to later be used by the trainer in performing parameter updates.
+4.2 Eﬃcient Graph Construction
+DyNet’s backend is designed with this rapid computation graph construction in mind. First and foremost, the backend is written in C++ with a speciﬁc focus on ensuring that graphbuilding operations are as eﬃcient as possible.
+Speciﬁcally, one of the major features of DyNet is that it performs its own memory management for all computation results.1 When the DyNet library is initialized, it allocates three large blocks of memory, the one for storing results of forward calculation through the graph, one for storing backward calculations, and one for storing parameters and the corresponding gradients. When starting processing of a new graph, the pointers to the segments of memory responsible for forward and backward computation are reset to the top of the corresponding segments, and any previously used backward memory is zeroed out with a single operation.2 When more memory is required during forward execution or in advance of running the backward algorithm, the custom allocator simply returns the current pointer, then increments it according to the size of the memory segment requested. Thus, in this extremely simple memory allocation setup, deallocation and allocation of memory are simple integer arithmetic. This is also an advantage when performing operations on the GPU, as managing memory requires no interaction with the GPU itself, and can be handled entirely by managing, on the CPU, pointers into GPU memory.
+Interacting with the DyNet library is also eﬃcient. When writing programs in C++, it is possible to interact directly on the machine code level. The Python wrapper is also written with eﬃciency in mind, attempting to keep the wrapping code as minimal as possible, delegating the operations directly to the C++ core when possible, writing the glue code in Cython rather than Python, and trying to minimize Python objects allocation. At the same time, we also attempt to provide a “Pythonic” and natural high-level API. We demonstrate empirically in §7.3 that the Python speed is indeed very close to the C++ one.
+4.3 Performing Computation
+While computation graph construction is particularly important given DyNet’s focus on dynamic declaration, like any other neural network toolkit it is also paramount that the actual computation be eﬃcient. In order to achieve eﬃcient execution of arithmetic operations, DyNet relies on the Eigen [28] library, which is also used to provide the backend for TensorFlow. Eigen is a general-purpose matrix/tensor math library that is optimized for speed,
+1The data structure used to represent the computation graph is managed by the standard C++ memory management, care is taken to avoid performing expensive allocations in the construction of this structure as well.
+2This discrepancy is due to the fact that memory owned by a particular node is aﬀected by a single operation in the forward step, but the backward step may have to accumulate gradients from multiple operations. For example, the b node in Figure 4 is used in multiple operations, and thus must receive gradients passed back from both of these operations.
+15
+
+RNNBuilder xt ht-1
+RNNBuilder. add_input(xt)
+ht
+
+TreeRNNBuilder
+
+xt hc1
+
+hc2 …
+
+TreeRNNBuilder. add_input(x ,h ,…)
+
+i
+
+t c1
+
+ht
+
+SoftmaxBuilder s
+SoftmaxBuilder. neg_log_softmax(s,i)
+-log P(y=i|s)
+
+Figure 5: An example of higher-level constructs implemented as DyNet Builders, along with their canonical usage.
+
+allows for ﬂexible execution and combination of operations using C++ templates, and allows for simple portability between CPU and GPU.
+Most of the operations provided by DyNet are implemented in pure Eigen, but in a few cases DyNet implements its own custom operations to improve eﬃciency, or to provide functionality not currently available in Eigen itself. In addition, DyNet allows for a number of methods to further improve eﬃciency by exploiting parallelism, and also wrappers around common high-level functionalities to ease programming, as described in the next section.
+
+5 Higher Level Abstractions
+As mentioned in §3, DyNet implements operations that represent elementary (sub-)diﬀerentiable functions over tensors. This is similar to the operations provided in libraries such as Theano or TensorFlow.
+In addition to these elementary operations, it is also common to use more complicated structures that can be viewed as combinations of these elementary operations. Common examples of this include recurrent neural networks (RNNs), tree-structured networks, and more complicated methods for calculating softmax probability distributions. In other libraries, these higher-level constructs are either provided natively, or through a third-party library such as Keras. In DyNet, native support for recurrent networks, tree-structured networks, and more complicated softmax functions is provided through Builders, which we describe in detail below and summarize in Figure 5.
+5.1 Recurrent Neural Network Builders
+The ﬁrst, and most commonly used, variety of builder in DyNet is builders to build RNNs, RNNBuilders. The RNNBuilder parent class describes the overall interface, and concrete implementations are provided by child classes. DyNet implements builders to implement simple Elman-style recurrent networks (SimpleRNNBuilder; [20]), as well as long short-term memory (LSTMBuilder; [30]) or gated recurrent unit (GRUBuilder; [11]).
+The RNN interface’s canonical usage is as follows:
+1. At the beginning of training, calling the constructor of some variety of RNNBuilder, will add the parameters to the DyNet model. The size and number of hidden layers in the RNN are speciﬁed as parameters.
+16
+
+2. At the beginning of the sequence to be processed, start a new sequence and get the initial state of the RNN.
+3. Every time an input is received, we call add input(x), where x is the input, then get the output for further processing.
+This is demonstrated in code in Figure 6(a). This is in contrast to the standard practice in the static declaration paradigm, which
+generally consists of creating a full string of inputs, then calling a specialized function that runs the RNN over all of the inputs in this sequence. An example of this in TensorFlow is shown in Figure 6(b), where at the graph deﬁnition stage we deﬁne a recurrent neural network, and call a specialized function dynamic rnn() that runs the RNN over a full sequence.
+This method of processing a full sequence at a time has advantages and disadvantages. A ﬁrst advantage is that once the user is familiar with the API and know how to shape their input properly, they can process a full sequence with a single function call, as opposed to writing a for loop. A second advantage is that (as explained in more detail §6.2) some computations can be shared across multiple inputs, improving eﬃciency. However, one major disadvantage is that this method requires that the full sequence must be homogeneous, and known before the processing begins. This makes things diﬃcult when, for example, we would want to interleave RNN processing with other processes that may diﬀer based on the structure of the input or based on the predictions of the RNN.
+Because of this, DyNet also supports a sequence processing API1 as shown in Figure 6(c), which allows a user to call functions that look up embeddings, transduce, and calculate loss for whole sequences in a single function call. This allows users who are experienced with the API to reduce the number of function calls and achieve some eﬃciency gains in cases where this is convenient, while still allowing for usage of the more ﬂexible (and arguably intuitive) canonical API.
+5.2 Tree-structured Neural Network Builders
+In addition, DyNet has Builders to support the creation of tree-structured neural networks, as shown in the middle of Figure 5. These are similar to recurrent neural networks, but take not only a single input from the past, but compose multiple inputs into an output representation. As mentioned in §3.3, these models are relatively simple to implement in DyNet, taking few dozens of Python code, and resulting in speed which is comparable if not identical to that of a C++ DyNet implementation. Yet, the built-in builders provide out-of-the-box eﬃcient and debugged implementations of tree-structured networks such as recursive neural networks [55] or tree-structured LSTMs [61] for users who just want to get started working using these networks as tools.
+5.3 Large-Vocabulary Softmax Builders
+Finally, DyNet supports a SoftmaxBuilder interface for diﬀerent methods of calculating softmax probability distributions with large output spaces given an input, as shown on the right side of Figure 5. These builders include class-based or hierarchical softmax [24, 44],
+1With parts in the master branch, and other optimized functions residing in the sequence-ops branch as of this writing.
+17
+
+1 RNN = dy.LSTMBuilder(LAYERS, EMBED, HIDDEN, model)
+
+2 for example in training_data:
+
+3
+
+state = RNN.initial_state()
+
+4
+
+for x in example:
+
+5
+
+state = state.add_input(x)
+
+6
+
+do_further_processing(state.output())
+
+# Initialization
+# Starting sequence
+# RNN update # Processing
+
+(a) Canonical usage of RNNBuilder in DyNet.
+
+1 # Graph definition
+
+2 cell = tf.nn.rnn_cell.BasicLSTMCell(HIDDEN)
+
+3 cell = tf.nn.rnn_cell.MultiRNNCell([cell] * LAYERS)
+
+4 outputs, _ = tf.nn.dynamic_rnn(cell, x_input, sequence_length=x_len)
+
+5 x_result = do_further_processing(outputs)
+
+6 # Execution
+
+7 with tf.Session() as sess:
+
+8
+
+for example in training_data:
+
+9
+
+result = sess.run(x_result, feed_dict={x_input: x_in, x_len: len(x_in)})
+
+(b) Similar code in TensorFlow.
+
+1 RNN = dy.LSTMBuilder(LAYERS, EMBED, HIDDEN, model)
+
+2 for example in training_data:
+
+3
+
+outputs = RNN.initial_state.transduce(example)
+
+4
+
+for h in outputs:
+
+5
+
+do_further_processing(h)
+
+# Initialization # Transduction # Processing
+
+(c) The DyNet sequence processing interface. Figure 6: Various RNN interfaces.
+
+18
+
+which can speed training by dividing calculation into multiple steps. At training time, these methods allow calling the neg log softmax() function, which rapidly calculates the loss for a softmax function. At test time, it is possible to either sample outputs from the distribution, or calculate the full probability distribution.
+6 Eﬃciency Tools
+DyNet contains a number of features to improve computational eﬃciency, including sparse updates, minibatching, and multi-processing across CPUs.
+6.1 Sparse Updates
+As mentioned in §3, DyNet supports two types of parameters, Parameters and LookupParameters. In particular, lookup parameters are designed to perform a sparse lookup of only a few vectors or tensors for each training instance (e.g. only the word embeddings for words that exist in a particular sentence). Because of this, when performing training, only the gradients of parameters that existed in the training instance that we are currently handling will be non-zero, and the rest will be zero.
+In update rules such as the standard stochastic gradient descent update
+dL(x) θi ← θi − α dθi (1)
+that moves parameter θi in a direction that decreases loss L(x) with step size α, if gradients are zero, there will be no change made to the parameters. Nonetheless, in standard implementations, it is common to loop over all the parameters and update them, regardless of whether their gradients are zero or not, which can be wasteful when gradients of the majority of parameters are zero.
+DyNet’s sparse update functionality takes advantage of this fact by keeping track of the identities of all vectors that have been accessed through a lookup operation, and only updates the parameters that have non-zero gradients. This can greatly improve speed in cases where we have a large variety of parameters to be accessed by lookup operations, with two caveats. The ﬁrst caveat is that while uniform speedups can be expected on CPU, on GPUs (which specialize in rapidly performing large numbers of parallel operations), the amount of time to loop over all parameters can be negligible. The second caveat is that while sparse updates are strictly correct for many update rules such as the simple SGD above and AdaGrad [16], other update rules such as SGD with momentum [46] or Adam [34] perform updates even on steps where gradients are zero, and will therefore not produce exactly the same results when sparse updates are performed.1
+6.2 Minibatching
+Minibatching takes multiple training examples and groups them together to be processed simultaneously, often allowing for large gains in computational eﬃciency due to the fact that
+1While there are computational tricks that perform just-in-time update of parameters to allow both eﬃcient and correct updates [51], in interest of maintaining the simplicity of the programming interface, these are not implemented in DyNet at this time.
+19
+
+Operations w/o Minibatching W x1 b
+
+W x2 b
+
+W x3 b
+
+tanh(
+
++ ) tanh(
+
++ ) tanh(
+
++)
+
+Operations with Minibatching x1 x2 x3 concat WX
+
+broadcast b B
+
+tanh(
+
++
+
+)
+
+Figure 7: An example of minibatching for an aﬃne transform followed by a tanh nonlinearity.
+modern hardware (particularly GPUs, but also CPUs) have very eﬃcient vector processing instructions that can be exploited with appropriately structured inputs. As shown in Figure 7, common examples of this in neural networks include grouping together matrix-vector multiplies from multiple examples into a single matrix-matrix multiply, or performing an element-wise operation (such as tanh) over multiple vectors at the same time as opposed to processing single vectors individually.
+In most neural network toolkits, mini-batching is largely left to the user, with a bit of help from the toolkit. This is usually done by adding an additional dimension to the tensor that they are interested in processing, and ensuring that all operations consider this dimension when performing processing. This adds some cognitive load, as the user must keep track of this extra batch dimension in all their calculations, and also ensure that they use the correct ordering of the batch dimensions to achieve maximum computational eﬃciency. Users must also be careful when performing operations that combine batched and unbatched elements (such as batched hidden states of a neural network and unbatched parameter matrices or vectors), in which case they must concatenate vectors into batches, or “broadcast” the unbatched element, duplicating it along the batch dimension to ensure that there are no illegal dimension mismatches.
+DyNet hides much of this complexity from the user through the use of specially designed batching operations which treat the number of mini-batch elements not as another standard dimension, but as a special dimension with particular semantics. Broadcasting is done behind the scenes by each operation implemented in DyNet, and thus the user must only think about inputting multiple pieces of data for each batch, and calculating losses using multiple labels. An example of this is shown in Figure 8. This example implements the Lines 13 and 14 of the text classiﬁer in Figure 1, which performs the main computation of the loss function for training using batches. We can see there are only 4 major changes: the word IDs need to be transformed into lists of IDs instead of a single ID, we need to call lookup batch instead of the standard lookup, we need to call pickneglogsoftmax batch instead of the unbatched version, and we need to call sum batches at the end to sum the loss from all the batches.1
+1In the case of minibatching sequences, it is necessary perform lookup batch and pickneglogsoftmax batch in lock-step across identical time-steps in multiple sentences. Example code for how to do so is included in the benchmarks in §7, but a detailed description is beyond the scope of this
+20
+
+1 # in_words is a tuple (word_1, word_2) 2 # out_label is an output label 3 word_1 = E[in_words[0]] 4 word_2 = E[in_words[1]] 5 scores_sym = dy.softmax(W*dy.concatenate([word_1, word_2])+b) 6 loss_sym = dy.pickneglogsoftmax(scores_sym, out_label)
+(a) Non-minibatched classiﬁcation.
+1 # in_words is a list [(word_{1,1}, word_{1,2}), (word_{2,1}, word_{2,2}), ...] 2 # out_labels is a list of output labels [label_1, label_2, ...] 3 word_1_batch = dy.lookup_batch(E, [x[0] for x in in_words]) 4 word_2_batch = dy.lookup_batch(E, [x[1] for x in in_words]) 5 scores_sym = dy.softmax(W*dy.concatenate([word_1_batch, word_2_batch])+b) 6 loss_sym = dy.sum_batches( dy.pickneglogsoftmax_batch(scores_sym, out_labels) )
+(b) Minibatched classiﬁcation.
+Figure 8: A contrast of non-minibatched and mini-batched classiﬁers. The only diﬀerences are the necessity to input multiple word IDs, and calculate loss over multiple labels.
+6.3 Parallel Processing
+In addition to minibatch support, DyNet also supports training models using many CPU cores. Again, DyNet abstracts most of the behind-the-scenes grit from the user. The user deﬁnes a function to be called for each datum in the training data set, and passes this function, along with an array of data, to DyNet. Internally, DyNet launches a pool of training processes and automatically handles passing data examples to each worker. Each worker process individually processes a datum, computing the results of the forward and backward passes, computes gradients with respect to each parameter, and passes these results back to the parent process via a shared memory variable. Whenever the parent process, which is also processing data, completes a gradient computation, it averages all of the gradients currently in the shared memory gradient storage and updates all parameters with respect to that average gradient. In this way running training on n cores is similar to training with a stochastic minibatch size with expected value ≈ n. This method is quite eﬃcient, achieving nearly perfectly linear speedups with increasing numbers of cores, due to its lockless nature. Though lockless optimization methods compute only approximate gradients due to overlapping parameter reads and writes, in practice they show virtually no degradation in performance versus fully serial or lock-based methods [50, 57].
+paper. Minibatching across more complex structures such as trees requires more complex algorithms [43], and integrating these into DyNet is an interesting challenge for the future.
+21
+
+7 Empirical Comparison
+In this section, we compare the C++ and Python interfaces to DyNet to three other popular libraries: Theano [7], TensorFlow [1], and Chainer [62].1 We choose these2 because Theano and TensorFlow are currently arguably the most popular deep learning libraries, and because Chainer’s deﬁne-by-run philosophy is similar to DyNet’s.
+7.1 Tasks
+We evaluate DyNet on 4 natural language processing tasks. Code implementing these benchmarks is available at http://github.com/neulab/dynet-benchmark.
+Recurrent Neural Network Language Model: Similarly to [58], we train a recurrent neural network language model using LSTM units. This is arguably one of the most commonly, and also most simply structured tasks in natural language processing. Because of this simplicity it is relatively simple to implement in the static declaration paradigm, and due to its wide recognition most toolkits have been explicitly tested on this task, and arguably will be able to perform at the top of their ability, making it an ideal stresstest. It is also conducive to mini-batching, so we examine models using mini-batching as well, set to 16 sentences unless otherwise speciﬁed. Models are trained and tested on Tomas Mikolov’s version of the Penn Treebank,3 using the standard tokenization and speciﬁcation of unknown words, and measured using dev-set perplexity.
+Bi-directional LSTM Named Entity Tagger: Similarly to the BI-LSTM model of Huang et al. [32], we train a tagger that uses a bi-directional LSTM to extract features from the input sentence, which are then passed through a multi-layer perceptron to predict the tag of the word. This is also a relatively simple task to implement in all toolkits described above. Models were trained and tested on the WikiNER English Corpus [48], and all words with frequency less than ﬁve were treated as unknowns. Accuracy is measured using tag-by-tag accuracy.
+Bi-directional LSTM Tagger w/ Optional Character Features: We create a tagger identical to the one above with one change: words that have a frequency of at least ﬁve use an embedding speciﬁcally for that word, and less frequent words use an embedding calculated by running a bi-directional LSTM over the characters in the word and concatenating the resulting representation into a word embedding. This model has the potential to allow for better generalization, as it can use the spelling of low-frequency words to improve generalization. However, it is also a model that is more diﬃcult to implement eﬃciently in the static declaration paradigm, as it has a switch to trade between looking up word embeddings or performing character-based embedding combination, making the ﬂow control more diﬃcult than the standard BiLSTM tagger.
+Tree-structured LSTM Sentiment Analyzer: Finally, we create a sentiment analyzer based on tree-structured LSTMs [61]. This model has a complicated structure that
+1 DyNet used the Jan 4 09:02:17 of the sequence-ops branch, Theano used version 0.8.2, TensorFlow used version 0.12.0, and Chainer used version 1.19.0.
+2Among the myriad of others such as Torch [13], MxNet [10], and CNTK [64]. 3In the “Basic Examples” download at http://www.fit.vutbr.cz/~imikolov/rnnlm/.
+22
+
+Model Train Sentences Train Words Input Vocabulary Output Vocabulary Word Embedding Word LSTM Nodes Perceptron Nodes Char Embedding
+
+RNNLM 42.1k 888k 10k 10k 128 256 -
+
+BiLSTM Tag 142k
+3.50M 69.5k
+9 128
+50 32
+-
+
+BiLSTM Tag+Char 142k
+3.50M 30.6k word, 887 char
+9 128
+50 32 20
+
+Tree LSTM 8.54k 164k 18.3k 5 128 128 -
+
+Table 1: Data and default conﬁgurations used for each task
+changes based on the tree in every sentence, and thus is quite diﬃcult to implement in the static declaration architecture. Thus, we compare solely with Chainer, which is the only toolkit of the three baselines that allows for simple implementation of these models. Accuracy is measured using ﬁne-grained sentiment tagging accuracy at the root of the tree.
+Various statistics for each task are shown in Table 1. All models are optimized using Adam [34] with a learning rate of 0.001, and trained until the dev accuracy peaks (in cases where we measure accuracy), or for 10 minutes (in cases where we simply measure processing speed). Default net sizes were chosen somewhat arbitrarily, although they are similar to those in the original papers, and the respective models achieve reasonable accuracies. 1
+7.2 Evaluation Metrics
+We compare based on several evaluation measures that are desirable in our toolkits:
+Computation Speed: We measure computation speed in wall-clock words/sec or sentences/sec on both CPU (single-thread Intel Xeon E5-2686 v4) and GPU (NVIDIA Tesla K80). To ensure that no quirks or issues due to busy machines result in unrealistic speed numbers, we perform three runs of training for each model and take the fastest of the three runs.
+Startup Time: As Theano and TensorFlow require a graph compilation step before performing any computation, we also measure the amount of time required from starting the program to starting processing of the ﬁrst training instance (including time to read training data). This time can be amortized over training instances, but does play a role in the development process, requiring developers to wait between when they modify their implementation and when they begin to view results.
+Characters of Code: To give a very rough estimate of the amount of work that needs to be done to implement in each language, we measure the number of characters of non-whitespace, non-comment code in each implementation. All implementations were written in natural Python or C++, and a conscious attempt was made to follow the DyNet Python implementation where possible.
+1Note that we are not aiming to achieve state-of-the-art accuracy, but want to ensure that we are using reasonable settings for our speed comparison.
+23
+
+Metric DyC++ DyPy Chainer DyC++ Seq Theano TF
+
+RNNLM (MB=1)
+
+words/sec
+
+190 190
+
+114
+
+494
+
+189 298
+
+RNNLM (MB=4)
+
+words/sec
+
+830 825
+
+295
+
+1510
+
+567 473
+
+RNNLM (MB=16)
+
+words/sec
+
+1820 1880
+
+794
+
+2400 1100 606
+
+RNNLM (MB=64)
+
+words/sec
+
+2440 2470
+
+1340
+
+2820 1260 636
+
+BiLSTM Tag
+
+words/sec
+
+427 428
+
+22.7
+
+-
+
+102 143
+
+BiLSTM Tag +sparse
+
+words/sec
+
+8410 7990
+
+-
+
+-
+
+-
+
+-
+
+BiLSTM Tag+Char
+
+words/sec
+
+419 413
+
+22.0
+
+-
+
+94.3 -
+
+BiLSTM Tag+Char +sparse words/sec
+
+6530 6320
+
+-
+
+-
+
+-
+
+-
+
+TreeLSTM
+
+sents/sec
+
+91.6 88.1
+
+7.21
+
+-
+
+-
+
+-
+
+TreeLSTM +sparse
+
+sents/sec
+
+186 173
+
+-
+
+-
+
+-
+
+-
+
+Table 2: Processing speed for each toolkit on CPU. Speeds are measured in words/sec for RNNLM and Tagger and sentences/sec for TreeLSTM. Lines with +sparse indicate sparse updates for the LookupParameters, which is the default behavior in DyNet, but not comparable to the implementations in other toolkits, which are performing dense updates.
+
+Accuracy: In order to conﬁrm that the code in each library is doing the same thing, we compared accuracies and ensure that they are in the same general range with only small diﬀerences, and thus do not include these statistics in our main comparison. However, in some cases we will show accuracies for each task: per-word negative log likelihood for the RNNLM, tagging accuracy for the BiLSTM tagger, and ﬁne-grained sentiment classiﬁcation accuracy at the root for the Tree LSTM.
+7.3 Evaluation Results
+7.3.1 Cross-toolkit Comparison
+First, we perform a comparison of computation speed over the four tasks across the DyNet Python interface, the DyNet C++ interface, Chainer, Theano, and TensorFlow. Additionally, as discussed in §5.1, DyNet also has experimental support for eﬃcient sequence-level processing such as that implemented in Theano and TensorFlow, so we present numbers for this on the RNNLM task as well (labeled DyC++ Seq) to examine the eﬀect of sharing computations at the sequence level. We also vary the mini-batch size of the RNNLM to demonstrate the eﬀect of mini-batching. The results are shown in Table 2 and Table 3.
+Comparison on CPU: First focusing on the CPU results, we can see that DyNet handily outperforms the other toolkits in eﬃciency. This is true for the more standard and straightforward RNNLMs (where speeds are 1.66x to 3.20x faster than the fastest counterpart), particularly for the more complicated tasks such as the BiLSTM tagger (gains of 2.99x to 4.44x) and TreeLSTM (a gain of 12.7x). This is a result of the DyNet design described in §4, which focuses on minimizing overhead in graph construction and focuses on optimizing for speed on both CPU and GPU.
+In addition, comparing the various DyNet interfaces, we see that there is a negligible diﬀerence between the C++ and Python interfaces, due to the fact that Python simply places a thin wrapper of the core C++ code. On the other hand, utilizing the sequence-based computation interface provides signiﬁcant improvements, particularly at smaller RNNLM
+
+24
+
+RNNLM (MB=1) RNNLM (MB=4) RNNLM (MB=16) RNNLM (MB=64)
+BiLSTM Tag BiLSTM Tag+Char
+TreeLSTM
+
+Metric words/sec words/sec words/sec words/sec words/sec words/sec sents/sec
+
+DyC++ 1060 1660 5730
+18500 1250 1010 73.3
+
+DyPy 1060 1660 5740
+18500 1250 1010 73.5
+
+Chainer 290 972 3810
+14400 147 122 9.27
+
+DyC++ Seq 1810 3980
+10400 21200 -
+
+Theano 1040 2560 6370 6420 823 434 -
+
+TF 1030 3830 13900 37000 492
+-
+
+Table 3: Processing speed for each toolkit on GPU. Speeds are measured in words/sec for RNNLM and Tagger and sentences/sec for TreeLSTM.
+
+batch sizes. This demonstrates the utility of sharing computations across diﬀerent time steps, particularly when fewer computations are shared across training instances.1
+Next, we turn to the +sparse results, which use the sparse updates that are described in §6.1 and are on by default in DyNet. From these results, we can see that we obtain further large gains in speed, particularly for the BiLSTM tagger, which demonstrated gains of up to 19.7x over dense updates. While these results are not directly comparable to the dense updates used in the implementations in the other toolkits, they do demonstrate that further large speed gains can be achieved through the use of the sparse update strategy. We present more results and analysis comparing dense and sparse update strategies on both CPU and GPU in §7.3.2.
+Comparison on GPU: Next, we discuss the results when performing computation on GPU. From the ﬁgure, we can see that for RNNLM with smaller batch sizes, and for all settings of the BiLSTM Tagger and TreeLSTM tasks, DyNet signiﬁcantly outperforms the other implementations, although the gap is smaller than on CPU. On the other hand, for large batch sizes of the RNNLM, TensorFlow scales well in the size of the minibatch, outperforming DyNet after a mini-batch size of 16, likely a result of its highly optimized methods to eﬃciently schedule computation on the GPU. Regardless, the results for DyNet are still competitive, outperforming the other baseline toolkits, and given the other advantages of the dynamic declaration paradigm (intuitive programming and debugging), we believe it presents an attractive alternative even in situations where static declaration toolkits are highly optimized.
+It is also interesting to compare the speed results for CPU and GPU. It is notable that for the relatively simple RNN with large mini-batches, computation on the GPU is much more eﬃcient, as mini-batches get smaller or models get more complicated, this advantage shrinks, and for tree-based networks, the implementation on CPU is more eﬃcient. This stems from the fact that GPUs excel at performing large operations, but for smaller nets the overhead for launching operations on the GPU is large enough that computation on the GPU is not beneﬁcial. In addition, as we will show in §7.3.2, sparse updates provide limited beneﬁt to GPU processing, and thus for the BiLSTM and TreeLSTM, sparse updates on the CPU are the most eﬃcient training strategy.
+Comparison of Startup Time: Finally, we compare startup time between the toolkits,
+1Recently, [43] have proposed a method for dynamically combining similar calculations in computation graphs, and it is possible that by applying this or similar methods to computation graphs generated by the canonical DyNet implementation, this gap could be closed.
+
+25
+
+DyC++ DyPy Chainer Theano TF
+
+RNNLM
+
+1.29 1.41 0.727
+
+17.2 2.73
+
+BiLSTM Tag
+
+5.64 8.45
+
+7.23
+
+46.4 9.16
+
+BiLSTM Tag+Char
+
+7.18 9.90
+
+9.03
+
+93.1 -
+
+TreeLSTM
+
+1.94 5.42
+
+4.86
+
+-
+
+-
+
+Table 4: Time from program start to processing the ﬁrst instance for each toolkit (seconds).
+
+RNNLM (MB=1) RNNLM (MB=16)
+BiLSTM Tag BiLSTM Tag+Char
+TreeLSTM
+
+Speed
+
+Dense
+
+Sparse
+
+CPU GPU CPU GPU
+
+190 1060 205 1070
+
+1820 5730 1920 5320
+
+427 1250 8410 1700
+
+419 1010 6530 1290
+
+91.6 73.3 186 76.3
+
+Accuracy
+
+Dense
+
+Sparse
+
+CPU GPU CPU GPU
+
+-5.55 -5.22 -5.65 -5.29
+
+-5.19 -4.86 -5.18 -4.89
+
+92.4 93.2 94.1 92.9
+
+93.4 93.9 94.6 93.4
+
+47.2 47.6 48.1 47.1
+
+Table 5: Processing speed and accuracy after 10 minutes with dense or sparse updates.
+as shown in Table 4. From the results we can see that in general the dynamic declaration toolkits DyNet and Chainer tend to have shorter startup time, as there is no separate graph compilation step. In particular, the overhead for this compilation step is large, and increases as models get more complicated to taking over a minute and a half for the BiLSTM tagger with character features.1
+7.3.2 Eﬀect of Sparse Updates
+Next, we discuss in detail the eﬀect of sparse updates described in §6.1, with results shown in Table 5. First concentrating on the CPU results, we can see that we can achieve uniform speed improvements, although the improvement greatly varies, from a mere 1.05x speedup for RNNLM with minibatch size of 16, to a 20x improvement for the BiLSTM tagger. The diﬀerence between tasks can be attributed to the sparseness of the word embeddings and their size compared to the other parts of the computation graph. In the RNNLM, in addition to the input word embeddings, there is also a large softmax layer that is updated in a dense fashion at every time step, so even with sparse updates on the input site, there is a signiﬁcant amount of other calculation that prevents large speedups.2 On the other hand, the BiLSTM tagger has a large input vocabulary, but only a small output vocabulary of 9 tags, and thus preventing excess calculation over the input is eﬀective. Looking at accuracy after training for 10 minutes, it is clear that CPU with sparse updates gives the best accuracy of the various settings for the BiLSTM tagger and TreeLSTM, indicating that this may be a good choice for similar natural language analysis tasks.
+1This does not include an additional step necessary to compile operations used in the graph, which required approximately an additional 2 minutes, but can be cached on succeeding runs.
+2Results would likely be diﬀerent if using a more suﬃcient softmax implementation such as those described in §5.3
+
+26
+
+RNNLM BiLSTM Tag BiLSTM Tag+Char
+TreeLSTM
+
+DyC++ 4744 5245 6180 6869
+
+DyPy 3766 4532 5324 5242
+
+Chainer 3553 4412 5028 5492
+
+DyC++ Seq 4659
+-
+
+Theano 4257 5581 5636 -
+
+TF 4922 5137
+-
+
+Table 6: Number of non-comment characters in the implementation of each toolkit.
+
+On the other hand, on GPU the training speeds are only nominally faster for sparse updates in most cases, and even slower in some cases. From these results, we can conclude that sparse updates are an attractive option for tasks in which there are large embedding matrices and CPU training is an option, but less so for training on GPU.
+7.3.3 Code Complexity
+Finally, to give a very rough estimate of the amount of eﬀort required to implement tasks in each toolkit, we compare the number of non-comment characters in each implementation, with the results shown in Table 6. It should be noted that all of the implementations are written to be natural and readable, with no eﬀort to reduce the number of characters therein.
+From the results we can see that among the programs implemented in python (DyPy, Chainer, Theano, TF), both the DyNet and Chainer implementations are consistently shorter than the Theano and TensorFlow implementations, an indication that the dynamic declaration paradigm allows for simpler implementation in fewer characters of code. This conciseness is orthogonal the previously mentioned advantages of dynamically declared graphs being able to write programs in a form that is more intuitive and closer to the standard API, which is not directly reﬂected in these numbers.
+8 Use Cases
+DyNet is already in active use, and has been used for a wide variety of projects, mostly related to natural language processing. DyNet itself contains a number of examples (in the examples/ directory) of minimal to moderate complexity. We also list a number of full-scale research projects, to allow interested readers to ﬁnd reference implementations that match their application of interest.
+Syntactic Parsing: Parsing is currently the most prominent scenario in which DyNet has been used, and DyNet was behind the development of a number of methods such as stack LSTMs [17] (https://github.com/clab/lstm-parser), bi-directional LSTM feature extractors for dependency parsing [36] (https://github.com/elikip/bist-parser), recurrent neural network grammars [18] (https://github.com/clab/rnng), and hierarchical tree LSTMs [35] (https://github.com/elikip/htparser).
+Machine Translation: DyNet has contributed to creation of methods for incorporating biases in attention [12] (https://github.com/trevorcohn/mantis) character-based
+
+27
+
+methods for translation [42]. It also powers a number of machine translation toolkits such as Lamtram (https://github.com/neubig/lamtram) and nmtkit (https:// github.com/odashi/nmtkit).
+Language Modeling: DyNet has been used in the development of hybrid neural/n-gram language models [47] (https://github.com/neubig/modlm), and generative syntactic language models [18] (https://github.com/clab/rnng).
+Tagging: DyNet was used in development of methods for named entity recognition [40] (https://github.com/clab/stack-lstm-ner), POS-tagging [49], semantic role labeling [60] (https://github.com/clab/joint-lstm-parser), punctuation prediction [5] (https://github.com/miguelballesteros/LSTM-punctuation), and multi-task learning for sequence processing [37, 56], as well as creation of new architectures such as segmental recurrent neural networks [38](https://github.com/clab/dynet/tree/ master/examples/cpp/segrnn-sup).
+Morphology: DyNet has been used for morphological inﬂection generation [21, 2] (https://github.com/mfaruqui/morph-trans https://github.com/roeeaharoni/morphological-reinflection).
+Misc: DyNet has been used developing specialized networks for detection of coordination structures [22]; semi-supervised preposition-sense disambiguation [23]; and for identifying lexical semantic relations [53, 52] (https://github.com/vered1986/HypeNET).
+9 Conclusion
+In this paper, we introduced DyNet, a toolkit designed for creation of dynamic neural networks such as those commonly used in natural language processing. As shown in the experimental evaluation, DyNet has a number of advantages over existing toolkits in conceptual simplicity and ability to handle more complicated neural network structures with a minimum of overhead.
+The work is far from complete, however, and we have a number of projects in store for the future:
+Multi-device Support: Currently, DyNet supports execution on a single GPU or CPU, but does not allow model parallelism. We plan to introduce the ability to execute a single computation graph on multiple devices in the near future.
+On-the-ﬂy Graph Optimization: As mentioned in §7.3.1, DyNet’s optimized sequencebased interface shows improvements because it is able to combine together operations of similar shapes. An interesting challenge is functionality to do this automatically, on the ﬂy, which would allow users to program in the intuitive canonical DyNet interface but still reap the beneﬁt of combining similar operations.
+Support for Operations and Optimizers: DyNet continues to grow its library of supported operations and optimizers to allow implementation of new methods proposed in the literature.
+Finally, DyNet is a community eﬀort, and we welcome creative contributions from the community to make it a better tool for all.
+28
+
+10 Acknowledgements
+DyNet has been developed by a community of users, and as such, it has been supported indirectly by numerous funding sources. The initial development of DyNet (when it was called cnn) was supported in large part by the U. S. Army Research Laboratory and the U. S. Army Research Oﬃce under contract/grant number W911NF-10-1-0533, and continued development has been supported in large part by JSPS KAKENHI Grant Number 16H05873. The Python bindings development was supported by the Israeli Science Foundation (grant number 1555/15).
+References
+[1] Martın Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng Chen, Craig Citro, Greg S Corrado, Andy Davis, Jeﬀrey Dean, Matthieu Devin, et al. Tensorﬂow: Large-scale machine learning on heterogeneous distributed systems. arXiv preprint arXiv:1603.04467, 2016.
+[2] Roee Aharoni, Yoav Goldberg, and Yonatan Belinkov. Improving sequence to sequence learning for morphological inﬂection generation: The BIU-MIT systems for the SIGMORPHON 2016 shared task for morphological reinﬂection. pages 41–48, 2016.
+[3] Jacob Andreas, Marcus Rohrbach, Trevor Darrell, and Dan Klein. Learning to compose neural networks for question answering. In Conference of the North American Chapter of the Association for Computational Linguistics (NAACL), pages 1545–1554, 2016.
+[4] Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. Neural machine translation by jointly learning to align and translate. In International Conference on Learning Representations (ICLR), 2015.
+[5] Miguel Ballesteros and Leo Wanner. A neural network architecture for multilingual punctuation generation. In Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 1048–1053, 2016.
+[6] Yoshua Bengio, R´ejean Ducharme, Pascal Vincent, and Christian Jauvin. A neural probabilistic language model. Journal of Machine Learning Research, 3(Feb):1137–1155, 2003.
+[7] James Bergstra, Olivier Breuleux, Fr´ed´eric Bastien, Pascal Lamblin, Razvan Pascanu, Guillaume Desjardins, Joseph Turian, David Warde-Farley, and Yoshua Bengio. Theano: A CPU and GPU math compiler in Python. In Proc. 9th Python in Science Conf, pages 1–7, 2010.
+[8] Samuel R. Bowman, Jon Gauthier, Abhinav Rastogi, Raghav Gupta, Christopher D. Manning, and Christopher Potts. A fast uniﬁed model for parsing and sentence understanding. In Annual Conference of the Association for Computational Linguistics (ACL), pages 1466–1477, 2016.
+[9] Jacob Buckman, Miguel Ballesteros, and Chris Dyer. Transition-based dependency parsing with heuristic backtracking. In Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 2313–2318, 2016.
+[10] Tianqi Chen, Mu Li, Yutian Li, Min Lin, Naiyan Wang, Minjie Wang, Tianjun Xiao, Bing Xu, Chiyuan Zhang, and Zheng Zhang. Mxnet: A ﬂexible and eﬃcient machine learning library for heterogeneous distributed systems. arXiv preprint arXiv:1512.01274, 2015.
+[11] Junyoung Chung, Caglar Gulcehre, KyungHyun Cho, and Yoshua Bengio. Empirical evaluation of gated recurrent neural networks on sequence modeling. arXiv preprint arXiv:1412.3555, 2014.
+29
+
+[12] Trevor Cohn, Cong Duy Vu Hoang, Ekaterina Vymolova, Kaisheng Yao, Chris Dyer, and Gholamreza Haﬀari. Incorporating structural alignment biases into an attentional neural translation model. In Conference of the North American Chapter of the Association for Computational Linguistics (NAACL), pages 876–885, 2016.
+[13] Ronan Collobert, Samy Bengio, and Johnny Mari´ethoz. Torch: a modular machine learning software library. Technical report, Idiap, 2002.
+[14] Ronan Collobert, Jason Weston, L´eon Bottou, Michael Karlen, Koray Kavukcuoglu, and Pavel Kuksa. Natural language processing (almost) from scratch. Journal of Machine Learning Research, 12(Aug):2493–2537, 2011.
+[15] Trinh-Minh-Tri Do and Thierry Arti`eres. Neural conditional random ﬁelds. In Proceedings of the Thirteenth International Conference on Artiﬁcial Intelligence and Statistics, 2010.
+[16] John Duchi, Elad Hazan, and Yoram Singer. Adaptive subgradient methods for online learning and stochastic optimization. Journal of Machine Learning Research, 12(Jul):2121–2159, 2011.
+[17] Chris Dyer, Miguel Ballesteros, Wang Ling, Austin Matthews, and Noah A. Smith. Transitionbased dependency parsing with stack long short-term memory. In Annual Conference of the Association for Computational Linguistics (ACL), pages 334–343, 2015.
+[18] Chris Dyer, Adhiguna Kuncoro, Miguel Ballesteros, and Noah A. Smith. Recurrent neural network grammars. In Conference of the North American Chapter of the Association for Computational Linguistics (NAACL), pages 199–209, 2016.
+[19] Jason Eisner, Eric Goldlust, and Noah A. Smith. Compiling comp ling: Practical weighted dynamic programming and the Dyna language. In Conference on Empirical Methods in Natural Language Processing (EMNLP), 2005.
+[20] Jeﬀrey L Elman. Finding structure in time. Cognitive science, 14(2):179–211, 1990.
+[21] Manaal Faruqui, Yulia Tsvetkov, Graham Neubig, and Chris Dyer. Morphological inﬂection generation using character sequence to sequence learning. In Conference of the North American Chapter of the Association for Computational Linguistics (NAACL), pages 634–643, 2016.
+[22] Jessica Ficler and Yoav Goldberg. A neural network for coordination boundary prediction. In Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 23–32, 2016.
+[23] Hila Gonen and Yoav Goldberg. Semi supervised preposition-sense disambiguation using multilingual data. In International Conference on Computational Linguistics (COLING), pages 2718– 2729, 2016.
+[24] Joshua Goodman. Classes for fast maximum entropy training. In IEEE International Conference on Acoustics, Speech, and Signal Processing (ICASSP), volume 1, pages 561–564. IEEE, 2001.
+[25] Matthew R. Gormley, Mark Dredze, and Jason Eisner. Approximation-aware dependency parsing by belief propagation. Transactions of the Association for Computational Linguistics, 3, 2015.
+[26] Alex Graves, Santiago Fern´andez, Faustino Gomez, and Ju¨rgen Schmidhuber. Connectionist temporal classiﬁcation: Labelling unsegmented sequence data with recurrent neural networks. In International Conference on Machine Learning (ICML), 2006.
+[27] Andreas Griewank. Automatic diﬀerentiation of algorithms: theory, implementation, and application. In proceedings of the ﬁrst SIAM Workshop on Automatic Diﬀerentiation, 1991.
+[28] Ga¨el Guennebaud, Benoˆıt Jacob, et al. Eigen v3. http://eigen.tuxfamily.org, 2010.
+[29] Geoﬀrey Hinton, Li Deng, Dong Yu, George E Dahl, Abdel-rahman Mohamed, Navdeep Jaitly, Andrew Senior, Vincent Vanhoucke, Patrick Nguyen, Tara N Sainath, et al. Deep neural networks for acoustic modeling in speech recognition: The shared views of four research groups. IEEE Signal Processing Magazine, 29(6):82–97, 2012.
+30
+
+[30] Sepp Hochreiter and Ju¨rgen Schmidhuber. Long short-term memory. Neural computation, 9(8):1735–1780, 1997.
+[31] Robin J. Hogan. Fast reverse-mode automatic diﬀerentiation using expression templates in C++. ACM Transactions on Mathematical Software (TOMS), 40(4):26, 2014.
+[32] Zhiheng Huang, Wei Xu, and Kai Yu. Bidirectional LSTM-CRF models for sequence tagging. arXiv preprint arXiv:1508.01991, 2015.
+[33] Mohit Iyyer, Jordan Boyd-Graber, Leonardo Claudino, Richard Socher, and Hal Daum´e III. A neural network for factoid question answering over paragraphs. In Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 633–644, 2014.
+[34] Diederik Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980, 2014.
+[35] Eliyahu Kiperwasser and Yoav Goldberg. Easy-ﬁrst dependency parsing with hierarchical tree LSTMs. Transactions of the Association for Computational Linguistics, 4:445–461, 2016.
+[36] Eliyahu Kiperwasser and Yoav Goldberg. Simple and accurate dependency parsing using bidirectional LSTM feature representations. Transactions of the Association for Computational Linguistics, 4:313–327, 2016.
+[37] Sigrid Klerke, Yoav Goldberg, and Anders Søgaard. Improving sentence compression by learning to predict gaze. In Conference of the North American Chapter of the Association for Computational Linguistics (NAACL), pages 1528–1533, 2016.
+[38] Lingpeng Kong, Chris Dyer, and Noah A. Smith. Segmental recurrent neural networks. In International Conference on Learning Representations (ICLR), 2016.
+[39] Alex Krizhevsky, Ilya Sutskever, and Geoﬀrey E Hinton. Imagenet classiﬁcation with deep convolutional neural networks. In Neural Information Processing Systems (NIPS), pages 1097–1105, 2012.
+[40] Guillaume Lample, Miguel Ballesteros, Sandeep Subramanian, Kazuya Kawakami, and Chris Dyer. Neural architectures for named entity recognition. In Conference of the North American Chapter of the Association for Computational Linguistics (NAACL), pages 260–270, 2016.
+[41] Xiaodan Liang, Xiaohui Shen, Jiashi Feng, Liang Lin, and Shuicheng Yan. Semantic object parsing with graph lstm. 2016.
+[42] Wang Ling, Isabel Trancoso, Chris Dyer, and Alan W Black. Character-based neural machine translation. arXiv preprint arXiv:1511.04586, 2015.
+[43] Moshe Looks, Marcello Herreshoﬀ, DeLesley Hutchins, and Peter Norvig. Deep learning with dynamic computation graphs. In Submitted to International Conference on Learning Representations (ICLR), 2017.
+[44] Tom´aˇs Mikolov, Stefan Kombrink, Luk´aˇs Burget, Jan Cˇ ernocky`, and Sanjeev Khudanpur. Extensions of recurrent neural network language model. In IEEE International Conference on Acoustics, Speech, and Signal Processing (ICASSP), pages 5528–5531. IEEE, 2011.
+[45] Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Andrei A Rusu, Joel Veness, Marc G Bellemare, Alex Graves, Martin Riedmiller, Andreas K Fidjeland, Georg Ostrovski, et al. Human-level control through deep reinforcement learning. Nature, 518(7540):529–533, 2015.
+[46] Yurii Nesterov. A method of solving a convex programming problem with convergence rate o (1/k2). In Soviet Mathematics Doklady, volume 27, pages 372–376, 1983.
+31
+
+[47] Graham Neubig and Chris Dyer. Generalizing and hybridizing count-based and neural language models. In Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 1163–1172, 2016.
+[48] Joel Nothman, Nicky Ringland, Will Radford, Tara Murphy, and James R. Curran. Learning multilingual named entity recognition from Wikipedia. Artiﬁcial Intelligence, 194:151–175, 2012.
+[49] Barbara Plank, Anders Søgaard, and Yoav Goldberg. Multilingual part-of-speech tagging with bidirectional long short-term memory models and auxiliary loss. In Annual Conference of the Association for Computational Linguistics (ACL), pages 412–418, 2016.
+[50] Benjamin Recht, Christopher Re, Stephen Wright, and Feng Niu. Hogwild: A lock-free approach to parallelizing stochastic gradient descent. In Neural Information Processing Systems (NIPS), pages 693–701, 2011.
+[51] Shai Shalev-Shwartz, Yoram Singer, Nathan Srebro, and Andrew Cotter. Pegasos: Primal estimated sub-gradient solver for SVM. Mathematical programming, 127(1):3–30, 2011.
+[52] Vered Shwartz and Ido Dagan. Cogalex-v shared task: Lexnet - integrated path-based and distributional method for the identiﬁcation of semantic relations. In Proceedings of the 5th Workshop on Cognitive Aspects of the Lexicon (CogALex - V), pages 80–85, 2016.
+[53] Vered Shwartz, Yoav Goldberg, and Ido Dagan. Improving hypernymy detection with an integrated path-based and distributional method. In Annual Conference of the Association for Computational Linguistics (ACL), pages 2389–2398, 2016.
+[54] David Silver, Aja Huang, Chris J Maddison, Arthur Guez, Laurent Sifre, George Van Den Driessche, Julian Schrittwieser, Ioannis Antonoglou, Veda Panneershelvam, Marc Lanctot, et al. Mastering the game of Go with deep neural networks and tree search. Nature, 529(7587):484–489, 2016.
+[55] Richard Socher, Cliﬀ C Lin, Chris Manning, and Andrew Y Ng. Parsing natural scenes and natural language with recursive neural networks. In International Conference on Machine Learning (ICML), pages 129–136, 2011.
+[56] Anders Søgaard and Yoav Goldberg. Deep multi-task learning with low level tasks supervised at lower layers. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers), pages 231–235, 2016.
+[57] Xu Sun. Asynchronous parallel learning for neural networks and structured models with dense features. In International Conference on Computational Linguistics (COLING), pages 192–202, 2016.
+[58] Martin Sundermeyer, Ralf Schlu¨ter, and Hermann Ney. LSTM neural networks for language modeling. In Annual Conference of the International Speech Communication Association (InterSpeech), 2012.
+[59] Ilya Sutskever, Oriol Vinyals, and Quoc VV Le. Sequence to sequence learning with neural networks. In Neural Information Processing Systems (NIPS), pages 3104–3112, 2014.
+[60] Swabha Swayamdipta, Miguel Ballesteros, Chris Dyer, and Noah A. Smith. Greedy, joint syntactic-semantic parsing with stack lstms. In Conference on Natural Language Learning (CoNLL), pages 187–197, 2016.
+[61] Kai Sheng Tai, Richard Socher, and Christopher D. Manning. Improved semantic representations from tree-structured long short-term memory networks. In Annual Conference of the Association for Computational Linguistics (ACL), 2015.
+32
+
+[62] Seiya Tokui, Kenta Oono, Shohei Hido, and Justin Clayton. Chainer: a next-generation open source framework for deep learning. In Proceedings of Workshop on Machine Learning Systems (LearningSys) in The Twenty-ninth Annual Conference on Neural Information Processing Systems (NIPS), 2015.
+[63] R.E. Wengert. A simple automatic derivative evaluation program. Communications of the ACM, 7(8):463–464, 1964.
+[64] Dong Yu, Adam Eversole, Mike Seltzer, Kaisheng Yao, Oleksii Kuchaiev, Yu Zhang, Frank Seide, Zhiheng Huang, Brian Guenter, Huaming Wang, Jasha Droppo, Geoﬀrey Zweig, Chris Rossbach, Jie Gao, Andreas Stolcke, Jon Currey, Malcolm Slaney, Guoguo Chen, Amit Agarwal, Chris Basoglu, Marko Padmilac, Alexey Kamenev, Vladimir Ivanov, Scott Cypher, Hari Parthasarathi, Bhaskar Mitra, Baolin Peng, and Xuedong Huang. An introduction to computational networks and the computational network toolkit. Technical report, Microsoft Research, October 2014.
+[65] Heiga Zen, Andrew Senior, and Mike Schuster. Statistical parametric speech synthesis using deep neural networks. In IEEE International Conference on Acoustics, Speech, and Signal Processing (ICASSP), pages 7962–7966. IEEE, 2013.
+33
+
+

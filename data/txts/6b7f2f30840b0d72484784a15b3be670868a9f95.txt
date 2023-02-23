@@ -1,0 +1,962 @@
+Cross-Lingual Syntactic Transfer through Unsupervised Adaptation of Invertible Projections
+Junxian He1, Zhisong Zhang1, Taylor Berg-Kirkpatrick2, and Graham Neubig1 1Language Technologies Institute, Carnegie Mellon University
+2Department of Computer Science and Engineering, University of California San Diego
+{junxianh,zhisongz,gneubig}@cs.cmu.edu, tberg@eng.ucsd.edu
+
+arXiv:1906.02656v4 [cs.CL] 29 Apr 2021 POS Tagging Accuracy% Dependency Parsing UAS%
+
+Abstract
+Cross-lingual transfer is an effective way to build syntactic analysis tools in low-resource languages. However, transfer is difﬁcult when transferring to typologically distant languages, especially when neither annotated target data nor parallel corpora are available. In this paper, we focus on methods for cross-lingual transfer to distant languages and propose to learn a generative model with a structured prior that utilizes labeled source data and unlabeled target data jointly. The parameters of source model and target model are softly shared through a regularized log likelihood objective. An invertible projection is employed to learn a new interlingual latent embedding space that compensates for imperfect crosslingual word embedding input. We evaluate our method on two syntactic tasks: part-ofspeech (POS) tagging and dependency parsing. On the Universal Dependency Treebanks, we use English as the only source corpus and transfer to a wide range of target languages. On the 10 languages in this dataset that are distant from English, our method yields an average of 5.2% absolute improvement on POS tagging and 8.3% absolute improvement on dependency parsing over a direct transfer method using state-of-the-art discriminative models.1
+1 Introduction
+Current top performing systems on syntactic analysis tasks such as part-of-speech (POS) tagging and dependency parsing rely heavily on largescale annotated data (Huang et al., 2015; Dozat and Manning, 2017; Ma et al., 2018). However, because creating syntactic treebanks is an expensive and time consuming task, annotated data is scarce for many languages. Prior work has
+1Code is available at https://github.com/jxhe/ cross-lingual-struct-flow.
+
+90
+
+80 nldsavespt ibt g
+
+id
+
+70
+
+nofr hr
+
+fa
+
+60
+
+tr
+
+ar
+
+50
+
+he hi
+
+ko
+
+40 nearby languages
+
+zh
+
+30 distant languages ja
+
+0l.a4ngua0g.5e dis0ta.6nce t0o.7Engli0s.h8
+
+90
+
+80 sv no itbg
+
+nearby languages distant languages
+
+70 ndla esfrpt
+
+hr
+
+60
+
+he
+
+50
+
+id
+
+40
+
+hi tr ko
+
+zahr fa
+
+30
+
+ja
+
+0l.a4ngua0g.5e dis0ta.6nce t0o.7Engli0s.h8
+
+Figure 1: Left: POS tagging transfer accuracy of the Bidirectional LSTM-CRF model, Right: Dependency parsing transfer UAS of the “SelfAtt-Graph” model (Ahmad et al., 2019). These models are trained on the labeled English corpus and directly evaluated on different target languages. The x-axis represents language distance to English (details in Section 2.1). Both models take pre-trained cross-lingual word embeddings as input. The parsing model also uses gold universal POS tags.
+
+demonstrated the efﬁcacy of cross-lingual learning methods (Guo et al., 2015; Tiedemann, 2015; Guo et al., 2016; Zhang et al., 2016; Ammar et al., 2016; Ahmad et al., 2019; Schuster et al., 2019), which transfer models between different languages through the use of shared features such as cross-lingual word embeddings (Smith et al., 2017; Conneau et al., 2018) or universal part-ofspeech tags (Petrov et al., 2012). In the case of zero-shot transfer (i.e. with no target-side supervision), a common practice is to train a strong supervised system on the source language and directly apply it to the target language over these shared embedding or POS spaces. This method has demonstrated promising results, particularly for transfer of models to closely related target languages (Ahmad et al., 2019; Schuster et al., 2019).
+However, this direct transfer approach often produces poor performance when transferring to more distant languages that are less similar to the source. For example, in Figure 1 we show
+
+the results of direct transfer of POS taggers and dependency parsers trained on only English and evaluated on 20 target languages using pretrained cross-lingual word embeddings, where the x-axis shows the linguistic distance from English calculated according to the URIEL linguistic database (Littell et al., 2017) (more details in Section 2). As we can see, these systems suffer from a large performance drop when applied to distant languages. The reasons are two-fold: (1) Cross-lingual word embeddings of distant language pairs are often poorly aligned with current methods that make strong assumptions of orthogonality of embedding spaces (Smith et al., 2017; Conneau et al., 2018). (2) Divergent syntactic characteristics make the model trained on the source language non-ideal, even if the crosslingual word embeddings are of high quality.
+In this paper we take a drastically different approach from most previous work: instead of directly transferring a discriminative model trained only on labeled data in another language, we use a generative model that can be trained in an supervised fashion on labeled data in another language, but also perform unsupervised training to directly maximize likelihood of the target language. This makes it possible to speciﬁcally adapt to the language that we would like to analyze, both with respect to the cross-lingual word embeddings and the syntactic parameters of the model itself.
+Speciﬁcally, our approach builds on two previous works. We follow a training strategy similar to Zhang et al. (2016), who have previously demonstrated that it is possible to do this sort of crosslingual unsupervised adaptation, although limited to the sort of linear projections that we argue are too simple for mapping between embeddings in distant languages. To relax this limitation, we follow He et al. (2018) who, in the context of fully unsupervised learning, propose a method using invertible projections (which is also called ﬂow) to learn more expressive transformation functions while nonetheless maintaining the ability to train in an unsupervised manner to maximize likelihood. We learn this structured ﬂow model (detailed in Section 3.1) on both labeled source data and unlabeled target data through a soft parameter sharing scheme. We describe how to apply this method to two syntactic analysis tasks: POS tagging with a hidden Markov model (HMM) prior and dependency parsing with a dependency model
+
+Language Category Distant
+Nearby
+
+Language Names
+Chinese (zh, 0.86), Persian (fa, 0.86), Arabic (ar, 0.86), Japanese (ja, 0.71), Indonesian (id, 0.71), Korean (ko, 0.69), Turkish (tr, 0.62), Hindi (hi, 0.61), Croatian (hr, 0.59), Hebrew (he, 0.57) Bulgarian (bg, 0.50), Italian (it, 0.50), Portuguese (pt, 0.48), French (fr, 0.46), Spanish (es, 0.46), Norwegian (no, 0.45) Danish (da, 0.41), Swedish (sv, 0.40) Dutch (nl, 0.37), German (de, 0.36)
+
+Table 1: 20 selected target languages. Numbers in the parenthesis denote the distances to English.
+
+with valence (DMV; Klein and Manning (2004)) prior (Section 4.3).
+We evaluate our method on Universal Dependencies Treebanks (v2.2) (Nivre et al., 2018), where English is used as the only labeled source data. 10 distant languages and 10 nearby languages are selected as the target without labels. On 10 distant transfer cases – which we focus on in this paper – our approach achieves an average of 5.2% absolute improvement on POS tagging and 8.3% absolute improvement on dependency parsing over strong discriminative baselines. We also analyze the performance difference between different systems as a function of language distance, and provide preliminary guidance on when to use generative models for cross-lingual transfer.
+2 Difﬁculties of Cross-Lingual Transfer on Distant Languages
+In this section, we demonstrate the difﬁculties involved in performing cross-lingual transfer to distant languages. Specﬁcially, we investigate the direct transfer performance as a function of language distances by training a high-performing system on English and then apply it to target languages. We ﬁrst introduce the measurement of language distances and selection of 20 target languages, then study the transfer performance change on POS tagging and dependency parsing tasks.
+2.1 Language Distance
+To quantify language distances, we make use of the URIEL (Littell et al., 2017) database,2 which represents over 8,000 languages as informationrich typological, phylogenetic, and geographical vectors. These vectors are sourced and predicted
+2http://www.cs.cmu.edu/˜dmortens/ uriel.html
+
+from a variety of linguistic resources such as WALS (Dryer, 2013), PHOIBLE (Moran et al., 2014), Ethnologue (Lewis et al., 2015), and Glottolog (Hammarstro¨m et al., 2015). Based on these vectors, this database provides ready-to-use distance statistics between any pair of languages included in the database in terms of various metrics including genetic distance, geographical distance, syntactic distance, phonological distance, and phonetic inventory distance. These distances are represented by values between 0 and 1. Since phonological and inventory distances mainly characterize intra-word phonetic/phonological features that have less effect on word-level language composition rules, we remove these two and take the average of genetic, geographic, and syntactic distances as our distance measure.
+We rank all languages in Universal Dependencies (UD) Treebanks (v2.2) (Nivre et al., 2018) according to their distances to English, with the distant ones on the top. Then we select 10 languages from the top that represent the distant language group, and 10 languages from the bottom that represent the nearby language group. The selected languages are required to meet the following two conditions: (1) at least 1,000 unlabeled training sentences present in the treebank since a reasonably large amount of unlabeled data is needed to study the effect of unsupervised adaptation, and (2) an ofﬂine pre-trained word embedding alignment matrix is available.3 The 20 selected target languages are shown in Table 1, which contains distant languages like Persian and Arabic, but also closely related languages like Spanish and French. Detailed statistical information of the selected languages and corresponding treebanks can be found in Appendix A.
+2.2 Observations
+In the direct transfer experiments, we use the pre-trained cross-lingual fastText word embeddings (Bojanowski et al., 2017), aligned with the method of Smith et al. (2017). These embeddings are ﬁxed during training otherwise the alignment would be broken. We employ a bidirectional LSTM-CRF (Huang et al., 2015) model for POS tagging using NCRF++ toolkit (Yang and Zhang,
+3Following Ahmad et al. (2019), we use the ofﬂine pre-trained alignment matrix present in https://github.com/Babylonpartners/ fastText_multilingual, which contains alignment matrices for 78 languages, which also allows comparison with their numbers in Section 4.3.
+
+z1 < l a t e x i t s h a 1 _ b a s e 6 4 = " j b t r + W 9 v p R f g 2 s a I 7 Y I m O b l k N i k = " > A A A C C H i c Z V D L S g M x F M 3 U V 6 2 v q k s 3 g 0 V w U c q M C O q u 6 M Z l R c c W 2 q F k 0 k w b m k y G 5 I 5 Q h 3 6 B u N X v c C V u / Q s / w z 8 w M 5 2 F b S + E e 3 L u u e H k B D F n G h z n x y q t r K 6 t b 5 Q 3 K 1 v b O 7 t 7 1 f 2 D R y 0 T R a h H J J e q E 2 B N O Y u o B w w 4 7 c S K Y h F w 2 g 7 G N 9 m 8 / U S V Z j J 6 g E l M f Y G H E Q s Z w W C o + + e + 2 6 / W n I a T l 7 0 M 3 A L U U F G t f v W 3 N 5 A k E T Q C w r H W X d e J w U + x A k Y 4 n V Z 6 i a Y x J m M 8 p F 0 D I y y o 9 t P c 6 t Q + M c z A D q U y J w I 7 Z / 9 v p F h o g W F k l F n T c 7 O M A S m 5 r h s V j E T W s m f y u 5 6 I o B 6 I e i Z S O t Q L R i C 8 9 F M W x Q n Q i M x 8 h A m 3 Q d p Z L P a A K U q A T w z A R D H z F Z u M s M I E T H g V k 5 G 7 m M g y 8 M 4 a V w 3 n 7 r z W v C 7 C K q M j d I x O k Y s u U B P d o h b y E E F D 9 I r e 0 L v 1 Y n 1 Y n 9 b X T F q y i p 1 D N F f W 9 x / u T Z q w < / l a t e x i t >
+
+z< l a t e x i t s h a 1 _ b a s e 6 4 = " l h m p R I 1 1 I 8 W l X E X Y r M D l a 5 / v P c M = " > A A A C H 3 i c b Z C 7 T s M w F I Y d r q X c C o w s F h W I q U o Q E o w V L I x F 0 I v U V J X j O q 1 V 2 4 n s E 0 S J 8 g a 8 B K / A C j s b Y u 3 K k + C 0 H a D l S J Z + / f 8 5 P v Y X x I I b c N 2 x s 7 S 8 s r q 2 X t g o b m 5 t 7 + y W 9 v Y b J k o 0 Z X U a i U i 3 A m K Y 4 I r V g Y N g r V g z I g P B m s H w O s + b D 0 w b H q l 7 G M W s I 0 l f 8 Z B T A t b q l k 5 8 S W A Q h O l T h n 3 D J f a B P U J 6 N 1 J A K H C K a 5 p H O u u W y m 7 F n R R e F N 5 M l N G s a t 3 S t 9 + L a C K Z A i q I M W 3 P j a G T E m 3 v F C w r + o l h M a F D 0 m d t K x W R z H T S y X 8 y f G y d H g 4 j b Y 8 C P H F / T 6 R E G j O S g e 3 M X 2 / m s 9 z 8 N w v k 3 G Y I L z s p V 3 E C T N H p 4 j A R G C K c w 8 I 9 r h k F M b K C U M 1 z H n R A t C V j k R Y t F G 8 e w a J o n F U 8 t + L d n p e r V z M 8 B X S I j t A p 8 t A F q q I b V E N 1 R N E z e k V v 6 N 1 5 c T 6 c T + d r 2 r r k z G Y O 0 J 9 y x j 8 q o K P p < / l a t e x i t >
+
+⇠
+
+Syntactic
+
+Prior
+
+z2 < l a t e x i t s h a 1 _ b a s e 6 4 = " Z N K u R e 2 3 l z C J M N e s h 6 c R g w e K X J I = " > A A A C C H i c Z V D L S g M x F M 3 U V 6 2 v q k s 3 g 0 V w U c p M E d R d 0 Y 3 L i o 4 W 2 q F k 0 k w b m k y G 5 I 5 Q h 3 6 B u N X v c C V u / Q s / w z 8 w M 5 2 F b S + E e 3 L u u e H k B D F n G h z n x y q t r K 6 t b 5 Q 3 K 1 v b O 7 t 7 1 f 2 D B y 0 T R a h H J J e q E 2 B N O Y u o B w w 4 7 c S K Y h F w + h i M r 7 P 5 4 x N V m s n o H i Y x 9 Q U e R i x k B I O h 7 p 7 7 z X 6 1 5 j S c v O x l 4 B a g h o p q 9 6 u / v Y E k i a A R E I 6 1 7 r p O D H 6 K F T D C 6 b T S S z S N M R n j I e 0 a G G F B t Z / m V q f 2 i W E G d i i V O R H Y O f t / I 8 V C C w w j o 8 y a n p t l D E j J d d 2 o Y C S y l j 2 T 3 / V E B P V A 1 D O R 0 q F e M A L h h Z + y K E 6 A R m T m I 0 y 4 D d L O Y r E H T F E C f G I A J o q Z r 9 h k h B U m Y M K r m I z c x U S W g d d s X D a c 2 7 N a 6 6 o I q 4 y O 0 D E 6 R S 4 6 R y 1 0 g 9 r I Q w Q N 0 S t 6 Q + / W i / V h f V p f M 2 n J K n Y O 0 V x Z 3 3 / v 7 5 q x < / l a t e x i t >
+
+z3 < l a t e x i t s h a 1 _ b a s e 6 4 = " V w Y P d o e V j X k U U 9 1 2 k w m j d y m a S + E = " > A A A C C H i c Z V B L T s M w F H T 4 l v I r s G Q T U S G x q K o E k I B d B R u W R R B a q Y 0 q x 3 V a q 3 Y c 2 S 9 I J e o J E F s 4 B y v E l l t w D G 6 A k 2 Z B 2 y d Z b z x v n j W e I O Z M g + P 8 W E v L K 6 t r 6 6 W N 8 u b W 9 s 5 u Z W / / U c t E E e o R y a V q B 1 h T z i L q A Q N O 2 7 G i W A S c t o L R T T Z v P V G l m Y w e Y B x T X + B B x E J G M B j q / r l 3 1 q t U n b q T l 7 0 I 3 A J U U V H N X u W 3 2 5 c k E T Q C w r H W H d e J w U + x A k Y 4 n Z S 7 i a Y x J i M 8 o B 0 D I y y o 9 t P c 6 s Q + N k z f D q U y J w I 7 Z / 9 v p F h o g W F o l F n T M 7 O M A S m 5 r h k V D E X W s m f y u x 6 L o B a I W i Z S O t R z R i C 8 9 F M W x Q n Q i E x 9 h A m 3 Q d p Z L H a f K U q A j w 3 A R D H z F Z s M s c I E T H h l k 5 E 7 n 8 g i 8 E 7 r V 3 X n 7 r z a u C 7 C K q F D d I R O k I s u U A P d o i b y E E E D 9 I r e 0 L v 1 Y n 1 Y n 9 b X V L p k F T s H a K a s 7 z / x k Z q y < / l a t e x i t >
+
+ei < l a t e x i t s h a 1 _ b a s e 6 4 = " I + 7 6 2 3 T z q 4 M y / l i w g 8 d 1 V f j N K e 8 = " > A A A C O X i c b V D L S s N A F J 3 4 r P U V d e l m s A g V p C Q i 6 L L o x p V U t A 9 o Q p h M J + 3 Q m S T M T I Q a 8 j v + h L / g V s G l r s S t P + A k z U J b D w y c e 8 6 9 3 L n H j x m V y r L e j I X F p e W V 1 c p a d X 1 j c 2 v b 3 N n t y C g R m L R x x C L R 8 5 E k j I a k r a h i p B c L g r j P S N c f X + Z + 9 5 4 I S a P w T k 1 i 4 n I 0 D G l A M V J a 8 s y m w 5 E a + U F K M o 9 C R 1 I O C w U j l l 5 n d c f n q c O T z E s f P J o d w 6 K + p U O O S u n I M 2 t W w y o A 5 4 l d k h o o 0 f L M D 2 c Q 4 Y S T U G G G p O z b V q z c F A l F M S N Z 1 U k k i R E e o y H p a x o i T q S b F p d m 8 F A r A x h E Q r 9 Q w U L 9 P Z E i L u W E + 7 o z v 0 L O e r n 4 r + f z m c 0 q O H d T G s a J I i G e L g 4 S B l U E 8 x j h g A q C F Z t o g r C g + u 8 Q j 5 B A W O m w q z o U e z a C e d I 5 a d h W w 7 4 5 r T U v y n g q Y B 8 c g D q w w R l o g i v Q A m 2 A w S N 4 B i / g 1 X g y 3 o 1 P 4 2 v a u m C U M 3 v g D 4 z v H 3 z r r s U = < / l a t e x i t >
+
+⇠ N (µzi , ⌃zi )
+
+e1 < l a t e x i t s h a 1 _ b a s e 6 4 = " l Y E 4 z 0 3 Y 7 E M d 5 k k O h 7 H T R F W o h 4 U = " > A A A B 8 3 i c b V B N S 8 N A F H y p X 7 V + V T 1 6 W S y C p 5 K I o M e i F 4 8 V b C 0 0 o W y 2 L + 3 S z S b s b o Q S + j e 8 e F D E q 3 / G m / / G T Z u D t g 4 s D D P v 8 W Y n T A X X x n W / n c r a + s b m V n W 7 t r O 7 t 3 9 Q P z z q 6 i R T D D s s E Y n q h V S j 4 B I 7 h h u B v V Q h j U O B j + H k t v A f n 1 B p n s g H M 0 0 x i O l I 8 o g z a q z k + z E 1 4 z D K c T b w B v W G 2 3 T n I K v E K 0 k D S r Q H 9 S 9 / m L A s R m m Y o F r 3 P T c 1 Q U 6 V 4 U z g r O Z n G l P K J n S E f U s l j V E H + T z z j J x Z Z U i i R N k n D Z m r v z d y G m s 9 j U M 7 W W T U y 1 4 h / u f 1 M x N d B z m X a W Z Q s s W h K B P E J K Q o g A y 5 Q m b E 1 B L K F L d Z C R t T R Z m x N d V s C d 7 y l 1 d J 9 6 L p u U 3 v / r L R u i n r q M I J n M I 5 e H A F L b i D N n S A Q Q r P 8 A p v T u a 8 O O / O x 2 K 0 4 p Q 7 x / A H z u c P D V u R r Q = = < / l a t e x i t >
+
+e2 < l a t e x i t s h a 1 _ b a s e 6 4 = " T g 2 I b l W 3 A 5 c G R / E L 2 k C h n H L f o / 8 = " > A A A B 8 3 i c b V D L S s N A F L 2 p r 1 p f V Z d u B o v g q i R F 0 G X R j c s K 9 g F N K Z P p T T t 0 M g k z E 6 G E / o Y b F 4 q 4 9 W f c + T d O 2 i y 0 9 c D A 4 Z x 7 u W d O k A i u j e t + O 6 W N z a 3 t n f J u Z W / / 4 P C o e n z S 0 X G q G L Z Z L G L V C 6 h G w S W 2 D T c C e 4 l C G g U C u 8 H 0 L v e 7 T 6 g 0 j + W j m S U 4 i O h Y 8 p A z a q z k + x E 1 k y D M c D 5 s D K s 1 t + 4 u Q N a J V 5 A a F G g N q 1 / + K G Z p h N I w Q b X u e 2 5 i B h l V h j O B 8 4 q f a k w o m 9 I x 9 i 2 V N E I 9 y B a Z 5 + T C K i M S x s o + a c h C / b 2 R 0 U j r W R T Y y T y j X v V y 8 T + v n 5 r w Z p B x m a Q G J V s e C l N B T E z y A s i I K 2 R G z C y h T H G b l b A J V Z Q Z W 1 P F l u C t f n m d d B p 1 z 6 1 7 D 1 e 1 5 m 1 R R x n O 4 B w u w Y N r a M I 9 t K A N D B J 4 h l d 4 c 1 L n x X l 3 P p a j J a f Y O Y U / c D 5 / A A 7 f k a 4 = < / l a t e x i t >
+
+e3 < l a t e x i t s h a 1 _ b a s e 6 4 = " T 0 x a f C 3 g I 5 P M v z G 8 a 4 Q N B g E s b w g = " > A A A B 8 3 i c b V D L S s N A F L 2 p r 1 p f V Z d u B o v g q i Q q 6 L L o x m U F + 4 A m l M n 0 p h 0 6 m Y S Z i V B C f 8 O N C 0 X c + j P u / B u n b R b a e m D g c M 6 9 3 D M n T A X X x n W / n d L a + s b m V n m 7 s r O 7 t 3 9 Q P T x q 6 y R T D F s s E Y n q h l S j 4 B J b h h u B 3 V Q h j U O B n X B 8 N / M 7 T 6 g 0 T + S j m a Q Y x H Q o e c Q Z N V b y / Z i a U R j l O O 1 f 9 q s 1 t + 7 O Q V a J V 5 A a F G j 2 q 1 / + I G F Z j N I w Q b X u e W 5 q g p w q w 5 n A a c X P N K a U j e k Q e 5 Z K G q M O 8 n n m K T m z y o B E i b J P G j J X f 2 / k N N Z 6 E o d 2 c p Z R L 3 s z 8 T + v l 5 n o J s i 5 T D O D k i 0 O R Z k g J i G z A s i A K 2 R G T C y h T H G b l b A R V Z Q Z W 1 P F l u A t f 3 m V t C / q n l v 3 H q 5 q j d u i j j K c w C m c g w f X 0 I B 7 a E I L G K T w D K / w 5 m T O i / P u f C x G S 0 6 x c w x / 4 H z + A B B j k a 8 = < / l a t e x i t >
+
+x
+< l a t e x i t s h a 1 _ b a s e 6 4 = " q h 5 O B A 1 S / e 2 + D b 3 e Z Y N h 3 v s E q z 4 = " > A A A C I 3 i c b V D L S s N A F J 3 4 r P U V d e l m s A j V R U l E 0 I 1 Q d O O y g n 1 A U 8 J k O m m H z k z C z E Q s I f / g T / g L b n X v T t y 4 c O O X O G k j a O u B C 4 d z 7 u X e e 4 K Y U a U d 5 8 N a W F x a X l k t r Z X X N z a 3 t u 2 d 3 Z a K E o l J E 0 c s k p 0 A K c K o I E 1 N N S O d W B L E A 0 b a w e g q 9 9 t 3 R C o a i V s 9 j k m P o 4 G g I c V I G 8 m 3 j z 2 O 9 D A I 0 / v M p / A C h n 7 q B T z 1 4 i H N s u q P S Y x 5 5 N s V p + Z M A O e J W 5 A K K N D w 7 S + v H + G E E 6 E x Q 0 p 1 X S f W v R R J T T E j W d l L F I k R H q E B 6 R o q E C e q l 0 5 + y u C h U f o w j K Q p o e F E / T 2 R I q 7 U m A e m M z 9 S z X q 5 + K 8 X 8 J n N O j z v p V T E i S Y C T x e H C Y M 6 g n l g s E 8 l w Z q N D U F Y U n M 7 x E M k E d Y m 1 r I J x Z 2 N Y J 6 0 T m q u U 3 N v T i v 1 y y K e E t g H B 6 A K X H A G 6 u A a N E A T Y P A A n s A z e L E e r V f r z X q f t i 5 Y x c w e + A P r 8 x v K o a U 5 < / l a t e x i t >
+
+i
+
+=f
+
+(ei)
+
+x< l a t e x i t s h a 1 _ b a s e 6 4 = " 2 H h T H y a E J k k J e n B T A O B / h 3 8 Y N c o = " > A A A B 8 3 i c b V D L S s N A F L 2 p r 1 p f V Z d u B o v g q i Q i 6 L L o x m U F + 4 C m l M l 0 0 g 6 d T M L M j V h C f 8 O N C 0 X c + j P u / B s n b R b a e m D g c M 6 9 3 D M n S K Q w 6 L r f T m l t f W N z q 7 x d 2 d n d 2 z + o H h 6 1 T Z x q x l s s l r H u B t R w K R R v o U D J u 4 n m N A o k 7 w S T 2 9 z v P H J t R K w e c J r w f k R H S o S C U b S S 7 0 c U x 0 G Y P c 0 G 3 q B a c + v u H G S V e A W p Q Y H m o P r l D 2 O W R l w h k 9 S Y n u c m 2 M + o R s E k n 1 X 8 1 P C E s g k d 8 Z 6 l i k b c 9 L N 5 5 h k 5 s 8 q Q h L G 2 T y G Z q 7 8 3 M h o Z M 4 0 C O 5 l n N M t e L v 7 n 9 V I M r / u Z U E m K X L H F o T C V B G O S F 0 C G Q n O G c m o J Z V r Y r I S N q a Y M b U 0 V W 4 K 3 / O V V 0 r 6 o e 2 7 d u 7 + s N W 6 K O s p w A q d w D h 5 c Q Q P u o A k t Y J D A M 7 z C m 5 M 6 L 8 6 7 8 7 E Y L T n F z j H 8 g f P 5 A y p g k c A = < / l a t e x i t > 1
+
+x< l a t e x i t s h a 1 _ b a s e 6 4 = " / x h o K o W R 7 5 1 d x O / n Y L z 1 5 N 6 j l L s = " > A A A B 8 3 i c b V D L S s N A F L 3 x W e u r 6 t L N Y B F c l a Q I u i y 6 c V n B P q A p Z T K 9 a Y d O J m F m I p b Q 3 3 D j Q h G 3 / o w 7 / 8 Z J m 4 W 2 H h g 4 n H M v 9 8 w J E s G 1 c d 1 v Z 2 1 9 Y 3 N r u 7 R T 3 t 3 b P z i s H B 2 3 d Z w q h i 0 W i 1 h 1 A 6 p R c I k t w 4 3 A b q K Q R o H A T j C 5 z f 3 O I y r N Y / l g p g n 2 I z q S P O S M G i v 5 f k T N O A i z p 9 m g P q h U 3 Z o 7 B 1 k l X k G q U K A 5 q H z 5 w 5 i l E U r D B N W 6 5 7 m J 6 W d U G c 4 E z s p + q j G h b E J H 2 L N U 0 g h 1 P 5 t n n p F z q w x J G C v 7 p C F z 9 f d G R i O t p 1 F g J / O M e t n L x f + 8 X m r C 6 3 7 G Z Z I a l G x x K E w F M T H J C y B D r p A Z M b W E M s V t V s L G V F F m b E 1 l W 4 K 3 / O V V 0 q 7 X P L f m 3 V 9 W G z d F H S U 4 h T O 4 A A + u o A F 3 0 I Q W M E j g G V 7 h z U m d F + f d + V i M r j n F z g n 8 g f P 5 A y v k k c E = < / l a t e x i t > 2
+
+x< l a t e x i t s h a 1 _ b a s e 6 4 = " 7 s i k x e 2 T J 1 e P g Y W w 2 6 l q N s E 8 U c k = " > A A A B 8 3 i c b V B N S 8 N A F H y p X 7 V + V T 1 6 W S y C p 5 K o o M e i F 4 8 V b C 0 0 p W y 2 L + 3 S z S b s b s Q S + j e 8 e F D E q 3 / G m / / G T Z u D t g 4 s D D P v 8 W Y n S A T X x n W / n d L K 6 t r 6 R n m z s r W 9 s 7 t X 3 T 9 o 6 z h V D F s s F r H q B F S j 4 B J b h h u B n U Q h j Q K B D 8 H 4 J v c f H l F p H s t 7 M 0 m w F 9 G h 5 C F n 1 F j J 9 y N q R k G Y P U 3 7 5 / 1 q z a 2 7 M 5 B l 4 h W k B g W a / e q X P 4 h Z G q E 0 T F C t u 5 6 b m F 5 G l e F M 4 L T i p x o T y s Z 0 i F 1 L J Y 1 Q 9 7 J Z 5 i k 5 s c q A h L G y T x o y U 3 9 v Z D T S e h I F d j L P q B e 9 X P z P 6 6 Y m v O p l X C a p Q c n m h 8 J U E B O T v A A y 4 A q Z E R N L K F P c Z i V s R B V l x t Z U s S V 4 i 1 9 e J u 2 z u u f W v b u L W u O 6 q K M M R 3 A M p + D B J T T g F p r Q A g Y J P M M r v D m p 8 + K 8 O x / z 0 Z J T 7 B z C H z i f P y 1 o k c I = < / l a t e x i t > 3
+
+Figure 2: Graphical representation of the structured ﬂow model. We denote discrete syntactic variables as z, latent embedding variable as e, and observed pretrained word embeddings as x. fφ is the invertible projection function.
+
+2018), and use the “SelfAtt-Graph” model (Ahmad et al., 2019) for dependency parsing.4 Following Ahmad et al. (2019), for dependency parsing gold POS tags are also used to learn POS tag embeddings as universal features. We train the systems on English and directly evaluate them on the target languages. Results are shown in Figure 1. While these systems achieve quite accurate results on closely related languages, we observe large performance drops on both tasks as distance to English increases. These results motivate our proposed approach, which aims to close this gap by directly adapting to the target language through unsupervised learning over unlabeled text.
+3 Proposed Method
+In this section, we ﬁrst introduce the unsupervised monolingual models presented in He et al. (2018), which we refer to as structured ﬂow models, then we propose our approach that extends the structured ﬂow models to cross-lingual settings.
+3.1 Unsupervised Training of Structured Flow Models
+The structured ﬂow generative model, proposed by He et al. (2018), is a state-of-the-art technique for inducing syntactic structure in a monolingual setting without supervision. This model cascades a structured generative prior psyntax(z; θ) with an invertible neural network fφ(z) to generate pre-
+4We use an implementation and English source model checkpoint identical to the original paper.
+
+trained word embeddings x = fφ(z), which correspond to the words in the training sentences. z represents latent syntax variables that are not observed during training. The structured prior deﬁnes a probability over syntactic structures, and can be a Markov prior to induce POS tags or DMV prior (Klein and Manning, 2004) to induce dependency structures. Notably, the model side-steps discrete words, and instead uses pre-trained word embeddings as observations, which allows it to be directly employed in cross-lingual transfer setting by using cross-lingual word embeddings as the observations. A graphical illustration of this model is shown in Figure 2. Given a sentence of length l, we denote z = {z}Kk=1 as a set of discrete latent variables from the structured prior, e = {ei}li=1 as the latent embeddings, and x = {xi}li=1 as the observed word embeddings. Note that the number of latent syntax variables K is no smaller than the sentence length l, and we assume xi is generated (indirectly) conditioned on zi for notation simplicity. The model is trained by maximizing the following marginal data likelihood:
+
+pus(x) = ·
+
+z psyntax(z; θ)
+
+−1
+
+∂fφ−1
+
+i=1 pη(fφ (xi)|zi) det ∂xi
+
+(1) .
+
+pη(·|zi) is deﬁned to be a conditional Gaussian
+
+distribution that emits latent embedding e. The
+
+projection function fφ projects the latent embed-
+
+∂f −1
+
+ding e to the observed embedding x.
+
+φ
+∂x
+
+is
+
+i
+
+the Jacobian matrix of function fφ−1 at xi, and
+
+∂f −1
+
+det
+
+φ
+∂x
+
+represents the absolute value of its de-
+
+i
+
+terminant.
+
+To understand the intuitions behind Eq. 1, ﬁrst
+
+denote the log likelihood over the latent embed-
+
+ding e as log pgaus(·), then log of Eq. 1 can be
+
+equivalently rewritten as:
+
+log pus(x) = log pgaus(fφ−1(x))
+
+l
+
+∂fφ−1
+
+(2)
+
++
+
+log det
+
+.
+
+i=1
+
+∂xi
+
+Eq. 2 shows that fφ−1(x) inversely projects x to a new latent embedding space, on which the unsupervised training objective is simply the Gaussian log likelihood with an additional Jacobian regularization term. The Jacobian regularization term accounts for the volume expansion or contraction behavior of the projection, thus maximizing it can be
+
+thought of as preventing information loss.5 This projection scheme can ﬂexibly transform embedding space to ﬁt the task at hand, but still avoids trivial solutions by preserving information.
+While fφ−1(x) can be any invertible function, He et al. (2018) use a version of the NICE architecture (Dinh et al., 2014) to construct fφ−1, which has the advantage that the determinant term is constantly equal to one. This structured ﬂow model allows for exact marginal data likelihood computation and exact inference by the use of dynamic programs to marginalize out z. More details about this model can be found in He et al. (2018).
+3.2 Supervised Training of Structured Flow Models
+While He et al. (2018) train the structured ﬂow model in an unsupervised fashion, this model can be also trained with supervised data when z is observed. Supervised training is required in the cross-lingual transfer where we train a model on the high-resource source language. The supervised objective can be written as:
+
+ps(z, x) = psyntax(z; θ)
+
+−1
+
+∂fφ−1 (3)
+
+· i=1 pη(fφ (xi)|zi) det ∂xi ,
+
+3.3 Multilingual Training through Parameter Sharing
+In this paper, we focus on the zero-shot crosslingual transfer setting where the syntactic structure z is observed for the source language but unavailable for the target languages. Eq. 2 is an unsupervised objective which is optimized on the target languages, and Eq. 3 is optimized on the source language. To establish connections between the source and target languages, we employ two instances of the structured ﬂow model – a source model and a target model – and share parameters between them. The source model uses the supervised objective, Eq. 3, and the target model uses the unsupervised objective, Eq. 2, and both are optimized jointly. Instead of tying their parameters in a hard way, we share their parameters softly through an L2 regularizer that encourages similarity. We use subscript p to represent variables of the source model and q to represent variables of
+5Maximizing the Jacobian term encourages volume expansion and prevents the latent embedding from collapsing to a (nearly) single point.
+
+the target model. Together, our joint training objective is:
+
+L(θ{p,q}, η{p,q}, φ{p,q}) = log ps(xp)+log pus(xq)
+
+− β1 θp − θq 2 − β2 ηp − ηq 2
+
+2
+
+2
+
+− β3 φp − φq 2,
+
+(4)
+
+2
+
+where β = {β1, β2, β3} are regularization parameters. Introduction of hyperparameters is concerning because in the zero-shot transfer setting we do not have annotated data to select the parameters for each target language, but in experiments we found it unnecessary to tune β for different target languages separately, and it is possible to use the same β within the same language category (i.e. distant or nearby). Under the parameter sharing scheme the projected latent embedding space e can be understood as the new interlingual embedding space from which we learn the syntactic structures. The expressivity of the ﬂow model used in learning this latent embeddings space is expected to compensate for the imperfect orthogonality between the two embedding spaces.
+Further, jointly training both models with Eq. 4 is more expensive than typical cross-lingual transfer setups – it would require re-training both models for each language pair. To improve efﬁciency and memory utilization, in practice we use a simple pipelined approach: (1) We pre-train parameters for the source model only once, in isolation. (2) We use these parameters to initialize each target model, and regularize all target parameters towards this initializer via the L2 terms in Eq. 4. In this way, we only need to save the pre-trained parameters for a single source model, and target-side ﬁne-tuning converges much faster than training each pair from scratch. This training approximation has been used before in Zhang et al. (2016).
+
+4 Experiments
+In this section, we ﬁrst describe the dataset and experimental setup, and then report the cross-lingual transfer results of POS tagging and dependency parsing on distant target languages. Lastly we include analysis of different systems.
+
+4.1 Experimental Setup
+Across both POS tagging and dependency parsing tasks, we run experiments on Universal Dependency Treebanks (v2.2) (Nivre et al., 2018).
+
+Speciﬁcally, we train the proposed model on the English corpus with annotated data and ﬁne-tune it on target languages in an unsupervised way. In the rest of the paper we will use Flow-FT to term our proposed method. We use the aligned cross-lingual word embeddings described in Section 2.2 as the observations of our model. To compare with Ahmad et al. (2019), on dependency parsing task we also use universal gold POS tags to index tag embeddings as part of observations. Speciﬁcally, the tag embeddings are concatenated with word embeddings to form x, tag embeddings are updated when training on the source language, and ﬁxed at ﬁne-tuning stage. We implement the structured ﬂow model based on the public code from He et al. (2018),6which contains models with Markov prior for POS tagging and DMV prior for dependency parsing. Detailed hyperparameters can be found in Appendix B. Both source model and target model are optimized with Adam (Kingma and Ba, 2014). Training on the English source corpus is run 5 times with different random restarts for all models, then the source model with the best English test accuracy is selected to perform transfer.
+We compare our method with a direct transfer approach that is based on the state-of-the-art discriminative models as described in Section 2.2. The pre-trained cross-lingual word embeddings for all models are frozen since ﬁne-tuning them will break the multi-lingual alignments. In addition, to demonstrate the efﬁcacy of unsupervised adaptation, we also include direct transfer results of our model without ﬁne-tuning, which we denote as Flow-Fix. On the POS tagging task we reimplement the generative baseline in Zhang et al. (2016) that employs a linear projection (LinearFT). We present results on 20 target languages in “distant languages” and “nearby languages” categories to analyze the difference of the systems and the scenarios to which they are applicable.
+4.2 Part-Of-Speech Tagging
+Setup. Our method aims to predict coarse universal POS tags, as ﬁne-grained tags are languagedependent. The discriminative baseline with the NCRF++ toolkit (Yang and Zhang, 2018) achieves supervised test accuracy on English of 94.02%, which is competitive (rank 12) on the CoNLL
+6https://github.com/jxhe/ struct-learning-with-flow.
+
+Lang
+zh (0.86) fa (0.86) ar (0.86) ja (0.71) id (0.71) ko (0.69) tr (0.62) hi (0.61) hr (0.59) he (0.57) AVG
+bg (0.50) it (0.50) pt (0.48) fr (0.46) es (0.46) no (0.45) da (0.41) sv (0.40) nl (0.37) de (0.36) AVG en∗
+
+Discriminative
+
+Generative
+
+LSTM-CRF Flow-Fix Flow-FT Linear-FT
+
+Distant Languages
+
+33.31
+
+35.24 43.44
+
+35.95
+
+61.74
+
+55.32 64.47
+
+34.35
+
+56.41
+
+49.70 64.00
+
+38.95
+
+26.37
+
+25.09 38.37
+
+12.49
+
+72.21
+
+63.73 73.51
+
+57.56
+
+42.57
+
+39.56 41.76
+
+18.30
+
+58.74
+
+43.17 60.08
+
+22.79
+
+55.85
+
+47.18 64.75
+
+38.04
+
+63.23
+
+50.57 57.90
+
+56.53
+
+48.90
+
+47.97 62.69
+
+48.17
+
+51.93
+
+45.75 57.10
+
+36.31
+
+Nearby Languages
+
+74.55
+
+62.18
+
+77.75
+
+69.93
+
+74.68
+
+65.08
+
+73.33
+
+64.15
+
+76.07
+
+65.77
+
+69.30
+
+58.98
+
+79.33
+
+62.42
+
+76.70
+
+58.91
+
+80.15
+
+66.52
+
+68.75
+
+57.91
+
+75.06
+
+63.19
+
+94.02
+
+87.03
+
+64.69 80.99 72.65 69.78 77.19 62.05 68.68 66.34 68.74 59.97 69.11
+–
+
+66.71 73.55 72.54 66.63 72.86 62.38 67.31 61.82 66.08 56.16 66.60 84.69
+
+Table 2: POS tagging accuracy results (%). Numbers next to languages names are their distances to English. Supervised accuracy on English (∗) is included for reference.
+
+2018 Shared Task scoreboard that uses the same dataset.7 The regularization parameters β in all generative models are tuned on the Arabic8 development data and kept the same for all target languages. Our running β is β1 = 0, β2 = 500, β3 = 80. Unsupervised ﬁne-tuning is run for 10 epochs.
+Results. We show our results in Table 2, where unsupervised ﬁne-tuning achieves considerable and consistent performance improvements over the Flow-Fix baseline in both language categories. When compared the discriminative LSTM-CRF baseline, our approach outperforms it on 8 out of 10 distant languages, with an average of 5.2% absolute improvement. Unsurprisingly, however, it also underperforms the expressive LSTM-CRF on 8 out of 10 nearby languages. The reasons for this phenomenon are two-fold. First, the ﬂexible LSTM-CRF model is better able to ﬁt the
+7For reference, check the “en ewt” treebank results in http://universaldependencies.org/conll18/results-upos.html.
+8We choose Arabic simply because it is ﬁrst in alphabetical order.
+
+source English corpus than our method (94.02% vs 87.03% accuracy), thus it is also capable of ﬁtting similar input when transferring. Second, unsupervised adaptation helps less when transferring to nearby languages (5.9% improvement over Flow-Fix versus 11.3% on distant languages), we posit that this is because a large portion of linguistic knowledge is shared between similar languages, and the cross-lingual word embeddings have better quality in this case, so unsupervised adaptation becomes less necessary. While the Linear-FT baseline on nearby languages is comparable to our method, its performance on distant languages is much worse, which conﬁrms the importance of invertible projection, especially when language typologies are divergent.
+4.3 Dependency Parsing
+Setup. In preliminary parsing results we found that transferring to “nearby language” group is likely to suffer from catastrophic forgetting (McCloskey and Cohen, 1989) and thus requires stronger regularization towards the source model. This also makes sense intuitively since nearby languages should prefer the source model more than distant languages. Therefore, we use two different sets of regularization parameters for nearby languages and distant languages, respectively. Speciﬁcally, β for the “distant languages” group is set as β1 = β2 = β3 = 0.1, tuned on the Arabic development set, and for the “nearby languages” group β is set as β1 = β2 = β3 = 1, tuned on the Spanish development set. Unsupervised adaptation is performed on sentences of length less than 40 due to memory constraints,9 but we test on sentences of all lengths. We run unsupervised ﬁne-tuning for 5 epochs, and evaluate using unlabeled attachment score (UAS) with punctuation excluded.
+Results. We show our results in Table 3. While unsupervised ﬁne-tuning improves the performance on the distant languages, it only has minimal effect on nearby languages, which is consistent with our observations in the POS tagging experiment and implies that unsupervised adaption helps more for distant transfer. Similar to POS tagging results, our method is able to outperform state-of-the-art “SelfAtt-Graph” model on 8 out of 10 distant languages, with an average of 8.3%
+9Reducing batch size can address this memory issue, but greatly increases the training time.
+
+Lang
+zh (0.86) fa (0.86) ar (0.86) ja (0.71) id (0.71) ko (0.69) tr (0.62) hi (0.61) hr (0.59) he (0.57) AVG
+bg (0.50) it (0.50) pt (0.48) fr (0.46) es (0.46) no (0.45) da (0.41) sv (0.40) nl (0.37) de (0.36) AVG en∗
+
+Discriminative
+
+Generative
+
+SelfAtt-Graph Flow-Fix Flow-FT
+
+Distant Languages
+
+42.48
+
+35.72 37.26
+
+37.10
+
+37.58 63.20
+
+38.12
+
+32.14 55.44
+
+28.18
+
+19.03 43.75
+
+49.20
+
+46.74 64.20
+
+34.48
+
+34.76 37.03
+
+35.08
+
+34.76 36.05
+
+35.50
+
+29.20 33.17
+
+61.91
+
+59.57 65.31
+
+55.29
+
+51.35 64.80
+
+41.73
+
+38.09 50.02
+
+Nearby Languages
+79.40 80.80 76.61 77.87 74.49 80.80 76.64 80.98 68.55 71.34 76.75
+
+73.52 68.84 66.61 65.92 63.10 65.48 61.64 66.22 61.59 70.10 66.30
+
+73.57 70.68 66.61 67.66 64.28 65.29 61.08 64.43 61.72 69.52 66.48
+
+91.82
+
+67.80
+
+–
+
+Table 3: Dependency parsing UAS (%) on sentences of all lengths. Numbers next to languages names are their distances to English. Supervised accuracy on English (∗) is included for reference.
+
+absolute improvement, but the strong discriminative baseline performs better when transferring to nearby languages. Note that the supervised performance of our method on English is poor. This is mainly because the DMV prior is too simple and limits the capacity of the model. While this model still achieves good performance on distant transfer, incorporating more complex DMV variants (Jiang et al., 2016) might lead to further improvement.
+Analysis on Dependency Relations. We further perform breakdown analysis on dependency relations to see how unsupervised adaptation helps learn new dependency rules. We select three typical distant languages with different word order of Subject, Object and Verb (Dryer, 2013): Arabic (Modern Standard, VSO), Indonesian (SVO) and Japanese (SOV).
+We investigate the unlabeled accuracy (recall) on the gold dependency labels. We especially explore four typical dependency relations: case (case marking), nmod (nominal modiﬁer), obj (ob-
+
+ject) and nsubj (nominal subject). The ﬁrst two are “nominal dependents” (modiﬁers for nouns) and the rest two are the main nominal “core arguments” (arguments for the predicate). Although different languages may vary, these four types are representative relations and occupies 25% to 40% in frequencies among all 37 UD dependency types.
+We compare our ﬁne-tuning model with the baseline “SelfAtt-Graph” model and our basic model without ﬁne-tuning. As shown in Figure 3, although our direct transfer model obtain similar results when compared with the baseline, the ﬁnetuning method brings large improvements on most of these dependency relations. In these three languages, Japanese beneﬁts from our tuning method the most, probably because its word order is quite different from English and the baseline may overﬁt to the English order. For example, in Japanese, almost all of the “case” relations are head-ﬁrst and “obj” relations are modiﬁer-ﬁrst, and these patterns are exactly opposite to those in English, which serves as our source language. As a result, direct transfer models fail on most of these relations since they only learn the patterns in English. With our ﬁne-tuning on unlabeled data, the model may get more familiar with the unusual patterns of word order and predict more correct attachment decisions (around 0.4 improvements in recalls). In Arabic and Indonesian, although not as obviously as in Japanese, the improvements are still consistent, especially on the relations of the core arguments.
+4.4 When to Use Generative Models?
+In unsupervised cross-lingual transfer setting, it is hard to ﬁnd a system that is able to achieve state-of-the-art on all languages. As reﬂected by our experiments, there is a tradeoff between ﬁtting source language and generalizing to target language – the ﬂexibility of discriminative models results in overﬁtting issue and poor performance when transferred to distant languages. Unfortunately, a limited number of high-resource languages and many more low-resource languages in the world are mostly distant. This means that distant transfer is a practical challenge we face when dealing with low-resource languages. Next we try to give a preliminary guidance about which system should be used in speciﬁc transfer scenarios.
+As discussed in Section 2.1, there are different types of distance metrics. Here we aim to compute the signiﬁcance of correlation between the
+
+5HFDOO8$6 5HFDOO8$6 5HFDOO8$6
+
+$UDELF      FDVH QPRG REM
+
+QVXEM
+
+,QGRQHVLDQ 
+
+
+
+
+
+
+
+ FDVH QPRG REM
+
+%DVHOLQH
+
+'LUHFW7UDQVIHU
+
+QVXEM )LQH7XQHG
+
+-DSDQHVH     FDVH QPRG REM QVXEM
+
+Figure 3: Results (UAS%) on typical dependency relations for Arabic, Indonesian and Japanese, respectively. “Baseline” denotes the “SelfAtt-Graph” model, and “Direct-Transfer” denotes our source model without ﬁnetuning. The number in the parenthesis after each dependency label indicates the relative frequency of this type.
+
+performance difference between our method and the discriminative baseline and different distance features. We have ﬁve input distance features: geographic, genetic, syntactic, inventory, and phonological.
+Speciﬁcally, we ﬁt a generalized linear model (GLM) on the difference in accuracy and ﬁve features of all 20 target languages, then we perform a hypothesis test to compute the p-value that reﬂects the signiﬁcance of speciﬁc features.10 Results are shown in Table 4, where we can conclude that the genetic distance feature is signiﬁcantly correlated with POS tagging performance, while geographic distance feature is signiﬁcantly correlated with dependency parsing performance. As assumed before, inventory and phonological distance do not have much inﬂuence on the transfer. Interestingly, syntactic distance is not the signiﬁcant term for both tasks, we posit that this is because the transfer performance is affected by both cross-lingual word embedding quality and linguistic features, thus genetic/geographic distance might be a better indicator overall. The results suggest that our method might be more suitable than the discriminative approach at genetically distant transfer for POS tagging and geographically distant transfer for parsing.
+4.5 Effect of Multilingual-BERT
+So far the analysis and experiments of this paper focus on non-contextualized fastText word embeddings. We note that concurrently to this work, Wu and Dredze (2019) found that the recently released multilingual BERT (mBERT; Devlin et al. (2019)) is able to achieve impressive performance on various cross-lingual transfer tasks. To study the effect of contextualized mBERT word embeddings on our proposed method, we report the average POS tagging and dependency parsing results in Table 5, while detailed numbers on each language
+10We use the GLM toolkit present in the H2O Python Module.
+
+Feature
+Geographic Genetic Syntactic Inventory Phonological
+
+POS tagging 0.465 0.007 0.716 0.982 0.502
+
+p-value Dependency Parsing
+0.013 0.531 0.231 0.453 0.669
+
+Table 4: p-value of different distance features on POS tagging and dependency parsing task. A lower pvalue indicates stronger association between the feature and the response, which is the difference between our method and the discriminative baselines.
+
+are included in Appendix C. In the mBERT experiments, all the settings and hyperparameters are the same as in Section 4.2 and Section 4.3, but the aligned fastText embeddings are replaced with the mBERT embeddings.11 We also include the average results from fastText embeddings for comparison.
+On the POS tagging task all the models greatly beneﬁt from the mBERT embeddings, especially our method on nearby languages where the mBERT outperforms the fastText by an average of 16 absolute points. Moreover, unsupervised adaptation still considerably improves the FlowFix baseline, and surpasses the LSTM-CRF baseline on 9 out of 10 distant languages with an average of 6% absolute performance boost. Different from the fastText setting where our method underperforms the discriminative baseline on the nearby language group, by the use of mBERT embeddings our method also beats the discriminative baseline on 7 out of 10 nearby languages with an average of 3% absolute improvement. A major limitation of our method lies in its strong independence assumptions, which results in the failure to model the long-term context information. We posit that the contextualized word embeddings
+
+11We use the multilingual cased BERT base model released
+
+in
+
+https://github.com/google-research/
+
+bert.
+
+emb
+fastText mBERT
+fastText mBERT
+
+Tagging Disc Flow-FT
+
+Parsing Disc Flow-FT
+
+Distant Languages
+
+51.93 60.24
+
+57.10 41.73 66.56 51.86
+
+50.02 50.11
+
+75.06 82.17
+
+Nearby Languages
+69.11 76.75 85.48 83.41
+
+66.48 67.70
+
+Table 5: Average of POS tagging accuracy (%) and dependency parsing UAS (%) results, comparing mBERT and fastText. “Disc” denotes the discriminative baselines.
+
+like mBERT exactly compensate for this drawback in our model through incorporating the context information into the observed word embeddings, so that our method is able to outperform the discriminative baseline on both distant and nearby language groups.
+On dependency parsing task, however, our method does not demonstrate signiﬁcant improvement by the use of mBERT, while mBERT greatly helps the discriminative baseline. Therefore, although our method still outperforms the discriminative baseline on four very distant languages, the baseline demonstrates superior performance on other languages when using mBERT. Interestingly, we ﬁnd that the performance of ﬂow-based models with mBERT is similar to the performance with fastText word embeddings. Based on this, better generative models for unsupervised dependency parsing that can take advantage of contextualized embeddings seems a promising direction for future work.
+5 Related Work
+Cross-lingual transfer learning has been widely studied to help induce syntactic structures in low-resource languages (McDonald et al., 2011; Ta¨ckstro¨m et al., 2013a; Agic´ et al., 2014; Tiedemann, 2015; Kim et al., 2017; Schuster et al., 2019; Ahmad et al., 2019). In the case when no available target annotations are available, unsupervised cross-lingual transfer can be performed by directly applying pre-trained source model to the target language. (Guo et al., 2015; Schuster et al., 2019; Ahmad et al., 2019). The challenge of direct transfer method lies in the different linguistic rules between source and distant target languages. Utilizing multiple sources of resources can mitigate this issue and has been actively studied in the past
+
+years (Cohen et al., 2011; Naseem et al., 2012; Ta¨ckstro¨m et al., 2013b; Zhang and Barzilay, 2015; Aufrant et al., 2015; Ammar et al., 2016; Wang and Eisner, 2018, 2019). Other approaches that try to overcome the lack of annotations include annotation projection by the use of bitext supervision or bilingual lexicons (Hwa et al., 2005; Smith and Eisner, 2009; Wisniewski et al., 2014) and source data point selection (Søgaard, 2011; Ta¨ckstro¨m et al., 2013b).
+Learning from both labeled source data and unlabeled target data has been explored before. Cohen et al. (2011) learns a generative target language parser as a linear interpolation of multiple source language parameters, Naseem et al. (2012) and Ta¨ckstro¨m et al. (2013b) rely on additional language typological features to guide selective model parameter sharing in a multi-source transfer setting, Wang and Eisner (2018, 2019) extract linguistic features from target languages by training a feature extractor on multiple source languages.
+6 Conclusion
+In this work, we focus on transfer to distant languages for POS tagging and dependency parsing, and propose to learn a structured ﬂow model in a cross-lingual setting. Through learning a new latent embedding space as well as languagespeciﬁc knowledge with unlabeled target data, our method proves effective at transferring to distant languages.
+Acknowledgements
+This research was supported by NSF Award No. 1761548 “Discovering and Demonstrating Linguistic Features for Language Documentation”, and, in part, by an Amazon Research Award to the third author.
+References
+Zˇ eljko Agic´, Jo¨rg Tiedemann, Kaja Dobrovoljc, Simon Krek, Danijela Merkler, and Sara Mozˇe. 2014. Cross-lingual dependency parsing of related languages with rich morphosyntactic tagsets. In EMNLP 2014 Workshop on Language Technology for Closely Related Languages and Language Variants.
+Wasi Uddin Ahmad, Zhisong Zhang, Xuezhe Ma, Eduard Hovy, Kai-Wei Chang, and Nanyun Peng. 2019. On difﬁculties of cross-lingual transfer with order differences: A case study on dependency parsing. In Proceedings of NAACL.
+
+Waleed Ammar, George Mulcaire, Miguel Ballesteros, Chris Dyer, and Noah A Smith. 2016. Many languages, one parser. Transactions of the Association for Computational Linguistics.
+Lauriane Aufrant, Guillaume Wisniewski, and Franc¸ois Yvon. 2015. Zero-resource dependency parsing: Boosting delexicalized cross-lingual transfer with linguistic knowledge. In Proceedings of COLING.
+Piotr Bojanowski, Edouard Grave, Armand Joulin, and Tomas Mikolov. 2017. Enriching word vectors with subword information. Transactions of the Association for Computational Linguistics.
+Shay B Cohen, Dipanjan Das, and Noah A Smith. 2011. Unsupervised structure prediction with nonparallel multilingual guidance. In Proceedings of EMNLP.
+Alexis Conneau, Guillaume Lample, Marc’Aurelio Ranzato, Ludovic Denoyer, and Herve´ Je´gou. 2018. Word translation without parallel data. In Proceedings of ICLR.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. Bert: Pre-training of deep bidirectional transformers for language understanding. In Proceedings of NAACL.
+Laurent Dinh, David Krueger, and Yoshua Bengio. 2014. Nice: Non-linear independent components estimation. arXiv preprint arXiv:1410.8516.
+Timothy Dozat and Christopher D Manning. 2017. Deep biafﬁne attention for neural dependency parsing. In Proceedings of ICLR.
+Matthew S. Dryer. 2013. Order of subject, object and verb. In Matthew S. Dryer and Martin Haspelmath, editors, The World Atlas of Language Structures Online. Max Planck Institute for Evolutionary Anthropology, Leipzig.
+Jiang Guo, Wanxiang Che, David Yarowsky, Haifeng Wang, and Ting Liu. 2015. Cross-lingual dependency parsing based on distributed representations. In Proceedings of ACL.
+Jiang Guo, Wanxiang Che, David Yarowsky, Haifeng Wang, and Ting Liu. 2016. A representation learning framework for multi-source transfer parsing. In Proceedings of AAAI.
+Harald Hammarstro¨m, Robert Forkel, Martin Haspelmath, and Sebastian Bank. 2015. Glottolog 2.6. Max Planck Institute for the Science of Human History.
+Junxian He, Graham Neubig, and Taylor BergKirkpatrick. 2018. Unsupervised learning of syntactic structure with invertible neural projections. In Proceedings of EMNLP.
+Zhiheng Huang, Wei Xu, and Kai Yu. 2015. Bidirectional lstm-crf models for sequence tagging. arXiv preprint arXiv:1508.01991.
+
+Rebecca Hwa, Philip Resnik, Amy Weinberg, Clara Cabezas, and Okan Kolak. 2005. Bootstrapping parsers via syntactic projection across parallel texts. Natural language engineering, 11(3):311–325.
+Yong Jiang, Wenjuan Han, and Kewei Tu. 2016. Unsupervised neural dependency parsing. In Proceedings of EMNLP.
+Joo-Kyung Kim, Young-Bum Kim, Ruhi Sarikaya, and Eric Fosler-Lussier. 2017. Cross-lingual transfer learning for pos tagging without cross-lingual resources. In Proceedings of EMNLP.
+Diederik P Kingma and Jimmy Ba. 2014. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980.
+Dan Klein and Christopher D Manning. 2004. Corpusbased induction of syntactic structure: Models of dependency and constituency. In Proceedings of ACL.
+M. Paul Lewis, Gary F. Simons, and Charles D. Fennig, editors. 2015. Ethnologue: Languages of the World, Eighteenth edition. SIL International, Dallas, Texas.
+Patrick Littell, David R Mortensen, Ke Lin, Katherine Kairis, Carlisle Turner, and Lori Levin. 2017. Uriel and lang2vec: Representing languages as typological, geographical, and phylogenetic vectors. In Proceedings of EACL.
+Xuezhe Ma, Zecong Hu, Jingzhou Liu, Nanyun Peng, Graham Neubig, and Eduard Hovy. 2018. Stackpointer networks for dependency parsing. In Proceedings of ACL.
+Michael McCloskey and Neal J Cohen. 1989. Catastrophic interference in connectionist networks: The sequential learning problem. In Psychology of learning and motivation, volume 24, pages 109– 165. Elsevier.
+Ryan McDonald, Slav Petrov, and Keith Hall. 2011. Multi-source transfer of delexicalized dependency parsers. In Proceedings of EMNLP.
+Steven Moran, Daniel McCloy, and Richard Wright, editors. 2014. PHOIBLE Online. Max Planck Institute for Evolutionary Anthropology, Leipzig.
+Tahira Naseem, Regina Barzilay, and Amir Globerson. 2012. Selective sharing for multilingual dependency parsing. In Proceedings of ACL.
+Joakim Nivre, Mitchell Abrams, Zˇ eljko Agic´, and et al. 2018. Universal dependencies 2.2. LINDAT/CLARIN digital library at the Institute of Formal and Applied Linguistics (U´ FAL), Faculty of Mathematics and Physics, Charles University.
+Slav Petrov, Dipanjan Das, and Ryan McDonald. 2012. A universal part-of-speech tagset. In Proceedings of the Eighth International Conference on Language Resources and Evaluation (LREC-2012).
+
+Tal Schuster, Ori Ram, Regina Barzilay, and Globerson Amir. 2019. Cross-lingual alignment of contextual word embeddings, with applications to zero-shot dependency parsing. In Proceedings of NAACL.
+David A Smith and Jason Eisner. 2009. Parser adaptation and projection with quasi-synchronous grammar features. In Proceedings of EMNLP.
+Samuel L Smith, David HP Turban, Steven Hamblin, and Nils Y Hammerla. 2017. Ofﬂine bilingual word vectors, orthogonal transformations and the inverted softmax. In Proceedings of ICLR.
+Anders Søgaard. 2011. Data point selection for crosslanguage adaptation of dependency parsers. In Proceedings of ACL.
+Oscar Ta¨ckstro¨m, Dipanjan Das, Slav Petrov, Ryan McDonald, and Joakim Nivre. 2013a. Token and type constraints for cross-lingual part-of-speech tagging. Transactions of the Association for Computational Linguistics, 1:1–12.
+Oscar Ta¨ckstro¨m, Ryan McDonald, and Joakim Nivre. 2013b. Target language adaptation of discriminative transfer parsers. In Proceedings of NAACL-HLT.
+Jo¨rg Tiedemann. 2015. Cross-lingual dependency parsing with universal dependencies and predicted pos labels. In Proceedings of the Third International Conference on Dependency Linguistics (Depling 2015).
+Dingquan Wang and Jason Eisner. 2018. Synthetic data made to order: The case of parsing. In Proceedings EMNLP.
+Dingquan Wang and Jason Eisner. 2019. Surface statistics of an unknown language indicate how to parse it. Transactions of the Association for Computational Linguistics.
+Guillaume Wisniewski, Nicolas Pe´cheux, Souhir Gahbiche-Braham, and Franc¸ois Yvon. 2014. Cross-lingual part-of-speech tagging through ambiguous learning. In Proceedings of EMNLP.
+Shijie Wu and Mark Dredze. 2019. Beto, Bentz, Becas: The surprising cross-lingual effectiveness of BERT. arXiv preprint arXiv:1904.09077.
+Jie Yang and Yue Zhang. 2018. NCRF++: An opensource neural sequence labeling toolkit. In Proceedings of ACL.
+Yuan Zhang and Regina Barzilay. 2015. Hierarchical low-rank tensors for multilingual transfer parsing. In Proceedings of EMNLP.
+Yuan Zhang, David Gaddy, Regina Barzilay, and Tommi Jaakkola. 2016. Ten pairs to tag– multilingual pos tagging via coarse mapping between embeddings. In Proceedings of NAACL-HLT.
+
+A Details of UD Treebanks
+
+Language
+
+Dist. Treebank
+
+#Sent.
+
+train 3997
+
+Chinese (zh)
+
+0.86
+
+GSD
+
+dev 500
+
+test 500
+
+train 4798
+
+Persian (fa)
+
+0.86
+
+Seraji
+
+dev 599
+
+test 600
+
+train 6075
+
+Arabic (ar)
+
+0.86
+
+PADT
+
+dev 909
+
+test 680
+
+train 7164
+
+Japanese (ja)
+
+0.71
+
+GSD
+
+dev 511
+
+test 557
+
+train 4477
+
+Indonesian (id) 0.71
+
+GSD
+
+dev 559
+
+test 557
+
+Korean (ko)
+
+GSD,
+
+train 27410
+
+0.69
+
+Kaist
+
+dev 3016
+
+test 3276
+
+train 3685
+
+Turkish (tr)
+
+0.62
+
+IMST
+
+dev 975
+
+test 975
+
+train 13304
+
+Hindi (hi)
+
+0.61
+
+HDTB
+
+dev 1659
+
+test 1684
+
+train 6983
+
+Croatian (hr)
+
+0.59
+
+SET
+
+dev 849
+
+test 1057
+
+train 5241
+
+Hebrew (he)
+
+0.57
+
+HTB
+
+dev 484
+
+test 491
+
+train 8907
+
+Bulgarian (bg) 0.50
+
+BTB
+
+dev 1115
+
+test 1116
+
+train 13121
+
+Italian (it)
+
+0.50
+
+ISDT
+
+dev 564
+
+test 482
+
+Portuguese (pt) 0.48
+
+Bosque, GSD
+
+train 17993 dev 1770 test 1681
+
+train 14554
+
+French (fr)
+
+0.46
+
+GSD
+
+dev 1478
+
+test 416
+
+Spanish (es)
+
+GSD,
+
+train 28492
+
+0.46 AnCora dev 3054
+
+test 2147
+
+Norwegian (no) 0.45
+
+Bokmaal, Nynorsk
+
+train 29870 dev 4300 test 3450
+
+train 4383
+
+Danish (da)
+
+0.41
+
+DDT
+
+dev 564
+
+test 565
+
+train 4303
+
+Swedish (sv)
+
+0.40 Talbanken dev 504
+
+test 1219
+
+Dutch (nl)
+
+Alpino, train 18058 0.37 LassySmall dev 1394
+test 1472
+
+train 13814
+
+German (de)
+
+0.36
+
+GSD
+
+dev 799
+
+test 977
+
+train 12543
+
+English (en)
+
+–
+
+EWT
+
+dev 2002
+
+test 2077
+
+Table 6: Statistics of the UD Treebanks that we used.
+
+We list the statistics of the UD Treebanks that we used in the following two tables. The left one lists the distance (to English) languages and the right one lists the similar (to English) languages.
+
+B Model Hyperparameters
+We use the same architecture as in He et al. (2018) for the invertible projection function fφ which is the NICE architecture (Dinh et al., 2014). It contains 8 coupling layers. The coupling function in each coupling layer is a rectiﬁed network with an input layer, one hidden layer, and linear output units. The number of hidden units is set to the same as the number of input units, which is 150 in our case. POS tagger is trained with batch size 32, while dependency parser is trained with batch size 16.
+C Full Results with mBERT
+Here we report in Table 7 the full results on all languages with mBERT.12
+12The results of our discriminative baselines are different from the ones reported in Wu and Dredze (2019) because they do not use additional encoders on top of the pretrained mBERT word embeddings, while we keep the models unchanged here for direct comparison with fastText embeddings. On some languages our version produces better results and sometimes their version is superior.
+
+Lang
+zh (0.86) fa (0.86) ar (0.86) ja (0.71) id (0.71) ko (0.69) tr (0.62) hi (0.61) hr (0.59) he (0.57) AVG (mBERT) AVG (fastText)
+bg (0.50) it (0.50) pt (0.48) fr (0.46) es (0.46) no (0.45) da (0.41) sv (0.41) nl (0.40) de (0.37) AVG (mBERT) AVG (fastText)
+en∗
+
+POS Tagging
+
+Dependency Parsing
+
+LSTM-CRF Flow-Fix Flow-FT SelfAtt-Graph Flow-Fix Flow-FT
+
+Distant Languages
+
+59.63 57.63 53.50 46.81 74.95 50.74 60.08 58.86 74.98 65.24
+
+53.61 56.18 48.92 40.98 70.95 47.99 54.69 53.16 66.35 57.27
+
+65.84 68.55 67.33 46.06 78.72 54.07 61.16 68.39 78.61 76.83
+
+48.78 51.47 50.91 40.08 57.94 39.42 42.80 48.44 73.63 65.11
+
+35.73 37.99 32.13 19.23 47.00 34.67 34.88 29.15 59.68 51.39
+
+35.64 63.18 56.85 43.55 64.35 37.02 37.06 33.17 65.27 65.03
+
+60.24
+
+55.01
+
+66.56
+
+51.86
+
+38.19
+
+50.11
+
+51.93
+
+45.75
+
+57.10
+
+41.73
+
+38.09
+
+50.02
+
+82.36 76.70 83.45 79.22 77.68 85.29 85.57 86.39 83.67 81.37 82.17 75.06
+
+Nearby Languages
+
+74.56 66.02 80.83 74.21 72.28 80.69 81.90 81.27 78.88 78.97 76.96 63.19
+
+80.68 87.88 86.49 87.21 84.50 83.96 86.79 86.31 85.05 85.96 85.48 69.11
+
+86.32 86.71 83.75 86.64 81.74 85.01 82.22 85.33 77.32 79.03 83.41 76.75
+
+73.65 69.09 66.67 66.08 63.18 65.47 61.61 66.04 61.70 70.19 66.37 66.30
+
+74.06 71.59 69.56 69.14 66.46 66.08 62.15 64.51 63.24 70.19 67.70 66.48
+
+95.13
+
+91.22
+
+–
+
+92.84
+
+67.76
+
+–
+
+Table 7: POS tagging accuracy (%) and dependency parsing UAS (%) results when using mBERT as the aligned embeddings. Numbers next to languages names are their distances to English. Supervised accuracy on English (∗) is included for reference.
+
+

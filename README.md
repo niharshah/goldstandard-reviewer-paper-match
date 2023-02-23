@@ -82,3 +82,7 @@ Code used in the project. Important pieces are:
 - `prepare_dataset_{ss/pdfs}.zh` scripts to consruct datasets *d_20_{x}, x \in {1, 2, ..., 10}* (`ss`) and *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 10}* (`pdfs`) that are eventually used in evaluations
 - `run_tmps.py` script to apply TPMS to all datasets used in this work
 - `scoring.py` functions that are used to evaluate the predicted similarities (used in the `Experiments.ipynb` to reproduce the results)
+
+## configs_for_OR_models
+
+Finally, we release the config files that we used to run Open Review models on our data.

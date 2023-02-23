@@ -64,3 +64,7 @@ For evaluations in Section 6.1 and 7 we use reviewer profiles of length 20 and r
 - *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 10}*
 
 To evaluate TPMS in the full text regime (Section 6.2, Section 7) we need to focus on papers (reported by participants or from reviewers' profiles) that have PDFs publicly available. For this, we need to remove some papers from the dataset and from the reviewers' profiles. Additionally, in Section 6.2 we experiment with the length of the reviewers' profiles so we create a dataset for each length of the profile from 1 to 20.
+
+## predictions
+
+Similarities predicted by different algorithms for datasets in the OpenReview format.

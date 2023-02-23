@@ -59,7 +59,7 @@ Many existing similarity-computation algorithms work with data in the OpenReview
 
 - *d_20_{x}, x \in {1, 2, ..., 10}*
 
-For evaluations in Section 6.1 and 7, we use reviewer profiles of length 20 and rerun all evaluations 10 times (each time the reviewer profiles are slightly different) to average out the noise in the reviewer profiles (the noise arises due to the randomness in the procedure of profile creation).
+For evaluations in Section 6.1 and 7, we use reviewer profiles of length 20 and rerun all evaluations 10 times to average out the noise in the reviewer profiles (the noise arises due to the randomness in the procedure of profile creation).
 
 - *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 5}*
 
@@ -81,10 +81,10 @@ Similarities predicted by different algorithms for datasets in the OpenReview fo
 
 Code used in the project. Important pieces are:
 - `prepare_dataset.py` code to construct a dataset in the OpenReview format
-- `prepare_dataset_{ss/pdfs}.zh` scripts to consruct datasets *d_20_{x}, x \in {1, 2, ..., 10}* (`ss`) and *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 10}* (`pdfs`) that are eventually used in evaluations
+- `prepare_dataset_{ss/pdfs}.zh` scripts to consruct datasets *d_20_{x}, x \in {1, 2, ..., 10}* (`ss`) and *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 5}* (`pdfs`) that are eventually used in evaluations
 - `run_tmps.py` script to apply TPMS to all datasets used in this work
-- `scoring.py` functions that are used to evaluate the predicted similarities (used in the `Experiments.ipynb` to reproduce the results)
+- `scoring.py` functions that are used to evaluate predicted similarities (used in the `Experiments.ipynb` to reproduce the results)
 
 ## configs_for_OR_models
 
-Finally, we release the config files that we used to run Open Review models on our data (ELMo, Specter, and Specter+MFR algorithms).
+Finally, we release the config files that we used to run the OpenReview algorithms on our data (ELMo, Specter, and Specter+MFR algorithms).

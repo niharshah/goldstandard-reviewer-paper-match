@@ -74,3 +74,9 @@ Similarities predicted by different algorithms for datasets in the OpenReview fo
 - `algorithm` is the algorithm that computed similarities
 - `dataset` is the dataset the similarities are predicted for
 - `regime` is the amount of information included in the papers' profiles: `t`--title only, `ta`--title+abstract, `f`--full text
+
+## scripts
+
+Code used in the project. Important pieces are:
+- `prepare_dataset.py` code to construct a dataset in the OpenReview format
+- `prepare_dataset_{ss/pdfs}.zh` scripts to consruct datasets *d_20_{x}, x \in {1, 2, ..., 10}* (`ss`) and *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 10}* (`pdfs`)

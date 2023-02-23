@@ -81,7 +81,7 @@ Similarities predicted by different algorithms for datasets in the OpenReview fo
 
 Code used in the project. Important pieces are:
 - `prepare_dataset.py` code to construct a dataset in the OpenReview format
-- `prepare_dataset_{ss/pdfs}.zh` scripts to consruct datasets *d_20_{x}, x \in {1, 2, ..., 10}* (`ss`) and *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 5}* (`pdfs`) that are eventually used in evaluations
+- `prepare_dataset_{ss/pdfs}.zh` scripts to consruct datasets *d_20_{x}, x \in {1, 2, ..., 10}* (`ss`) and *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 5}* (`pdfs`) that are eventually used in evaluations (!*to run these scripts you need to specify the absolute paths to directories inside these scripts*!)
 - `run_tmps.py` script to apply TPMS to all datasets used in this work
 - `scoring.py` functions that are used to evaluate predicted similarities (used in the `Experiments.ipynb` to reproduce the results)
 

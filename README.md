@@ -1,6 +1,6 @@
 # README
 
-This repository accompanies the paper "*A Gold Standard Dataset for the Reviewer Assignment Problem*" by Stelmakh, Wieting, Neubig, and Shah. The structure of the directory is as follows (more details on each point below):
+This repository accompanies the paper "*A Gold Standard Dataset for the Reviewer Assignment Problem*" by Ivan Stelmakh, John Wieting, Graham Neubig, and Nihar Shah. The structure of the directory is as follows (more details on each point below):
 
 1. `data` folder contains the dataset we release in this work
 2. `notebooks` folder contains jupyter notebooks that explore the dataset and replicate the results of the paper

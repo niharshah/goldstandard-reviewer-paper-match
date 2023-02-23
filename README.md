@@ -7,7 +7,7 @@ This repository accompanies the paper "*A Gold Standard Dataset for the Reviewer
 3. `evaluation_datasets` folder contains the dataset preprocessed into the OpenReview format that similarity computation algorithms can directly work with
 4. `predictions` folder contains similaritites predicted by different similarity-computation algorithms
 5. `scripts` folder contains various scripts, including the evaluation code and implementation of the TPMS algorithm
-6. `configs_for_OR_models` folder contains config files used to run the Open Review algorithns (ELMo, Specter, Specter+MFR)
+6. `configs_for_OR_models` folder contains config files used to run the Open Review algorithns
 
 We now provide more details on each of the released folders.
 
@@ -85,4 +85,4 @@ Code used in the project. Important pieces are:
 
 ## configs_for_OR_models
 
-Finally, we release the config files that we used to run Open Review models on our data.
+Finally, we release the config files that we used to run Open Review models on our data (ELMo, Specter, and Specter+MFR algorithms).

@@ -37,7 +37,7 @@ For each paper (reported by participants or from reviewers' profiles), this fold
 
 Note: For papers reported by participants, we edit semantic scholar profiles by adding links to publicly available PDFs whenever they were missing in the semantic scholar profile.
 
-**6. txts**
+**5. txts**
 
 Parsed PDF files. For each paper from `papers` that has a link to a publicly available pdf in its profile, we construct:
 - .txt file that is obtained by parsing the pdf with the `xpdf` tool

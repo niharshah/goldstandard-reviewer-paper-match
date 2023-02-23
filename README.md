@@ -67,4 +67,10 @@ To evaluate TPMS in the full text regime (Section 6.2, Section 7) we need to foc
 
 ## predictions
 
-Similarities predicted by different algorithms for datasets in the OpenReview format.
+Similarities predicted by different algorithms for datasets in the OpenReview format. The naming convention is as follows:
+
+`{algorithm}_{dataset}_{regime}.json`
+
+- `algorithm` is the algorithm that computed similarities
+- `dataset` is the dataset the similarities are predicted for
+- `regime` is the amount of information included in the papers' profiles: 't'--title only, 'ta'--title+abstract, 'f'--full text

@@ -55,15 +55,17 @@ Once you understand the data, you can proceed to the `Experiments.ipynb` noteboo
 
 ## evaluation_datasets
 
-Open Rewiew algorithms work with data in a specific format (https://github.com/openreview/openreview-expertise#affinity-scores). For consistency, all experiments in this project are conducted with data in the OpenReview format. The `evaluation_datasets` folder contains all the datasets used in the experiments. Specifically, there are two types of datasets we use in the experiments:
+Open Rewiew algorithms work with data in a specific format (https://github.com/openreview/openreview-expertise#affinity-scores). For consistency, all experiments in this project are conducted with data in the OpenReview format. The `evaluation_datasets` folder contains all the datasets used in the experiments. Specifically, there are two types of datasets we use:
 
 - *d_20_{x}, x \in {1, 2, ..., 10}*
 
-For evaluations in Section 6.1 and 7 we use reviewer profiles of length 20 and rerun all evaluations 10 times to average out the noise in the reviewer profiles (the noise arises due to the randomness in the procedure of profile creation).
+For evaluations in Section 6.1 and 7, we use reviewer profiles of length 20 and rerun all evaluations 10 times (each time the reviewer profiles are slightly different) to average out the noise in the reviewer profiles (the noise arises due to the randomness in the procedure of profile creation).
 
-- *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 10}*
+- *d_full_{y}_{x}, y \in {1, 2, ...., 20}, x \in {1, 2, ..., 5}*
 
-To evaluate TPMS in the full text regime (Section 6.2, Section 7) we need to focus on papers (reported by participants or from reviewers' profiles) that have PDFs publicly available. For this, we need to remove some papers from the dataset and from the reviewers' profiles. Additionally, in Section 6.2 we experiment with the length of the reviewers' profiles so we create a dataset for each length of the profile from 1 to 20.
+In Section 6.2 we experiment with the length of the reviewers' profiles so we create a dataset for each length of the profile from 1 to 20. To average out the noise, we create 5 versions of each dataset (each version has slightly different reviewer profiles) and report the mean values across these versions.
+
+Note that to evalute an algorithm in the full text regime (Section 6.2, Section 7) we need to focus on papers (reported by participants or from reviewers' profiles) that have PDFs publicly available. For this, we remove papers without publicly available PDFs from the dataset and from the reviewers' profiles.
 
 ## predictions
 

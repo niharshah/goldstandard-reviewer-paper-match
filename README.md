@@ -15,7 +15,7 @@ We now provide more details on each of the released folders.
 
 The dataset folder contains six items:
 
-**1. evaluations.csv**
+*1. evaluations.csv*
 
 This tab-separated file contains evaluations reported by participants. Each row in the data frame corresponds to a participant who is represented by their Semantic Scholar ID (`ParticipantID`).
 

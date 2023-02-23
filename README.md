@@ -73,4 +73,4 @@ Similarities predicted by different algorithms for datasets in the OpenReview fo
 
 - `algorithm` is the algorithm that computed similarities
 - `dataset` is the dataset the similarities are predicted for
-- `regime` is the amount of information included in the papers' profiles: 't'--title only, 'ta'--title+abstract, 'f'--full text
+- `regime` is the amount of information included in the papers' profiles: `t`--title only, `ta`--title+abstract, `f`--full text

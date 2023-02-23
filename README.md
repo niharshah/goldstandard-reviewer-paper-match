@@ -13,7 +13,7 @@ We now provide more details on each of the released folders.
 
 ## data
 
-The dataset folder contains six items:
+The dataset folder contains the data we collect in this work and comprises six items:
 
 *1. evaluations.csv*
 

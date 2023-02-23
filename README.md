@@ -13,7 +13,7 @@ We now provide more details on each of the released folders.
 
 ## data
 
-The dataset folder contains the data we collect in this work and comprises six items:
+The dataset folder contains the data we collect in this work and comprises five items:
 
 **1. evaluations.csv**
 
@@ -37,13 +37,9 @@ For each paper (reported by participants or from reviewers' profiles), this fold
 
 Note: For papers reported by participants, we edit semantic scholar profiles by adding links to publicly available PDFs whenever they were missing in the semantic scholar profile.
 
-**5. pdfs**
-
-PDF files for each paper (reported by participants or from reviewers' profiles) that has a link to PDF in its profile.
-
 **6. txts**
 
-Parsed PDF files. For each pdf file in the `pdfs` folder, there is:
+Parsed PDF files. For each paper from `papers` that has a link to a publicly available pdf in its profile, we construct:
 - .txt file that is obtained by parsing the pdf with the `xpdf` tool
 - .json file that contains counts of words in the txt file with some sanitization applied (txt -> json conversion is done using the approach by Laurent Charlin https://bitbucket.org/lcharlin/tpms/src/master/)
 

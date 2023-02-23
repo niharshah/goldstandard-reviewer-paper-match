@@ -61,7 +61,7 @@ For evaluations in Section 6.1 and 7, we use reviewer profiles of length 20 and 
 
 In Section 6.2 we experiment with the length of the reviewers' profiles so we create a dataset for each length of the profile from 1 to 20. To average out the noise, we create 5 versions of each dataset (each version has slightly different reviewer profiles) and report the mean values across these versions.
 
-Note that to evalute an algorithm in the full text regime (Section 6.2, Section 7) we need to focus on papers (reported by participants or from reviewers' profiles) that have PDFs publicly available. For this, when constructing *d_full_** datasets, we remove papers without publicly available PDFs from the dataset and from the reviewers' profiles.
+Note that to evalute an algorithm in the full text regime (Section 6.2, Section 7) we need to focus on papers (reported by participants or from reviewers' profiles) that have PDFs publicly available. For this, when constructing *d_full_** datasets, we remove papers without publicly available PDFs.
 
 ## predictions
 

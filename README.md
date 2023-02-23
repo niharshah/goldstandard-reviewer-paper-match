@@ -7,7 +7,7 @@ This repository accompanies the paper "*A Gold Standard Dataset for the Reviewer
 3. `evaluation_datasets` folder contains the datasets preprocessed into the OpenReview format that similarity computation algorithms can directly work with
 4. `predictions` folder contains similaritites predicted by different similarity-computation algorithms
 5. `scripts` folder contains various scripts, including the evaluation code and implementation of the TPMS algorithm
-6. `configs_for_OR_models` folder contains config files used to run the Open Review algorithns
+6. `configs_for_OR_models` folder contains config files used to run the OpenReview algorithms
 
 We now provide more details on each of the released folders.
 

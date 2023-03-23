@@ -8,6 +8,7 @@ This repository accompanies the paper "*A Gold Standard Dataset for the Reviewer
 4. `predictions` folder contains similaritites predicted by different similarity-computation algorithms
 5. `scripts` folder contains various scripts, including the evaluation code and implementation of the TPMS algorithm
 6. `configs_for_OR_models` folder contains config files used to run the OpenReview algorithms
+7. `evaluation_script.py` script provides an easy way to evaluate predictions of new similarity computation algorithms
 
 We now provide more details on each of the released folders.
 
@@ -84,3 +85,13 @@ Code used in the project. Important pieces are:
 ## configs_for_OR_models
 
 Finally, we release the config files that we used to run the OpenReview algorithms on our data (ELMo, Specter, and Specter+MFR algorithms).
+
+## evaluation_script.py
+
+If you wish to evaluate a new similarity-computation algorithm on our dataset and obtain results that are directly comparable to main results reported in our paper (Table 3), you need to do the following steps:
+
+1. Run your algorithms on 10 datasets *d_20_{x}, x \in {1, 2, ..., 10}*. The datasets are in the OpenReview format (https://github.com/openreview/openreview-expertise#affinity-scores).
+2. Save predictions of your algorithm to the `predictions` folder using the following name convention: `{algo_name}_d_20_{x}_ta.json`, where `algo_name` is a name of your algorithm (make sure it is unique) and `x` is the index of the dataset from Step 1.
+3. Run the evaluation script as follows:
+```python evaluation_script.py --dataset ./data/evaluations.csv --prediction_dir ./predictions --algo algo_name```
+

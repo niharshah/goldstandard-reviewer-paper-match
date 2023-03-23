@@ -91,7 +91,7 @@ Finally, we release the config files that we used to run the OpenReview algorith
 If you wish to evaluate a new similarity-computation algorithm on our dataset and obtain results that are directly comparable to main results reported in [our paper](https://www.google.com) (Table 3), you need to do the following steps:
 
 1. Run your algorithm on 10 datasets *d_20_{x}, x \in {1, 2, ..., 10}* (available in the `evaluation_datasets` folder) using titles and abstracts of submissions. The datasets are in the OpenReview format (https://github.com/openreview/openreview-expertise#affinity-scores).
-2. Save predictions of your algorithm to the `predictions` folder using the following name convention: *{algo_name}_d_20_{x}_ta.json*, where `algo_name` is the name of your algorithm (make sure it is unique) and `x` is the index of the dataset from Step 1.
+2. Save predictions of your algorithm to the `predictions` folder using the following name convention: *{algo_name}\_d_20_{x}_ta.json*, where `algo_name` is the name of your algorithm (make sure it is unique) and `x` is the index of the dataset from Step 1.
 3. Run the evaluation script as follows:
 ```python evaluation_script.py --dataset ./data/evaluations.csv --prediction_dir ./predictions --algo algo_name```
 

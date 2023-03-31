@@ -1,6 +1,6 @@
 # README
 
-This repository accompanies the paper "*A Gold Standard Dataset for the Reviewer Assignment Problem*" [(link)](https://www.google.com) by Ivan Stelmakh, John Wieting, Graham Neubig, and Nihar Shah. The structure of the directory is as follows (more details on each point below):
+This repository accompanies the paper "*A Gold Standard Dataset for the Reviewer Assignment Problem*" [(link)](https://arxiv.org/abs/2303.16750) by Ivan Stelmakh, John Wieting, Graham Neubig, and Nihar Shah. The structure of the directory is as follows (more details on each point below):
 
 1. `data` folder contains the dataset we release in this work
 2. `notebooks` folder contains jupyter notebooks that explore the dataset and replicate the results of the paper
@@ -88,7 +88,7 @@ Finally, we release the config files that we used to run the OpenReview algorith
 
 ## evaluation_script.py
 
-If you wish to evaluate a new similarity-computation algorithm on our dataset and obtain results that are directly comparable to main results reported in [our paper](https://www.google.com) (Table 3), you need to do the following steps:
+If you wish to evaluate a new similarity-computation algorithm on our dataset and obtain results that are directly comparable to main results reported in [our paper](https://arxiv.org/abs/2303.16750) (Table 3), you need to do the following steps:
 
 1. Run your algorithm on 10 datasets *d_20_{x}, x \in {1, 2, ..., 10}* (available in the `evaluation_datasets` folder) using titles and abstracts of submissions. The datasets are in the OpenReview format (https://github.com/openreview/openreview-expertise#affinity-scores).
 2. Save predictions of your algorithm to the `predictions` folder using the following name convention: *{algo_name}\_d_20_{x}_ta.json*, where `algo_name` is the name of your algorithm (make sure it is unique) and `x` is the index of the dataset from Step 1.

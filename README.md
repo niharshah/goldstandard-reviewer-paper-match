@@ -50,6 +50,8 @@ A good entry point to this project is the `DataExploration.ipynb` notebook. It p
 
 Once you understand the data, you can proceed to the `Experiments.ipynb` notebook that replicates the results of the paper.
 
+If you want to play wit the LLMs used in the evaluation, you can proceed to the `LLMPerformance.ipynb` notebook. It provides some functions to query LLMs.
+
 ## evaluation_datasets
 
 Many existing similarity-computation algorithms work with data in the OpenReview format (https://github.com/openreview/openreview-expertise#affinity-scores). For consistency, all experiments in this project are conducted with data in the OpenReview format. The `evaluation_datasets` folder contains all the datasets used in the experiments. Specifically, there are two types of datasets we use:

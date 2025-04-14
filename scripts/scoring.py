@@ -5,6 +5,8 @@
 
 from itertools import combinations
 import numpy as np
+
+
 def compute_kendall_tau(preds, refs, vp, vr, k=None):
     """Compute accuracy of predictions against references (weighted kendall's tau metric)
 
@@ -19,6 +21,7 @@ def compute_kendall_tau(preds, refs, vp, vr, k=None):
 
         vp: papers to use in evaluations
         vr: reviewers to use in evaluations
+        k: int to indices the use of top k items
 
     Returns:
         Loss of predictions.
@@ -36,18 +39,16 @@ def compute_kendall_tau(preds, refs, vp, vr, k=None):
         # Skip reviewers with no valid papers
         if not valid_papers:
             continue
-        # sort the papers by highest and lowest algorithm scoring
+        # sort the papers by highest to lowest algorithm scoring
         pred_ranking = sorted(valid_papers, key=lambda p: preds[reviewer][p], reverse=True)
-
+        # get all the pairs for valid papers
         pairs = list(combinations(pred_ranking, 2))
+        # Get the pairs where one element is in the top k valid papers
         if k:
-            top_k_items = set(pred_ranking[:k])  # Get the top k items
+            top_k_items = set(pred_ranking[:k])  
             pairs = [pair for pair in pairs if pair[0] in top_k_items or pair[1] in top_k_items]
         
         for p1, p2 in pairs:
-
-            if p1 not in vp or p2 not in vp:
-                continue
 
             pred_diff = preds[reviewer][p1] - preds[reviewer][p2]
             true_diff = refs[reviewer][p1] - refs[reviewer][p2]
@@ -76,6 +77,7 @@ def compute_mrr(preds, refs, vp, vr, k):
 
         vp: papers to use in evaluations
         vr: reviewers to use in evaluations
+        k: int to indices the use of top k items
 
     Returns:
         Loss of predictions.
@@ -84,7 +86,6 @@ def compute_mrr(preds, refs, vp, vr, k):
     for reviewer in vr:
         papers = list(refs[reviewer].keys())
         valid_papers = [p for p in papers if p in vp]
-        # Skip reviewers with no valid papers
         if not valid_papers:
             continue
         
@@ -100,14 +101,28 @@ def compute_mrr(preds, refs, vp, vr, k):
     return np.mean(means)
 
 def compute_precision(preds, refs, vp, vr, k):
+    """Compute accuracy of predictions against references (Precision metric)
+
+    Args:
+        preds: dict of dicts, where top-level keys corresponds to reviewers
+        and inner-level keys correspond to the papers associated with a given
+        reviewer in the dataset. Values in the inner dicts should represent similarities
+        and must be computed for all (valid_reviewer, valid_paper) pairs from the references.
+
+        refs: ground truth values of reviewer expertise. The structure of the object
+        is the same as that of preds.
+
+        vp: papers to use in evaluations
+        vr: reviewers to use in evaluations
+        k: int to indices the use of top k items
+
+    Returns:
+        Loss of predictions.
+    """
     preision_score = []
     for reviewer in vr:
         papers = list(refs[reviewer].keys())
-
-        # Filter valid papers
         valid_papers = [p for p in papers if p in vp]
-
-        # Skip reviewers with no valid papers
         if not valid_papers:
             continue
         
@@ -123,7 +138,24 @@ def compute_precision(preds, refs, vp, vr, k):
     return np.mean(preision_score)
 
 def compute_ndcg(preds, refs, vp, vr, k):
+    """Compute accuracy of predictions against references (NDCG metric)
 
+    Args:
+        preds: dict of dicts, where top-level keys corresponds to reviewers
+        and inner-level keys correspond to the papers associated with a given
+        reviewer in the dataset. Values in the inner dicts should represent similarities
+        and must be computed for all (valid_reviewer, valid_paper) pairs from the references.
+
+        refs: ground truth values of reviewer expertise. The structure of the object
+        is the same as that of preds.
+
+        vp: papers to use in evaluations
+        vr: reviewers to use in evaluations
+        k: int to indices the use of top k items
+
+    Returns:
+        Loss of predictions.
+    """
     def dcg(scores):
         """Compute Discounted Cumulative Gain (DCG)."""
         return sum(rel / np.log2(idx + 2) for idx, rel in enumerate(scores))
@@ -132,23 +164,16 @@ def compute_ndcg(preds, refs, vp, vr, k):
 
     for reviewer in vr:
         papers = list(refs[reviewer].keys())
-
-        # Filter valid papers
         valid_papers = [p for p in papers if p in vp]
-
-        # Skip reviewers with no valid papers
         if not valid_papers:
             continue
 
         # Predicted ranking (sorted by predicted scores)
         pred_ranking = sorted(valid_papers, key=lambda p: preds[reviewer][p], reverse=True)[:k]
-
         # Ground truth relevance scores in predicted ranking order
         rel_score = [refs[reviewer][p] for p in pred_ranking]
-
         # Ideal ranking (sorted by ground truth)
         ideal_ranking = sorted(valid_papers, key=lambda p: refs[reviewer][p], reverse=True)[:k]
-
         # Ground truth relevance scores in ideal ranking order
         ideal_score = [refs[reviewer][p] for p in ideal_ranking]
         # Compute NDCG
@@ -223,6 +248,7 @@ def compute_resolution(preds, refs, vp, vr, regime='easy'):
                 num_correct += 1
 
     return {'score': num_correct / num_pairs, 'correct': num_correct, 'total': num_pairs}
+
 
 if __name__ == '__main__':
 

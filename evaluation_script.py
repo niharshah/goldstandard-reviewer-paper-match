@@ -7,7 +7,7 @@ import pandas as pd
 
 import argparse
 import scripts.helpers as hlp
-from scripts.scoring import compute_main_metric
+from scripts.scoring import compute_kendall_tau
 
 
 def score_performance(pred_file, references, valid_papers, valid_reviewers, bootstraps):
@@ -24,8 +24,8 @@ def score_performance(pred_file, references, valid_papers, valid_reviewers, boot
     with open(pred_file, 'r') as handler:
         predictions = json.load(handler)
 
-    score = compute_main_metric(predictions, references, valid_papers, valid_reviewers)
-    variations = [compute_main_metric(predictions, references, valid_papers, vr) for vr in bootstraps]
+    score = compute_kendall_tau(predictions, references, valid_papers, valid_reviewers)
+    variations = [compute_kendall_tau(predictions, references, valid_papers, vr) for vr in bootstraps]
 
     return score, variations
 

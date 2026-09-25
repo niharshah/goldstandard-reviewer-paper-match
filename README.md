@@ -97,3 +97,28 @@ If you wish to evaluate a new similarity-computation algorithm on our dataset an
 3. Run the evaluation script as follows:
 ```python evaluation_script.py --dataset ./data/evaluations.csv --prediction_dir ./predictions --algo algo_name```
 
+## License and citation
+
+### Code
+
+Original software in this repository is licensed under the MIT License. See [`LICENSE`](LICENSE).
+
+### Gold-standard data
+
+The original reviewer-expertise annotations in `data/evaluations.csv` are licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0), subject to the scope and exclusions described in [`LICENSE-DATA.md`](LICENSE-DATA.md).
+
+### Third-party data
+
+This repository also contains or references third-party material, including Semantic Scholar metadata and text derived from research papers.
+
+These materials are **not** licensed under the MIT License or CC BY 4.0 by the authors of this repository and remain subject to their respective licenses, terms of use, and copyright restrictions.
+
+See [`LICENSE-DATA.md`](LICENSE-DATA.md) for details.
+
+### Citation
+
+If you use this dataset or repository in academic work, please cite:
+
+> Ivan Stelmakh, John Wieting, Sarina Xi, Graham Neubig, and Nihar B. Shah. “A Gold Standard Dataset for the Reviewer Assignment Problem.” Transactions on Machine Learning Research, 2025.
+
+Machine-readable citation metadata is available in [`CITATION.cff`](CITATION.cff).
